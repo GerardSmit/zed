@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
+    Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -36,6 +36,25 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// Cached render layers captured this frame. Each is a view subtree painted into its own
+    /// sub-scene (in layer-local coordinates); the platform renderer draws each into an offscreen
+    /// texture, then the main scene composites it via a `PaintSurface` with
+    /// `SurfaceSource::Layer(id)`. See `Window::paint_layer`.
+    pub layers: Vec<SceneLayer>,
+}
+
+/// One cached render layer captured during a frame's paint (see [`Scene::layers`]).
+pub struct SceneLayer {
+    /// Stable id linking this layer to its `SurfaceSource::Layer(id)` composite.
+    pub id: LayerId,
+    /// Device-pixel size of the offscreen texture (the layered view's bounds at the current scale).
+    pub size: Size<DevicePixels>,
+    /// When true the texture must be (re)rendered from `scene` this frame (content changed / first
+    /// paint / scale changed). When false the existing texture is reused and only re-composited —
+    /// this is the resize fast path, and `scene` is empty.
+    pub needs_render: bool,
+    /// The layer's primitives in layer-local coordinates, present only when `needs_render`.
+    pub scene: Option<Box<Scene>>,
 }
 
 #[expect(missing_docs)]
@@ -52,6 +71,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.layers.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -715,14 +735,31 @@ impl From<PolychromeSprite> for Primitive {
     }
 }
 
+/// Identifies a cached render layer: a view subtree rendered into its own offscreen GPU texture so
+/// it can be re-composited (cheaply, stretched) on window resize without re-running the view's
+/// paint. Stable for the lifetime of the layered view (derived from its `EntityId`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LayerId(pub u64);
+
+/// Where a [`PaintSurface`] composite samples from.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub enum PaintSurfaceSource {
+    /// A cached render layer (a view rendered to an offscreen GPU texture). The platform renderer
+    /// looks the texture up by id from the frame's layer set and draws it stretched to `bounds`.
+    Layer(LayerId),
+    /// A platform pixel buffer (e.g. a decoded video frame). macOS only.
+    #[cfg(target_os = "macos")]
+    Image(core_video::pixel_buffer::CVPixelBuffer),
+}
+
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
 pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    #[cfg(target_os = "macos")]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    pub source: PaintSurfaceSource,
 }
 
 impl From<PaintSurface> for Primitive {

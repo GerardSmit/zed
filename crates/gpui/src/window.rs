@@ -4158,7 +4158,7 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
     pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
-        use crate::PaintSurface;
+        use crate::{PaintSurface, PaintSurfaceSource};
 
         self.invalidator.debug_assert_paint();
 
@@ -4168,7 +4168,7 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            image_buffer,
+            source: PaintSurfaceSource::Image(image_buffer),
         });
     }
 
