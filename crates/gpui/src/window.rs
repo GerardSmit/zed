@@ -1892,6 +1892,16 @@ impl Window {
         }
     }
 
+    /// Schedule a redraw WITHOUT the cache-bypass that `refresh()` performs. The (uncached) root
+    /// view re-renders and re-lays-out, but cached subtrees whose cache key (bounds / content mask
+    /// / text style) is unchanged reuse their previous render. Use this for layout-only changes
+    /// such as dragging a split divider, where the whole UI must not re-render every frame.
+    pub fn request_redraw(&mut self) {
+        if self.invalidator.not_drawing() {
+            self.invalidator.set_dirty(true);
+        }
+    }
+
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;
