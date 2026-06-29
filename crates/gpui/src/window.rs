@@ -1904,11 +1904,26 @@ impl Window {
     }
 
     /// Move focus to the element associated with the given [`FocusHandle`].
+    /// Invalidate only the view that owns `focus` (and its ancestors), via the per-entity dirty
+    /// path, instead of refreshing the whole window. Returns `false` if the focus target can't be
+    /// resolved to a view in the last rendered frame, so the caller can fall back to a full refresh.
+    fn invalidate_focus_view(&mut self, focus: Option<FocusId>, cx: &mut App) -> bool {
+        let Some(focus_id) = focus else {
+            return true; // nothing focused on this side — nothing to invalidate
+        };
+        let Some(view_id) = self.rendered_frame.dispatch_tree.view_id_for_focus(focus_id) else {
+            return false;
+        };
+        self.invalidator.invalidate_view(view_id, cx);
+        true
+    }
+
     pub fn focus(&mut self, handle: &FocusHandle, cx: &mut App) {
         if !self.focus_enabled || self.focus == Some(handle.id) {
             return;
         }
 
+        let previous_focus = self.focus;
         self.focus = Some(handle.id);
         self.focus_generation = self.focus_generation.wrapping_add(1);
         self.clear_pending_keystrokes();
@@ -1924,7 +1939,16 @@ impl Window {
                 .ok();
         });
 
-        self.refresh();
+        // Only the views whose focus styling actually changed need to re-render: the one losing
+        // focus and the one gaining it (plus their ancestors, handled by the dirty-view walk).
+        // Invalidate just those instead of `refresh()`-ing the entire window — which would
+        // re-render every view and bypass the element cache. Fall back to a full refresh if a
+        // focus target isn't resolvable in the last frame (e.g. a freshly created element).
+        if !(self.invalidate_focus_view(previous_focus, cx)
+            && self.invalidate_focus_view(Some(handle.id), cx))
+        {
+            self.refresh();
+        }
     }
 
     /// Remove focus from all elements within this context's window.

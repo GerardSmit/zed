@@ -608,6 +608,20 @@ impl DispatchTree {
         self.focusable_node_ids.get(&target).copied()
     }
 
+    /// The entity id of the nearest view that owns `focus_id` (walking up the dispatch tree from
+    /// the focusable node). Used to invalidate only the views whose focus styling changed, instead
+    /// of refreshing the whole window. Returns `None` if the focus id isn't in this frame's tree.
+    pub fn view_id_for_focus(&self, focus_id: FocusId) -> Option<EntityId> {
+        let mut node_id = self.focusable_node_id(focus_id)?;
+        loop {
+            let node = self.node(node_id);
+            if let Some(view_id) = node.view_id {
+                return Some(view_id);
+            }
+            node_id = node.parent?;
+        }
+    }
+
     pub fn root_node_id(&self) -> DispatchNodeId {
         debug_assert!(!self.nodes.is_empty());
         DispatchNodeId(0)
