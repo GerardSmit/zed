@@ -4153,6 +4153,78 @@ impl Window {
         Ok(())
     }
 
+    /// Composite an already-rendered cached layer texture at `bounds` without re-rendering it — the
+    /// resize / content-unchanged fast path. The platform reuses the existing offscreen texture for
+    /// `layer_id` and stretches it to `bounds`. `size` is that texture's device size.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn composite_layer(
+        &mut self,
+        layer_id: crate::LayerId,
+        bounds: Bounds<Pixels>,
+        size: Size<DevicePixels>,
+    ) {
+        use crate::{PaintSurface, PaintSurfaceSource, SceneLayer};
+        self.invalidator.debug_assert_paint();
+        self.next_frame.scene.layers.push(SceneLayer {
+            id: layer_id,
+            size,
+            needs_render: false,
+            scene: None,
+        });
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            source: PaintSurfaceSource::Layer(layer_id),
+        });
+    }
+
+    /// Paint a view subtree into its own sub-scene (a cached layer) and emit a composite for it.
+    /// `f` paints exactly as it would inline (absolute coordinates); the captured primitives are
+    /// translated to layer-local coordinates and handed to the platform to render into the layer's
+    /// offscreen texture, which the emitted `PaintSurface` composites at `bounds`. Hitboxes and
+    /// dispatch registered by `f` stay in the real frame (only scene primitives are redirected), so
+    /// input still targets the view at its true on-screen position.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn capture_layer<R>(
+        &mut self,
+        layer_id: crate::LayerId,
+        bounds: Bounds<Pixels>,
+        size: Size<DevicePixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        use crate::{PaintSurface, PaintSurfaceSource, Scene, SceneLayer};
+        self.invalidator.debug_assert_paint();
+        let parent_scene = std::mem::replace(&mut self.next_frame.scene, Scene::default());
+        let result = f(self);
+        let mut layer_scene = std::mem::replace(&mut self.next_frame.scene, parent_scene);
+        let origin = self.snap_bounds(bounds).origin;
+        layer_scene.translate(point(
+            crate::ScaledPixels(-origin.x.0),
+            crate::ScaledPixels(-origin.y.0),
+        ));
+        layer_scene.finish();
+        self.next_frame.scene.layers.push(SceneLayer {
+            id: layer_id,
+            size,
+            needs_render: true,
+            scene: Some(Box::new(layer_scene)),
+        });
+        let composite_bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds: composite_bounds,
+            content_mask,
+            source: PaintSurfaceSource::Layer(layer_id),
+        });
+        result
+    }
+
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.

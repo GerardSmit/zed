@@ -144,6 +144,54 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Shift every primitive in this scene by `offset`. Used to convert a captured layer sub-scene
+    /// from absolute window coordinates into layer-local coordinates (offset = `-view_origin`)
+    /// before rendering it into its own offscreen texture, whose top-left is local `(0, 0)`.
+    pub fn translate(&mut self, offset: Point<ScaledPixels>) {
+        #[inline]
+        fn shift(bounds: &mut Bounds<ScaledPixels>, offset: Point<ScaledPixels>) {
+            bounds.origin.x = bounds.origin.x + offset.x;
+            bounds.origin.y = bounds.origin.y + offset.y;
+        }
+        for s in &mut self.shadows {
+            shift(&mut s.bounds, offset);
+            shift(&mut s.content_mask.bounds, offset);
+        }
+        for q in &mut self.quads {
+            shift(&mut q.bounds, offset);
+            shift(&mut q.content_mask.bounds, offset);
+        }
+        for p in &mut self.paths {
+            shift(&mut p.bounds, offset);
+            shift(&mut p.content_mask.bounds, offset);
+            for v in &mut p.vertices {
+                v.xy_position.x = v.xy_position.x + offset.x;
+                v.xy_position.y = v.xy_position.y + offset.y;
+                shift(&mut v.content_mask.bounds, offset);
+            }
+        }
+        for u in &mut self.underlines {
+            shift(&mut u.bounds, offset);
+            shift(&mut u.content_mask.bounds, offset);
+        }
+        for s in &mut self.monochrome_sprites {
+            shift(&mut s.bounds, offset);
+            shift(&mut s.content_mask.bounds, offset);
+        }
+        for s in &mut self.subpixel_sprites {
+            shift(&mut s.bounds, offset);
+            shift(&mut s.content_mask.bounds, offset);
+        }
+        for s in &mut self.polychrome_sprites {
+            shift(&mut s.bounds, offset);
+            shift(&mut s.content_mask.bounds, offset);
+        }
+        for s in &mut self.surfaces {
+            shift(&mut s.bounds, offset);
+            shift(&mut s.content_mask.bounds, offset);
+        }
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {

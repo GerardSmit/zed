@@ -16,6 +16,10 @@ struct AnyViewState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    /// For layer views (`is_layer`): the scale factor at which the offscreen texture was last
+    /// rendered. `None` means never rendered. A content-unchanged frame at the same scale composites
+    /// the existing texture instead of re-rendering (the resize fast path).
+    layer_scale: Option<f32>,
 }
 
 #[derive(Default)]
@@ -31,6 +35,10 @@ pub struct AnyView {
     entity: AnyEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
     cached_style: Option<Rc<StyleRefinement>>,
+    /// When true this view is composited as a cached GPU layer: its subtree renders into its own
+    /// offscreen texture (only when its content changes) and is re-composited — stretched — on
+    /// resize without re-running render/layout/paint. See [`AnyView::layer`].
+    is_layer: bool,
 }
 
 impl<V: Render> From<Entity<V>> for AnyView {
@@ -39,6 +47,7 @@ impl<V: Render> From<Entity<V>> for AnyView {
             entity: value.into_any(),
             render: any_view::render::<V>,
             cached_style: None,
+            is_layer: false,
         }
     }
 }
@@ -49,6 +58,21 @@ impl AnyView {
     /// The one exception is when [Window::refresh] is called, in which case caching is ignored.
     pub fn cached(mut self, style: StyleRefinement) -> Self {
         self.cached_style = Some(style.into());
+        self
+    }
+
+    /// Composite this view as a cached GPU layer. Its subtree renders into its own offscreen
+    /// texture only when its content is dirty (or scale changes); on a content-unchanged frame —
+    /// notably every frame of a live window resize — the texture is re-composited (stretched to the
+    /// new bounds) without re-running the view's render, layout, or paint. This decouples resize
+    /// cost from the view's render cost, so any number of expensive panels cost ~nothing to resize.
+    ///
+    /// Tradeoff: while compositing the stale texture (e.g. mid-drag) the interior looks slightly
+    /// soft and its hitboxes are not updated; a normal frame (resize-settle, or any content change)
+    /// re-renders it crisp with correct hitboxes. Implies [`cached`](Self::cached) for layout.
+    pub fn layer(mut self, style: StyleRefinement) -> Self {
+        self.cached_style = Some(style.into());
+        self.is_layer = true;
         self
     }
 
@@ -69,6 +93,7 @@ impl AnyView {
                 entity,
                 render: self.render,
                 cached_style: self.cached_style,
+                is_layer: self.is_layer,
             }),
         }
     }
@@ -151,8 +176,33 @@ impl Element for AnyView {
                 |element_state, window| {
                     let content_mask = window.content_mask();
                     let text_style = window.text_style();
+                    let scale = window.scale_factor();
+                    let view_dirty =
+                        window.dirty_views.contains(&self.entity_id()) || window.refreshing;
 
-                    if let Some(mut element_state) = element_state
+                    if self.is_layer {
+                        // Layer fast path: when content is unchanged (and scale matches), skip
+                        // render + layout entirely and reuse last frame's prepaint — paint will
+                        // composite the existing texture at the new bounds. Hitboxes go briefly
+                        // stale (acceptable mid-resize; a content change or resize-settle frame is
+                        // `view_dirty` and re-renders crisp). Only re-render the texture when dirty,
+                        // first paint, or scale changed.
+                        let needs_render = view_dirty
+                            || element_state
+                                .as_ref()
+                                .map_or(true, |state| state.layer_scale != Some(scale));
+                        if !needs_render
+                            && let Some(mut element_state) = element_state
+                        {
+                            let prepaint_start = window.prepaint_index();
+                            window.reuse_prepaint(element_state.prepaint_range.clone());
+                            cx.entities
+                                .extend_accessed(&element_state.accessed_entities);
+                            let prepaint_end = window.prepaint_index();
+                            element_state.prepaint_range = prepaint_start..prepaint_end;
+                            return (None, element_state);
+                        }
+                    } else if let Some(mut element_state) = element_state
                         && element_state.cache_key.bounds == bounds
                         && element_state.cache_key.content_mask == content_mask
                         && element_state.cache_key.text_style == text_style
@@ -192,6 +242,7 @@ impl Element for AnyView {
                                 content_mask,
                                 text_style,
                             },
+                            layer_scale: if self.is_layer { Some(scale) } else { None },
                         },
                     )
                 },
@@ -203,7 +254,7 @@ impl Element for AnyView {
         &mut self,
         global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         element: &mut Self::PrepaintState,
         window: &mut Window,
@@ -211,6 +262,20 @@ impl Element for AnyView {
     ) {
         window.with_rendered_view(self.entity_id(), |window| {
             let caching_disabled = window.is_inspector_picking(cx);
+            if self.is_layer && !caching_disabled {
+                let layer_id = crate::LayerId(self.entity_id().as_u64());
+                let size = bounds.size.to_device_pixels(window.scale_factor());
+                if let Some(mut element) = element.take() {
+                    // Content (re)rendered this frame: paint the subtree into the layer's texture.
+                    window.capture_layer(layer_id, bounds, size, |window| {
+                        element.paint(window, cx);
+                    });
+                } else {
+                    // Unchanged: composite the existing texture at the current bounds.
+                    window.composite_layer(layer_id, bounds, size);
+                }
+                return;
+            }
             if self.cached_style.is_some() && !caching_disabled {
                 window.with_element_state::<AnyViewState, _>(
                     global_id.unwrap(),
@@ -270,6 +335,7 @@ impl AnyWeakView {
             entity,
             render: self.render,
             cached_style: None,
+            is_layer: false,
         })
     }
 }
