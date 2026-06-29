@@ -621,6 +621,13 @@ pub struct RequestFrameOptions {
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
+    /// True while the window is inside an interactive (modal) move/resize loop — the user is
+    /// dragging the window edge. During this, `bounds_changed` repaints without bypassing caches so
+    /// cached layers composite (cull) instead of re-rendering, avoiding per-frame freezes. One-shot
+    /// size changes (maximize, restore, snap, programmatic) return false and re-render normally.
+    fn is_in_resize_loop(&self) -> bool {
+        false
+    }
     fn window_bounds(&self) -> WindowBounds;
     fn content_size(&self) -> Size<Pixels>;
     fn resize(&mut self, size: Size<Pixels>);

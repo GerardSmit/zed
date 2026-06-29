@@ -2274,11 +2274,27 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
+        let prev_scale_factor = self.scale_factor;
         self.scale_factor = self.platform_window.scale_factor();
         self.viewport_size = self.platform_window.content_size();
         self.display_id = self.platform_window.display().map(|display| display.id());
 
-        self.refresh();
+        if self.scale_factor != prev_scale_factor {
+            // DPI change: glyphs must be re-rasterized at the new scale, so bypass all caches now.
+            self.refresh();
+        } else if self.platform_window.is_in_resize_loop() {
+            // Interactive edge-drag: re-lay-out and repaint without bypassing caches. Cached layers
+            // (tool-window panels) re-composite (culled) at the new bounds instead of re-rendering,
+            // so a slow panel can't freeze the drag; non-layer content (the editor) still reflows.
+            // The resize-end forces one crisp refresh.
+            self.request_redraw();
+        } else {
+            // One-shot resize (maximize / restore / snap): re-render directly at the new size. The
+            // panels do have to re-render (there's no free lunch on a one-shot grow), but it's a
+            // single frame — no flash. Only the continuous edge-drag (the freeze case) needs the
+            // cull path above.
+            self.refresh();
+        }
 
         self.bounds_observers
             .clone()

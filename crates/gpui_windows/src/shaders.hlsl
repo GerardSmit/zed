@@ -1266,17 +1266,22 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
 struct SurfaceSprite {
     Bounds bounds;
     Bounds content_mask;
+    // Device size of a cached-layer texture. Non-zero => composite a view layer: sample 1:1 (crisp)
+    // and keep alpha. Zero => an image surface (remote frame): stretch to fill, force opaque.
+    float2 tex_size;
 };
 
 struct SurfaceVertexOutput {
     float4 position: SV_Position;
     float2 texcoord: TEXCOORD0;
+    float is_layer: TEXCOORD1;
     float4 clip_distance: SV_ClipDistance;
 };
 
 struct SurfaceFragmentInput {
     float4 position: SV_Position;
     float2 texcoord: TEXCOORD0;
+    float is_layer: TEXCOORD1;
 };
 
 StructuredBuffer<SurfaceSprite> surfaces: register(t1);
@@ -1286,14 +1291,29 @@ SurfaceVertexOutput surface_vertex(uint vertex_id: SV_VertexID, uint surface_id:
     SurfaceSprite surface = surfaces[surface_id];
     SurfaceVertexOutput output;
     output.position = to_device_position(unit_vertex, surface.bounds);
-    output.texcoord = unit_vertex;
+    if (surface.tex_size.x > 0.0) {
+        // Cached layer: 1 texel per device pixel, top-left anchored. On resize the content is
+        // culled/clipped (UV grows past 1 and is discarded) rather than stretched, staying crisp.
+        output.texcoord = unit_vertex * surface.bounds.size / surface.tex_size;
+        output.is_layer = 1.0;
+    } else {
+        output.texcoord = unit_vertex;
+        output.is_layer = 0.0;
+    }
     output.clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds, surface.content_mask);
     return output;
 }
 
 // The frame texture is B8G8R8A8_UNORM, so the sampler already yields straight RGBA.
 float4 surface_fragment(SurfaceFragmentInput input): SV_Target {
+    if (input.is_layer > 0.5 && (input.texcoord.x > 1.0 || input.texcoord.y > 1.0)) {
+        // Beyond the rendered layer texture (the view grew since its last render) — leave the
+        // parent background showing through instead of smearing the edge texel.
+        discard;
+    }
     float4 color = t_sprite.Sample(s_sprite, input.texcoord);
-    color.a = 1.0;
+    if (input.is_layer < 0.5) {
+        color.a = 1.0;
+    }
     return color;
 }

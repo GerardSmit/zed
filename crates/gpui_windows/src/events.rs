@@ -251,8 +251,10 @@ impl WindowsWindowInner {
             KillTimer(Some(handle), SIZE_MOVE_LOOP_TIMER_ID).log_err();
         }
         self.state.in_size_move_loop.set(false);
-        // Settle on a final correct frame now that the gate is lifted.
-        self.handle_paint_msg(handle);
+        // Force a full (cache-bypassing) redraw so cached view layers, which only culled/composited
+        // during the live resize, re-render crisp at the final size. `force_render` routes to
+        // `Window::refresh()` in gpui, marking every view dirty for this one frame.
+        self.draw_window(handle, true);
         None
     }
 

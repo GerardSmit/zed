@@ -51,6 +51,11 @@ pub(crate) struct DirectXRenderer {
     /// Cached upload texture for remote-window surfaces (M1). Recreated when the frame size changes.
     surface_texture: Option<RemoteSurfaceTexture>,
 
+    /// Offscreen render-target textures for cached view layers, keyed by `LayerId`. A layered view
+    /// renders its subtree into its texture only when its content changes; on resize the texture is
+    /// re-composited (stretched) without re-rendering. See `render_layers` / `draw_surfaces`.
+    layers: std::collections::HashMap<u64, LayerTexture>,
+
     /// Whether we want to skip drwaing due to device lost events.
     ///
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
@@ -96,12 +101,15 @@ struct DirectXRenderPipelines {
     surface_pipeline: PipelineState<SurfaceSprite>,
 }
 
-/// One instance for the surface pipeline; mirrors the HLSL `SurfaceSprite` (two `Bounds` = 8 floats).
+/// One instance for the surface pipeline; mirrors the HLSL `SurfaceSprite` (two `Bounds` + a
+/// `float2` = 10 floats). `tex_size` is the layer texture's device size for a cached-view-layer
+/// composite (1:1, crisp, alpha-preserving), or `[0, 0]` for a stretched opaque image surface.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct SurfaceSprite {
     bounds: Bounds<ScaledPixels>,
     content_mask: Bounds<ScaledPixels>,
+    tex_size: [f32; 2],
 }
 
 /// A cached dynamic BGRA texture (+ SRV) for uploading remote-window frames each draw.
@@ -109,6 +117,17 @@ struct RemoteSurfaceTexture {
     width: u32,
     height: u32,
     texture: ID3D11Texture2D,
+    srv: Option<ID3D11ShaderResourceView>,
+}
+
+/// An offscreen RGBA render target (RTV to draw into, SRV to composite from) backing one cached
+/// view layer. Sized to the layered view's device bounds; recreated when that size changes.
+struct LayerTexture {
+    width: u32,
+    height: u32,
+    #[allow(dead_code)]
+    texture: ID3D11Texture2D,
+    rtv: Option<ID3D11RenderTargetView>,
     srv: Option<ID3D11ShaderResourceView>,
 }
 
@@ -194,6 +213,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             surface_texture: None,
+            layers: std::collections::HashMap::new(),
             skip_draws: false,
         })
     }
@@ -267,6 +287,8 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            // Layer textures belong to the lost device; drop them so they're recreated fresh.
+            self.layers.clear();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
@@ -332,11 +354,29 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
+
+        // Render any cached view layers into their offscreen textures first (binds its own render
+        // target + viewport), before the main pass rebinds the back buffer.
+        self.render_layers(scene)?;
+
         self.pre_draw(&match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
         })?;
 
+        self.render_scene(scene, true)?;
+
+        // Remote-window frames are pushed out-of-band (not as scene primitives, to avoid editing the
+        // read-only base gpui). Composit them on top after the scene.
+        self.draw_remote_surfaces()?;
+        self.present()
+    }
+
+    /// Draw a scene's primitive batches into the currently-bound render target. Shared by the main
+    /// pass and the per-layer offscreen passes. `allow_paths` is false for layer passes: the path
+    /// pipeline uses a window-sized MSAA intermediate and rebinds the main target when it finishes,
+    /// which would corrupt an in-progress layer pass — path support in layers is a follow-up.
+    fn render_scene(&mut self, scene: &Scene, allow_paths: bool) -> Result<()> {
         self.upload_scene_buffers(scene)?;
 
         for batch in scene.batches() {
@@ -344,6 +384,9 @@ impl DirectXRenderer {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
+                    if !allow_paths {
+                        continue;
+                    }
                     let paths = &scene.paths[range];
                     self.draw_paths_to_intermediate(paths)?;
                     self.draw_paths_from_intermediate(paths)
@@ -373,10 +416,106 @@ impl DirectXRenderer {
                 scene.surfaces.len(),
             ))?;
         }
-        // Remote-window frames are pushed out-of-band (not as scene primitives, to avoid editing the
-        // read-only base gpui). Composit them on top after the scene.
-        self.draw_remote_surfaces()?;
-        self.present()
+        Ok(())
+    }
+
+    /// Render each dirty cached layer's sub-scene into its offscreen texture. Reused (non-dirty)
+    /// layers keep their existing texture and are only re-composited by the main pass. Restores the
+    /// main viewport size in the global params at the end; `pre_draw` rebinds the back buffer.
+    fn render_layers(&mut self, scene: &Scene) -> Result<()> {
+        if scene.layers.is_empty() {
+            return Ok(());
+        }
+        for layer in &scene.layers {
+            let width = layer.size.width.0.max(1) as u32;
+            let height = layer.size.height.0.max(1) as u32;
+            if !layer.needs_render {
+                // Texture is reused as-is; ensure it at least exists (composite skips if missing).
+                continue;
+            }
+            let Some(sub_scene) = layer.scene.as_deref() else {
+                continue;
+            };
+            self.ensure_layer_texture(layer.id.0, width, height)?;
+            let Some(devices) = self.devices.clone() else {
+                continue;
+            };
+            let rtv = self
+                .layers
+                .get(&layer.id.0)
+                .and_then(|t| t.rtv.clone())
+                .context("layer render target missing")?;
+
+            let layer_viewport = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: width as f32,
+                Height: height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            // The batch draw helpers read `resources.viewport` for their RSSetViewports; override it
+            // so they rasterize into this layer (its size), not the main back buffer. Restored after.
+            let saved_viewport = self.resources.as_ref().context("resources missing")?.viewport;
+            if let Some(resources) = self.resources.as_mut() {
+                resources.viewport = layer_viewport;
+            }
+            // Point the shaders' NDC math at the layer (its primitives are in layer-local coords).
+            update_buffer(
+                &devices.device_context,
+                self.globals.global_params_buffer.as_ref().unwrap(),
+                &[GlobalParams {
+                    gamma_ratios: self.font_info.gamma_ratios,
+                    viewport_size: [width as f32, height as f32],
+                    grayscale_enhanced_contrast: self.font_info.grayscale_enhanced_contrast,
+                    subpixel_enhanced_contrast: self.font_info.subpixel_enhanced_contrast,
+                    is_bgr: self.font_info.is_bgr as u32,
+                    _pad: [0; 3],
+                }],
+            )?;
+            unsafe {
+                devices
+                    .device_context
+                    .ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 0.0]);
+                devices
+                    .device_context
+                    .OMSetRenderTargets(Some(slice::from_ref(&Some(rtv.clone()))), None);
+                devices
+                    .device_context
+                    .RSSetViewports(Some(slice::from_ref(&layer_viewport)));
+            }
+            self.render_scene(sub_scene, false)?;
+            if let Some(resources) = self.resources.as_mut() {
+                resources.viewport = saved_viewport;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensure an offscreen render-target texture exists for `key` at `width`x`height`, recreating it
+    /// when the size changed (the layered view resized).
+    fn ensure_layer_texture(&mut self, key: u64, width: u32, height: u32) -> Result<()> {
+        if let Some(t) = self.layers.get(&key)
+            && t.width == width
+            && t.height == height
+        {
+            return Ok(());
+        }
+        let device = &self.devices.as_ref().context("devices missing")?.device;
+        let (texture, srv) = create_path_intermediate_texture(device, width, height)?;
+        let mut rtv = None;
+        unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut rtv))? };
+        self.layers.insert(
+            key,
+            LayerTexture {
+                width,
+                height,
+                texture,
+                rtv,
+                srv,
+            },
+        );
+        Ok(())
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
@@ -721,9 +860,57 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_surfaces(&mut self, _surfaces: &[PaintSurface]) -> Result<()> {
-        // Base-gpui scene surfaces are unused on Windows (PaintSurface has no payload here); remote
-        // window frames are composited by `draw_remote_surfaces` from an out-of-band queue.
+    /// Composite cached view layers: for each `PaintSurface` whose source is a layer, draw its
+    /// offscreen texture stretched to the surface bounds via the surface pipeline (the same path
+    /// remote-window frames use). Runs in the main pass, so the back buffer + main viewport are
+    /// bound and the layer texture lands at the view's real on-screen position.
+    fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
+        if surfaces.is_empty() {
+            return Ok(());
+        }
+        let Some(devices) = self.devices.clone() else {
+            return Ok(());
+        };
+        let Some(viewport) = self.resources.as_ref().map(|r| r.viewport) else {
+            return Ok(());
+        };
+        for surface in surfaces {
+            let layer_id = match &surface.source {
+                PaintSurfaceSource::Layer(layer_id) => *layer_id,
+                #[cfg(target_os = "macos")]
+                _ => continue,
+            };
+            let Some((srv, tex_w, tex_h)) = self
+                .layers
+                .get(&layer_id.0)
+                .map(|t| (t.srv.clone(), t.width, t.height))
+            else {
+                continue;
+            };
+            if srv.is_none() {
+                // Texture not rendered yet (e.g. a composite-only first frame) — skip rather than
+                // draw garbage.
+                continue;
+            }
+            let instance = SurfaceSprite {
+                bounds: surface.bounds,
+                content_mask: surface.content_mask.bounds,
+                tex_size: [tex_w as f32, tex_h as f32],
+            };
+            self.pipelines.surface_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &[instance],
+            )?;
+            self.pipelines.surface_pipeline.draw_with_texture(
+                &devices.device_context,
+                slice::from_ref(&srv),
+                slice::from_ref(&viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.sampler),
+                1,
+            )?;
+        }
         Ok(())
     }
 
@@ -753,6 +940,7 @@ impl DirectXRenderer {
             let instance = SurfaceSprite {
                 bounds: surface.bounds,
                 content_mask: surface.bounds,
+                tex_size: [0.0, 0.0],
             };
             self.pipelines.surface_pipeline.update_buffer(
                 &devices.device,

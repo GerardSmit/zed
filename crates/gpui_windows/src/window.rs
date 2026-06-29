@@ -606,6 +606,10 @@ impl PlatformWindow for WindowsWindow {
         self.state.is_maximized()
     }
 
+    fn is_in_resize_loop(&self) -> bool {
+        self.state.in_size_move_loop.get()
+    }
+
     fn window_bounds(&self) -> WindowBounds {
         self.state.window_bounds()
     }
