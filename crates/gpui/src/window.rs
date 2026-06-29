@@ -1610,7 +1610,10 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, _| {
                         window.hovered.set(active);
-                        window.refresh();
+                        // Cache-honoring redraw: only views that depend on window hover status
+                        // (e.g. the titlebar) repaint — not the whole UI when the mouse enters or
+                        // leaves the window (which hovering the top-edge titlebar triggers).
+                        window.request_redraw();
                     })
                     .log_err();
             }
@@ -4724,13 +4727,16 @@ impl Window {
         if cx.has_active_drag() {
             if event.is::<MouseMoveEvent>() {
                 // If this was a mouse move event, redraw the window so that the
-                // active drag can follow the mouse cursor.
-                self.refresh();
+                // active drag can follow the mouse cursor. `request_redraw` (not `refresh`) so
+                // the uncached root re-renders and repositions the drag image, but views whose
+                // bounds didn't change reuse their cached render instead of re-rendering the whole
+                // UI on every move (e.g. while dragging a dock divider to resize a panel).
+                self.request_redraw();
             } else if event.is::<MouseUpEvent>() {
-                // If this was a mouse up event, cancel the active drag and redraw
-                // the window.
+                // If this was a mouse up event, cancel the active drag and redraw the window
+                // (cache-honoring: only the drag image's removal + any bounds change repaint).
                 cx.active_drag = None;
-                self.refresh();
+                self.request_redraw();
             }
         }
 

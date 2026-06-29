@@ -2626,7 +2626,7 @@ impl Interactivity {
 
                                 if can_drop {
                                     listener(drag.value.as_ref(), window, cx);
-                                    window.refresh();
+                                    window.request_redraw();
                                     cx.stop_propagation();
                                 }
                             }
@@ -2660,13 +2660,15 @@ impl Interactivity {
                     let pending_mouse_down = pending_mouse_down.clone();
                     let hitbox = hitbox.clone();
                     let has_aux_click_listeners = !aux_click_listeners.is_empty();
-                    move |event: &MouseDownEvent, phase, window, _cx| {
+                    let current_view = window.current_view();
+                    move |event: &MouseDownEvent, phase, window, cx| {
                         if phase == DispatchPhase::Bubble
                             && (event.button == MouseButton::Left || has_aux_click_listeners)
                             && hitbox.is_hovered(window)
                         {
                             *pending_mouse_down.borrow_mut() = Some(event.clone());
-                            window.refresh();
+                            // Invalidate only the view this element lives in, not the whole window.
+                            cx.notify(current_view);
                         }
                     }
                 });
@@ -2697,7 +2699,9 @@ impl Interactivity {
                                 cursor_style: drag_cursor_style,
                             });
                             pending_mouse_down.take();
-                            window.refresh();
+                            // Redraw so the drag image appears, without bypassing the per-view
+                            // cache — unaffected views shouldn't re-render just because a drag began.
+                            window.request_redraw();
                             cx.stop_propagation();
                         }
                     }
@@ -2773,6 +2777,7 @@ impl Interactivity {
                 window.on_mouse_event({
                     let mut captured_mouse_down = None;
                     let hitbox = hitbox.clone();
+                    let current_view = window.current_view();
                     move |event: &MouseUpEvent, phase, window, cx| match phase {
                         // Clear the pending mouse down during the capture phase,
                         // so that it happens even if another event handler stops
@@ -2781,7 +2786,7 @@ impl Interactivity {
                             let mut pending_mouse_down = pending_mouse_down.borrow_mut();
                             if pending_mouse_down.is_some() && hitbox.is_hovered(window) {
                                 captured_mouse_down = pending_mouse_down.take();
-                                window.refresh();
+                                cx.notify(current_view);
                             } else if pending_mouse_down.is_some() {
                                 // Clear the pending mouse down event (without firing click handlers)
                                 // if the hitbox is not being hovered.
@@ -2789,7 +2794,7 @@ impl Interactivity {
                                 // immediately after being clicked.
                                 // See https://github.com/zed-industries/zed/issues/24600 for more details
                                 pending_mouse_down.take();
-                                window.refresh();
+                                cx.notify(current_view);
                             }
                         }
                         // Fire click handlers during the bubble phase.
@@ -2899,10 +2904,11 @@ impl Interactivity {
 
             {
                 let active_state = active_state.clone();
-                window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _cx| {
+                let current_view = window.current_view();
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
                     if phase == DispatchPhase::Capture && active_state.borrow().is_clicked() {
                         *active_state.borrow_mut() = ElementClickedState::default();
-                        window.refresh();
+                        cx.notify(current_view);
                     }
                 });
             }
@@ -2913,7 +2919,8 @@ impl Interactivity {
                     .as_ref()
                     .and_then(|group_active| GroupHitboxes::get(&group_active.group, cx));
                 let hitbox = hitbox.clone();
-                window.on_mouse_event(move |_: &MouseDownEvent, phase, window, _cx| {
+                let current_view = window.current_view();
+                window.on_mouse_event(move |_: &MouseDownEvent, phase, window, cx| {
                     if phase == DispatchPhase::Bubble && !window.default_prevented() {
                         let group_hovered = active_group_hitbox
                             .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window));
@@ -2923,7 +2930,7 @@ impl Interactivity {
                                 group: group_hovered,
                                 element: element_hovered,
                             };
-                            window.refresh();
+                            cx.notify(current_view);
                         }
                     }
                 });
@@ -3310,8 +3317,8 @@ pub(crate) fn clear_active_tooltip(
     match active_tooltip.borrow_mut().take() {
         None => {}
         Some(ActiveTooltip::WaitingForShow { .. }) => {}
-        Some(ActiveTooltip::Visible { .. }) => window.refresh(),
-        Some(ActiveTooltip::WaitingForHide { .. }) => window.refresh(),
+        Some(ActiveTooltip::Visible { .. }) => window.request_redraw(),
+        Some(ActiveTooltip::WaitingForHide { .. }) => window.request_redraw(),
     }
 }
 
@@ -3327,7 +3334,7 @@ pub(crate) fn clear_active_tooltip_if_not_hoverable(
     };
     if should_clear {
         active_tooltip.borrow_mut().take();
-        window.refresh();
+        window.request_redraw();
     }
 }
 
@@ -3513,7 +3520,7 @@ fn handle_tooltip_mouse_move(
                                 }
                             });
                         *active_tooltip.borrow_mut() = new_tooltip;
-                        window.refresh();
+                        window.request_redraw();
                     })
                     .ok();
                 }
@@ -3586,7 +3593,7 @@ fn handle_tooltip_check_visible_and_update(
                         return;
                     };
                     if active_tooltip.borrow_mut().take().is_some() {
-                        cx.update(|window, _cx| window.refresh()).ok();
+                        cx.update(|window, _cx| window.request_redraw()).ok();
                     }
                 }
             });
