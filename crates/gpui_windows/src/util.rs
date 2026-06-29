@@ -147,6 +147,39 @@ pub(crate) fn configure_dwm_dark_mode(hwnd: HWND, appearance: WindowAppearance) 
     }
 }
 
+/// Strip Windows 11's automatic rounded corners + 1px border from a borderless popup window, so a
+/// transparent tooltip/menu window renders no frame at all.
+pub(crate) fn disable_window_chrome(hwnd: HWND) {
+    unsafe {
+        let pref = DWMWCP_DONOTROUND;
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &pref as *const _ as _,
+            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        )
+        .log_err();
+        // DWMWA_COLOR_NONE (0xFFFFFFFE) suppresses the window border.
+        let border_none: u32 = 0xFFFF_FFFE;
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &border_none as *const _ as _,
+            std::mem::size_of::<u32>() as u32,
+        )
+        .log_err();
+        // Disable non-client rendering — removes the DWM drop shadow on the borderless popup.
+        let ncrp = DWMNCRP_DISABLED;
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY,
+            &ncrp as *const _ as _,
+            std::mem::size_of::<DWMNCRENDERINGPOLICY>() as u32,
+        )
+        .log_err();
+    }
+}
+
 #[inline]
 pub(crate) fn logical_point(x: f32, y: f32, scale_factor: f32) -> Point<Pixels> {
     Point {

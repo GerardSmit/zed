@@ -238,6 +238,11 @@ impl WindowsWindowInner {
                 );
             }
         }
+        // Enter the loop: `draw_window` now skips redraws until the size changes off this baseline.
+        self.state.in_size_move_loop.set(true);
+        self.state
+            .size_move_loop_last_size
+            .set(self.state.logical_size.get());
         None
     }
 
@@ -245,6 +250,9 @@ impl WindowsWindowInner {
         unsafe {
             KillTimer(Some(handle), SIZE_MOVE_LOOP_TIMER_ID).log_err();
         }
+        self.state.in_size_move_loop.set(false);
+        // Settle on a final correct frame now that the gate is lifted.
+        self.handle_paint_msg(handle);
         None
     }
 
@@ -254,6 +262,7 @@ impl WindowsWindowInner {
             while let Some(Ok(runnable)) = runnables.next() {
                 WindowsDispatcher::execute_runnable(runnable);
             }
+            // `draw_window` gates pure-move redraws itself (see its move-loop guard).
             self.handle_paint_msg(handle)
         } else {
             None
@@ -888,7 +897,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_hit_test_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
-        if self.state.is_fullscreen() {
+        if !self.is_movable || self.state.is_fullscreen() {
             return None;
         }
 
@@ -899,13 +908,16 @@ impl WindowsWindowInner {
                 .callbacks
                 .hit_test_window_control
                 .set(Some(callback));
-            area.and_then(|area| match area {
-                WindowControlArea::Drag if self.is_movable => Some(HTCAPTION as _),
-                WindowControlArea::Drag => None,
-                WindowControlArea::Close => Some(HTCLOSE as _),
-                WindowControlArea::Max => Some(HTMAXBUTTON as _),
-                WindowControlArea::Min => Some(HTMINBUTTON as _),
-            })
+            if let Some(area) = area {
+                match area {
+                    WindowControlArea::Drag => Some(HTCAPTION as _),
+                    WindowControlArea::Close => return Some(HTCLOSE as _),
+                    WindowControlArea::Max => return Some(HTMAXBUTTON as _),
+                    WindowControlArea::Min => return Some(HTMINBUTTON as _),
+                }
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1215,7 +1227,23 @@ impl WindowsWindowInner {
 
     #[inline]
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
+        // Inside the Windows modal move/resize loop, skip redraws while the size is unchanged
+        // (a pure window move). The OS blits the existing content as the window moves, so
+        // re-rendering the whole UI every frame is wasted work. Live resize changes the size,
+        // which lifts this guard; `force_render` (device-loss recovery) always draws.
+        if self.state.in_size_move_loop.get()
+            && !force_render
+            && self.state.logical_size.get() == self.state.size_move_loop_last_size.get()
+        {
+            return Some(0);
+        }
+
         let mut request_frame = self.state.callbacks.request_frame.take()?;
+        if self.state.in_size_move_loop.get() {
+            self.state
+                .size_move_loop_last_size
+                .set(self.state.logical_size.get());
+        }
 
         self.state.direct_manipulation.update();
 

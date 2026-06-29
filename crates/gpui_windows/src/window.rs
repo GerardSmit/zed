@@ -45,6 +45,11 @@ impl std::ops::Deref for WindowsWindow {
 pub struct WindowsWindowState {
     pub origin: Cell<Point<Pixels>>,
     pub logical_size: Cell<Size<Pixels>>,
+    /// True while inside the Windows modal move/resize loop (WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE).
+    pub in_size_move_loop: Cell<bool>,
+    /// Window size at the last frame drawn inside the move/resize loop. Lets the loop skip
+    /// redraws for pure moves (size unchanged) and only repaint while actually resizing.
+    pub size_move_loop_last_size: Cell<Size<Pixels>>,
     pub min_size: Option<Size<Pixels>>,
     pub fullscreen_restore_bounds: Cell<Bounds<Pixels>>,
     pub border_offset: WindowBorderOffset,
@@ -151,6 +156,8 @@ impl WindowsWindowState {
         Ok(Self {
             origin: Cell::new(origin),
             logical_size: Cell::new(logical_size),
+            in_size_move_loop: Cell::new(false),
+            size_move_loop_last_size: Cell::new(logical_size),
             fullscreen_restore_bounds: Cell::new(fullscreen_restore_bounds),
             border_offset,
             appearance: Cell::new(appearance),
@@ -448,7 +455,13 @@ impl WindowsWindow {
         );
 
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
-            (WS_EX_TOOLWINDOW, WINDOW_STYLE(0x0))
+            // WS_EX_NOACTIVATE: a popup/tooltip must never steal activation or keyboard focus from
+            // its owner — otherwise keys stop reaching the editor and the owner reads as inactive.
+            // WS_EX_TOPMOST: stay above the owner even while the owner keeps focus/activation.
+            (
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                WINDOW_STYLE(0x0),
+            )
         } else {
             let mut dwstyle = WS_SYSMENU;
 
@@ -527,6 +540,9 @@ impl WindowsWindow {
         register_drag_drop(&this)?;
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
+        if params.kind == WindowKind::PopUp {
+            crate::util::disable_window_chrome(hwnd);
+        }
         this.state.border_offset.update(hwnd)?;
         let placement = retrieve_window_placement(
             hwnd,
@@ -618,7 +634,10 @@ impl PlatformWindow for WindowsWindow {
                         bounds.origin.y.0,
                         rect.right - rect.left,
                         rect.bottom - rect.top,
-                        SWP_NOMOVE,
+                        // NOACTIVATE: a programmatic resize must not steal activation/focus (a
+                        // no-activate popup resizing itself would otherwise grab the keyboard).
+                        // NOZORDER: keep the current z-order (e.g. a topmost popup stays topmost).
+                        SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
                     )
                     .context("unable to set window content size")
                     .log_err();
@@ -867,6 +886,18 @@ impl PlatformWindow for WindowsWindow {
                 status.state = WindowOpenState::Maximized;
                 self.state.initial_placement.set(Some(status));
             }
+        }
+    }
+
+    fn start_window_move(&self) {
+        unsafe {
+            ReleaseCapture().log_err();
+            SendMessageW(
+                self.0.hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                Some(LPARAM(0)),
+            );
         }
     }
 

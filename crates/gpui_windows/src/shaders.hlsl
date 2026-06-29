@@ -1256,3 +1256,44 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/*
+**
+**              Surfaces (streamed remote-window video frames)
+**
+*/
+
+struct SurfaceSprite {
+    Bounds bounds;
+    Bounds content_mask;
+};
+
+struct SurfaceVertexOutput {
+    float4 position: SV_Position;
+    float2 texcoord: TEXCOORD0;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct SurfaceFragmentInput {
+    float4 position: SV_Position;
+    float2 texcoord: TEXCOORD0;
+};
+
+StructuredBuffer<SurfaceSprite> surfaces: register(t1);
+
+SurfaceVertexOutput surface_vertex(uint vertex_id: SV_VertexID, uint surface_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    SurfaceSprite surface = surfaces[surface_id];
+    SurfaceVertexOutput output;
+    output.position = to_device_position(unit_vertex, surface.bounds);
+    output.texcoord = unit_vertex;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds, surface.content_mask);
+    return output;
+}
+
+// The frame texture is B8G8R8A8_UNORM, so the sampler already yields straight RGBA.
+float4 surface_fragment(SurfaceFragmentInput input): SV_Target {
+    float4 color = t_sprite.Sample(s_sprite, input.texcoord);
+    color.a = 1.0;
+    return color;
+}

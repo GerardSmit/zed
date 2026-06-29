@@ -48,6 +48,9 @@ pub(crate) struct DirectXRenderer {
     width: u32,
     height: u32,
 
+    /// Cached upload texture for remote-window surfaces (M1). Recreated when the frame size changes.
+    surface_texture: Option<RemoteSurfaceTexture>,
+
     /// Whether we want to skip drwaing due to device lost events.
     ///
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
@@ -90,6 +93,23 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    surface_pipeline: PipelineState<SurfaceSprite>,
+}
+
+/// One instance for the surface pipeline; mirrors the HLSL `SurfaceSprite` (two `Bounds` = 8 floats).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SurfaceSprite {
+    bounds: Bounds<ScaledPixels>,
+    content_mask: Bounds<ScaledPixels>,
+}
+
+/// A cached dynamic BGRA texture (+ SRV) for uploading remote-window frames each draw.
+struct RemoteSurfaceTexture {
+    width: u32,
+    height: u32,
+    texture: ID3D11Texture2D,
+    srv: Option<ID3D11ShaderResourceView>,
 }
 
 struct DirectXGlobalElements {
@@ -173,6 +193,7 @@ impl DirectXRenderer {
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
+            surface_texture: None,
             skip_draws: false,
         })
     }
@@ -352,6 +373,9 @@ impl DirectXRenderer {
                 scene.surfaces.len(),
             ))?;
         }
+        // Remote-window frames are pushed out-of-band (not as scene primitives, to avoid editing the
+        // read-only base gpui). Composit them on top after the scene.
+        self.draw_remote_surfaces()?;
         self.present()
     }
 
@@ -697,9 +721,127 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
+    fn draw_surfaces(&mut self, _surfaces: &[PaintSurface]) -> Result<()> {
+        // Base-gpui scene surfaces are unused on Windows (PaintSurface has no payload here); remote
+        // window frames are composited by `draw_remote_surfaces` from an out-of-band queue.
+        Ok(())
+    }
+
+    /// Composite the remote-window frames pushed this frame (via `crate::remote_surface::push_surface`)
+    /// as textured quads. M1: one BGRA frame uploaded to a cached dynamic texture per draw.
+    fn draw_remote_surfaces(&mut self) -> Result<()> {
+        let surfaces = crate::remote_surface::take_surfaces();
         if surfaces.is_empty() {
             return Ok(());
+        }
+
+        for surface in &surfaces {
+            if surface.width == 0 || surface.height == 0 {
+                continue;
+            }
+            self.ensure_surface_texture(surface.width, surface.height)?;
+            self.upload_surface(surface)?;
+
+            let Some(devices) = self.devices.clone() else {
+                continue;
+            };
+            let Some(viewport) = self.resources.as_ref().map(|r| r.viewport) else {
+                continue;
+            };
+            let srv = self.surface_texture.as_ref().and_then(|t| t.srv.clone());
+
+            let instance = SurfaceSprite {
+                bounds: surface.bounds,
+                content_mask: surface.bounds,
+            };
+            self.pipelines.surface_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &[instance],
+            )?;
+            self.pipelines.surface_pipeline.draw_with_texture(
+                &devices.device_context,
+                slice::from_ref(&srv),
+                slice::from_ref(&viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.sampler),
+                1,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_surface_texture(&mut self, width: u32, height: u32) -> Result<()> {
+        if let Some(t) = &self.surface_texture
+            && t.width == width
+            && t.height == height
+        {
+            return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DYNAMIC,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        unsafe {
+            devices
+                .device
+                .CreateTexture2D(&desc, None, Some(&mut texture))?
+        };
+        let texture = texture.context("CreateTexture2D returned null")?;
+        let mut srv = None;
+        unsafe {
+            devices
+                .device
+                .CreateShaderResourceView(&texture, None, Some(&mut srv))?
+        };
+        self.surface_texture = Some(RemoteSurfaceTexture {
+            width,
+            height,
+            texture,
+            srv,
+        });
+        Ok(())
+    }
+
+    fn upload_surface(&mut self, surface: &crate::remote_surface::RemoteSurface) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let Some(tex) = &self.surface_texture else {
+            return Ok(());
+        };
+        unsafe {
+            let mut mapped = std::mem::zeroed::<D3D11_MAPPED_SUBRESOURCE>();
+            devices.device_context.Map(
+                &tex.texture,
+                0,
+                D3D11_MAP_WRITE_DISCARD,
+                0,
+                Some(&mut mapped),
+            )?;
+            let src_stride = surface.stride as usize;
+            let row_bytes = (surface.width as usize) * 4;
+            let dst = mapped.pData as *mut u8;
+            let dst_stride = mapped.RowPitch as usize;
+            for row in 0..surface.height as usize {
+                std::ptr::copy_nonoverlapping(
+                    surface.bgra.as_ptr().add(row * src_stride),
+                    dst.add(row * dst_stride),
+                    row_bytes,
+                );
+            }
+            devices.device_context.Unmap(&tex.texture, 0);
         }
         Ok(())
     }
@@ -881,6 +1023,13 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        let surface_pipeline = PipelineState::new(
+            device,
+            "surface_pipeline",
+            ShaderModule::Surface,
+            4,
+            create_blend_state(device)?,
+        )?;
 
         Ok(Self {
             shadow_pipeline,
@@ -891,6 +1040,7 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            surface_pipeline,
         })
     }
 }
@@ -1603,6 +1753,7 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        Surface,
         EmojiRasterization,
     }
 
@@ -1676,6 +1827,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::Surface => match target {
+                    ShaderTarget::Vertex => SURFACE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => SURFACE_FRAGMENT_BYTES,
                 },
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
@@ -1767,6 +1922,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::Surface => "surface",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
         }
