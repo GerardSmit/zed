@@ -1,14 +1,15 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, LayerId, MonochromeSprite, Path,
+    PaintSurfaceSource, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
+    Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -42,6 +43,34 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+}
+
+/// Uniform block for the layer composite pipeline. `tex_size` is the actual
+/// pixel size of the offscreen texture (nonzero) so the shader can compute
+/// 1:1 texcoords and discard fragments outside the texture area (matching
+/// DirectX's culling/alpha behaviour). When `tex_size == [0,0]` the shader
+/// would stretch-to-fill, but we always set it for layer composites.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LayerSurfaceParams {
+    bounds: PodBounds,
+    content_mask: PodBounds,
+    tex_size: [f32; 2],
+    _pad: [f32; 2],
+}
+
+/// Number of frames a layer texture is kept alive after last being referenced.
+/// Mirrors DirectX's `LAYER_EVICT_FRAMES`.
+const LAYER_EVICT_FRAMES: u32 = 3;
+
+/// One cached offscreen texture for a layered view.
+struct LayerTexture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+    /// Frames since this layer was last seen in the scene.
+    unseen: u32,
 }
 
 #[repr(C)]
@@ -92,6 +121,8 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    /// Pipeline for compositing a cached layer texture onto the frame.
+    layer_composite: wgpu::RenderPipeline,
 }
 
 struct WgpuBindGroupLayouts {
@@ -99,6 +130,9 @@ struct WgpuBindGroupLayouts {
     instances: wgpu::BindGroupLayout,
     instances_with_texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+    /// Bind group layout for the layer composite pipeline: uniform params +
+    /// single RGBA texture + sampler.
+    layer_surfaces: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -120,6 +154,8 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    /// Cached offscreen textures for layered views, keyed by [`LayerId`] raw value.
+    layer_textures: HashMap<u64, LayerTexture>,
 }
 
 impl WgpuResources {
@@ -128,6 +164,7 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.layer_textures.clear();
     }
 }
 
@@ -463,6 +500,7 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            layer_textures: HashMap::new(),
         };
 
         Ok(Self {
@@ -607,11 +645,46 @@ impl WgpuRenderer {
             ],
         });
 
+        let layer_surfaces = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("layer_surfaces_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(
+                            std::mem::size_of::<LayerSurfaceParams>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
             instances_with_texture,
             surfaces,
+            layer_surfaces,
         }
     }
 
@@ -872,6 +945,18 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.surfaces,
             wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let layer_composite = create_pipeline(
+            "layer_composite",
+            "vs_layer_composite",
+            "fs_layer_composite",
+            &layouts.globals,
+            &layouts.layer_surfaces,
+            wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
             &shader_module,
@@ -887,6 +972,7 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            layer_composite,
         }
     }
 
@@ -1209,6 +1295,14 @@ impl WgpuRenderer {
                         label: Some("main_encoder"),
                     });
 
+            // Render each dirty layer sub-scene into its offscreen texture before the main pass.
+            self.render_layers(scene, &mut encoder, &mut instance_offset);
+
+            // After rendering layers the instance_offset may have advanced; reset it for the
+            // main pass so the main-pass geometry can also use the full buffer from the start.
+            // (Layer rendering uses its own separate instance_offset range.)
+            let main_instance_offset_start = instance_offset;
+
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("main_pass"),
@@ -1224,6 +1318,8 @@ impl WgpuRenderer {
                     depth_stencil_attachment: None,
                     ..Default::default()
                 });
+
+                instance_offset = main_instance_offset_start;
 
                 for batch in scene.batches() {
                     let ok = match batch {
@@ -1300,11 +1396,11 @@ impl WgpuRenderer {
                                 &mut instance_offset,
                                 &mut pass,
                             ),
-                        PrimitiveBatch::Surfaces(_surfaces) => {
-                            // Surfaces are macOS-only for video playback
-                            // Not implemented for Linux/wgpu
-                            true
-                        }
+                        PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
+                            &scene.surfaces[range],
+                            &mut instance_offset,
+                            &mut pass,
+                        ),
                     };
                     if !ok {
                         overflow = true;
@@ -1331,6 +1427,7 @@ impl WgpuRenderer {
                 .queue
                 .submit(std::iter::once(encoder.finish()));
             frame.present();
+            self.evict_stale_layers(scene);
             return true;
         }
     }
@@ -1444,6 +1541,408 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    /// Composite layer surfaces. Each `PaintSurface` whose source is `Layer(id)` is drawn
+    /// using the layer composite pipeline, sampling the offscreen texture produced by
+    /// `render_layers`. Sources of other kinds (macOS video, etc.) are ignored on wgpu.
+    fn draw_surfaces(
+        &self,
+        surfaces: &[gpui::PaintSurface],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        for surface in surfaces {
+            #[cfg(target_os = "macos")]
+            let layer_id = match &surface.source {
+                PaintSurfaceSource::Layer(id) => id,
+                PaintSurfaceSource::Image(_) => continue,
+            };
+            #[cfg(not(target_os = "macos"))]
+            let PaintSurfaceSource::Layer(layer_id) = &surface.source;
+
+            let resources = self.resources();
+            let Some(layer_tex) = resources.layer_textures.get(&layer_id.0) else {
+                continue; // texture not yet rendered; skip silently
+            };
+
+            let params = LayerSurfaceParams {
+                bounds: surface.bounds.into(),
+                content_mask: surface.content_mask.bounds.into(),
+                tex_size: [layer_tex.width as f32, layer_tex.height as f32],
+                _pad: [0.0; 2],
+            };
+
+            let params_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("layer_surface_params"),
+                size: std::mem::size_of::<LayerSurfaceParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            resources
+                .queue
+                .write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
+
+            let bind_group = resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("layer_surface_bg"),
+                    layout: &resources.bind_group_layouts.layer_surfaces,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&layer_tex.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                        },
+                    ],
+                });
+
+            pass.set_pipeline(&resources.pipelines.layer_composite);
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &bind_group, &[]);
+            pass.draw(0..4, 0..1);
+
+            // The params buffer is kept alive by the bind group until the pass ends.
+            // We need to keep it alive until after the pass, so we drop it explicitly later —
+            // however, wgpu's bind group holds an `Arc` to it so it is safe to drop here.
+            drop(params_buffer);
+        }
+        // We never overflow (each draw is independent, no instance buffer used).
+        let _ = instance_offset;
+        true
+    }
+
+    /// Render each `SceneLayer` that needs rendering into its offscreen texture.
+    /// This must be called before the main render pass so the textures are ready for compositing.
+    fn render_layers(
+        &mut self,
+        scene: &Scene,
+        encoder: &mut wgpu::CommandEncoder,
+        instance_offset: &mut u64,
+    ) {
+        for layer in &scene.layers {
+            if !layer.needs_render {
+                continue;
+            }
+            let sub_scene = match &layer.scene {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let width = layer.size.width.0.max(1) as u32;
+            let height = layer.size.height.0.max(1) as u32;
+
+            self.ensure_layer_texture(layer.id, width, height);
+
+            // Update the globals buffer with the layer's viewport size so all shaders
+            // compute positions relative to the layer (not the window).
+            let layer_globals = GlobalParams {
+                viewport_size: [width as f32, height as f32],
+                premultiplied_alpha: 0, // layer textures use straight alpha
+                pad: 0,
+            };
+            {
+                let resources = self.resources();
+                resources.queue.write_buffer(
+                    &resources.globals_buffer,
+                    0,
+                    bytemuck::bytes_of(&layer_globals),
+                );
+                // path_globals_bind_group also needs the layer viewport
+                resources.queue.write_buffer(
+                    &resources.globals_buffer,
+                    self.path_globals_offset,
+                    bytemuck::bytes_of(&layer_globals),
+                );
+            }
+
+            let layer_view = {
+                let resources = self.resources();
+                // SAFETY: we just ensured the texture exists
+                resources
+                    .layer_textures
+                    .get(&layer.id.0)
+                    .unwrap()
+                    .view
+                    .clone() // TextureView is Arc-backed; clone is cheap
+            };
+
+            // Layer render pass: clear to transparent, draw the sub-scene.
+            // We need a new render pass targeting the layer texture.
+            {
+                // Ensure path intermediate textures are sized for this layer.
+                // We temporarily resize the surface_config dimensions to the layer size so
+                // ensure_intermediate_textures() creates the right-sized intermediate buffer.
+                // After the layer pass we restore the original size.
+                // (The intermediate texture is only used for paths; we recreate it when
+                // the next layer or the main pass needs a different size.)
+                let saved_width = self.surface_config.width;
+                let saved_height = self.surface_config.height;
+                if self.surface_config.width != width || self.surface_config.height != height {
+                    self.surface_config.width = width;
+                    self.surface_config.height = height;
+                    let resources = self.resources_mut();
+                    if let Some(ref t) = resources.path_intermediate_texture {
+                        t.destroy();
+                    }
+                    if let Some(ref t) = resources.path_msaa_texture {
+                        t.destroy();
+                    }
+                    resources.path_intermediate_texture = None;
+                    resources.path_intermediate_view = None;
+                    resources.path_msaa_texture = None;
+                    resources.path_msaa_view = None;
+                }
+                self.ensure_intermediate_textures();
+                self.surface_config.width = saved_width;
+                self.surface_config.height = saved_height;
+
+                let mut layer_instance_offset: u64 = 0;
+
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("layer_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &layer_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+
+                for batch in sub_scene.batches() {
+                    let ok = match batch {
+                        PrimitiveBatch::Quads(range) => self.draw_quads(
+                            &sub_scene.quads[range],
+                            &mut layer_instance_offset,
+                            &mut pass,
+                        ),
+                        PrimitiveBatch::Shadows(range) => self.draw_shadows(
+                            &sub_scene.shadows[range],
+                            &mut layer_instance_offset,
+                            &mut pass,
+                        ),
+                        PrimitiveBatch::Paths(range) => {
+                            let paths = &sub_scene.paths[range];
+                            if paths.is_empty() {
+                                continue;
+                            }
+                            drop(pass);
+                            let did_draw = self.draw_paths_to_intermediate(
+                                encoder,
+                                paths,
+                                &mut layer_instance_offset,
+                            );
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("layer_pass_continued"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &layer_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+                            if did_draw {
+                                self.draw_paths_from_intermediate(
+                                    paths,
+                                    &mut layer_instance_offset,
+                                    &mut pass,
+                                )
+                            } else {
+                                false
+                            }
+                        }
+                        PrimitiveBatch::Underlines(range) => self.draw_underlines(
+                            &sub_scene.underlines[range],
+                            &mut layer_instance_offset,
+                            &mut pass,
+                        ),
+                        PrimitiveBatch::MonochromeSprites { texture_id, range } => self
+                            .draw_monochrome_sprites(
+                                &sub_scene.monochrome_sprites[range],
+                                texture_id,
+                                &mut layer_instance_offset,
+                                &mut pass,
+                            ),
+                        PrimitiveBatch::SubpixelSprites { texture_id, range } => self
+                            .draw_subpixel_sprites(
+                                &sub_scene.subpixel_sprites[range],
+                                texture_id,
+                                &mut layer_instance_offset,
+                                &mut pass,
+                            ),
+                        PrimitiveBatch::PolychromeSprites { texture_id, range } => self
+                            .draw_polychrome_sprites(
+                                &sub_scene.polychrome_sprites[range],
+                                texture_id,
+                                &mut layer_instance_offset,
+                                &mut pass,
+                            ),
+                        PrimitiveBatch::Surfaces(_) => true, // nested layers not supported
+                    };
+                    if !ok {
+                        // Instance buffer overflow within a layer — not ideal but not fatal;
+                        // the layer may be partially rendered.
+                        break;
+                    }
+                }
+                // `pass` is dropped here, finishing the layer render pass.
+                // Update the shared instance_offset to account for data written.
+                *instance_offset = (*instance_offset).max(layer_instance_offset);
+            }
+        }
+
+        // Restore the main window globals after all layer passes.
+        let main_globals = GlobalParams {
+            viewport_size: [
+                self.surface_config.width as f32,
+                self.surface_config.height as f32,
+            ],
+            premultiplied_alpha: if self.surface_config.alpha_mode
+                == wgpu::CompositeAlphaMode::PreMultiplied
+            {
+                1
+            } else {
+                0
+            },
+            pad: 0,
+        };
+        let main_path_globals = GlobalParams {
+            premultiplied_alpha: 0,
+            ..main_globals
+        };
+        {
+            let resources = self.resources();
+            resources.queue.write_buffer(
+                &resources.globals_buffer,
+                0,
+                bytemuck::bytes_of(&main_globals),
+            );
+            resources.queue.write_buffer(
+                &resources.globals_buffer,
+                self.path_globals_offset,
+                bytemuck::bytes_of(&main_path_globals),
+            );
+        }
+
+        // Restore intermediate textures for main pass size.
+        {
+            let need_regen = self
+                .resources()
+                .path_intermediate_texture
+                .as_ref()
+                .map(|t| {
+                    let size = t.size();
+                    size.width != self.surface_config.width
+                        || size.height != self.surface_config.height
+                })
+                .unwrap_or(true);
+            if need_regen {
+                let resources = self.resources_mut();
+                if let Some(ref t) = resources.path_intermediate_texture {
+                    t.destroy();
+                }
+                if let Some(ref t) = resources.path_msaa_texture {
+                    t.destroy();
+                }
+                resources.path_intermediate_texture = None;
+                resources.path_intermediate_view = None;
+                resources.path_msaa_texture = None;
+                resources.path_msaa_view = None;
+                drop(resources);
+                self.ensure_intermediate_textures();
+            }
+        }
+    }
+
+    /// Ensure a layer texture of the given size exists; (re)creates it if missing or wrong size.
+    fn ensure_layer_texture(&mut self, id: LayerId, width: u32, height: u32) {
+        let needs_create = self
+            .resources()
+            .layer_textures
+            .get(&id.0)
+            .map(|t| t.width != width || t.height != height)
+            .unwrap_or(true);
+
+        if !needs_create {
+            // Reset unseen counter since we're using it this frame.
+            if let Some(t) = self.resources_mut().layer_textures.get_mut(&id.0) {
+                t.unseen = 0;
+            }
+            return;
+        }
+
+        let format = self.surface_config.format;
+        let resources = self.resources_mut();
+        let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("layer_texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        resources.layer_textures.insert(
+            id.0,
+            LayerTexture {
+                texture,
+                view,
+                width,
+                height,
+                unseen: 0,
+            },
+        );
+    }
+
+    /// Drop layer textures that haven't been referenced for `LAYER_EVICT_FRAMES` frames.
+    fn evict_stale_layers(&mut self, scene: &Scene) {
+        // Build the set of layer ids referenced this frame.
+        let referenced: std::collections::HashSet<u64> = scene
+            .surfaces
+            .iter()
+            .filter_map(|s| {
+                match &s.source {
+                    PaintSurfaceSource::Layer(id) => Some(id.0),
+                    #[cfg(target_os = "macos")]
+                    PaintSurfaceSource::Image(_) => None,
+                }
+            })
+            .chain(scene.layers.iter().map(|l| l.id.0))
+            .collect();
+
+        let resources = self.resources_mut();
+        resources.layer_textures.retain(|id, tex| {
+            if referenced.contains(id) {
+                tex.unseen = 0;
+                true
+            } else {
+                tex.unseen += 1;
+                tex.unseen < LAYER_EVICT_FRAMES
+            }
+        });
     }
 
     fn draw_instances(

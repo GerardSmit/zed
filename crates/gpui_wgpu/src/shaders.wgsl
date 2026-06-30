@@ -1362,3 +1362,72 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+
+// --- layer composite --- //
+//
+// Composites a cached layer RGBA texture onto the frame. `tex_size` is the
+// actual pixel size of the layer texture. The texcoord is computed so that
+// unit_vertex=(0,0)..(1,1) maps exactly onto the portion of the texture that
+// corresponds to the layer's bounds, clamped so fragments outside the texture
+// area are discarded (matching DirectX's culling behaviour). The texture
+// carries straight alpha from the layer render pass, so we keep alpha as-is.
+
+struct LayerSurfaceParams {
+    bounds: Bounds,
+    content_mask: Bounds,
+    tex_size: vec2<f32>,
+    _pad: vec2<f32>,
+}
+
+@group(1) @binding(0) var<uniform> layer_surface_locals: LayerSurfaceParams;
+@group(1) @binding(1) var t_layer: texture_2d<f32>;
+@group(1) @binding(2) var s_layer: sampler;
+
+struct LayerSurfaceVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) unit_vertex: vec2<f32>,
+    @location(3) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_layer_composite(@builtin(vertex_index) vertex_id: u32) -> LayerSurfaceVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+
+    var out = LayerSurfaceVarying();
+    out.position = to_device_position(unit_vertex, layer_surface_locals.bounds);
+    out.unit_vertex = unit_vertex;
+    out.clip_distances = distance_from_clip_rect(
+        unit_vertex,
+        layer_surface_locals.bounds,
+        layer_surface_locals.content_mask,
+    );
+    return out;
+}
+
+@fragment
+fn fs_layer_composite(input: LayerSurfaceVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    // Map unit_vertex into texture space: bounds.size / tex_size gives the
+    // fraction of the texture covered by this surface. If the surface is
+    // exactly the same size as the texture, tex_coord will be exactly [0..1].
+    let bounds_size = layer_surface_locals.bounds.size;
+    let tex_size = layer_surface_locals.tex_size;
+    let tex_coord = input.unit_vertex * bounds_size / tex_size;
+
+    // Discard fragments whose texcoords exceed the texture extent (cull, DirectX parity).
+    if (any(tex_coord > vec2<f32>(1.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    // Sample the layer texture. The layer was rendered with straight alpha.
+    let sample = textureSampleLevel(t_layer, s_layer, tex_coord, 0.0);
+
+    // Premultiply if the surface uses premultiplied alpha compositing.
+    if (globals.premultiplied_alpha != 0u) {
+        return vec4<f32>(sample.rgb * sample.a, sample.a);
+    }
+    return sample;
+}
