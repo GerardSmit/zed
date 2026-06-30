@@ -129,7 +129,13 @@ struct LayerTexture {
     texture: ID3D11Texture2D,
     rtv: Option<ID3D11RenderTargetView>,
     srv: Option<ID3D11ShaderResourceView>,
+    /// Consecutive frames this layer was not composited. Once it exceeds `LAYER_EVICT_FRAMES` the
+    /// texture is dropped (the layered view was closed/hidden), freeing its VRAM.
+    unseen: u32,
 }
+
+/// Drop a layer texture after this many frames without being composited.
+const LAYER_EVICT_FRAMES: u32 = 240;
 
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
@@ -369,7 +375,35 @@ impl DirectXRenderer {
         // Remote-window frames are pushed out-of-band (not as scene primitives, to avoid editing the
         // read-only base gpui). Composit them on top after the scene.
         self.draw_remote_surfaces()?;
+        self.evict_stale_layers(scene);
         self.present()
+    }
+
+    /// Drop layer textures whose view stopped compositing (closed/hidden tab or panel), so their
+    /// VRAM isn't held forever. A layer is "live" this frame if a `PaintSurface(Layer)` referenced
+    /// it; the composite surface is replayed every frame (even on cache reuse), so this is reliable.
+    fn evict_stale_layers(&mut self, scene: &Scene) {
+        if self.layers.is_empty() {
+            return;
+        }
+        let live: std::collections::HashSet<u64> = scene
+            .surfaces
+            .iter()
+            .filter_map(|surface| match &surface.source {
+                PaintSurfaceSource::Layer(id) => Some(id.0),
+                #[cfg(target_os = "macos")]
+                _ => None,
+            })
+            .collect();
+        self.layers.retain(|id, texture| {
+            if live.contains(id) {
+                texture.unseen = 0;
+                true
+            } else {
+                texture.unseen += 1;
+                texture.unseen < LAYER_EVICT_FRAMES
+            }
+        });
     }
 
     /// Draw a scene's primitive batches into the currently-bound render target. Shared by the main
@@ -513,6 +547,7 @@ impl DirectXRenderer {
                 texture,
                 rtv,
                 srv,
+                unseen: 0,
             },
         );
         Ok(())
