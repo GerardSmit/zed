@@ -79,6 +79,16 @@ impl<T: 'static> DragMoveEvent<T> {
             .expect("DragMoveEvent is only valid when the stored active drag is of the same type.")
     }
 
+    /// Offset of the initiating click from the origin of the dragged element — i.e. where on the
+    /// element the drag was grabbed. Useful for resize handles, which should keep the grabbed point
+    /// under the cursor rather than snapping the edge to the cursor on the first move.
+    pub fn drag_cursor_offset(&self, cx: &App) -> Point<Pixels> {
+        cx.active_drag
+            .as_ref()
+            .map(|drag| drag.cursor_offset)
+            .unwrap_or_default()
+    }
+
     /// An item that is about to be dropped.
     pub fn dragged_item(&self) -> &dyn Any {
         self.dragged_item.as_ref()
