@@ -193,11 +193,17 @@ impl Element for AnyView {
                         // bounds check, a layer laid out at one size and then grown (e.g. the window
                         // settling, or a dock toggle) keeps its old, too-narrow content inside the
                         // new, larger composite bounds.
+                        // Cull (reuse cached texture) on a bounds change while EITHER the OS window
+                        // is resizing or the app is dragging a dock/panel divider. Both are
+                        // interactive resizes where re-rendering every cached layer each frame is
+                        // wasteful; the settle/drag-end frame is `view_dirty`/refreshed and re-renders
+                        // crisp.
+                        let resizing = window.platform_window.is_in_resize_loop()
+                            || window.resizing_layout;
                         let needs_render = view_dirty
                             || element_state.as_ref().map_or(true, |state| {
                                 state.layer_scale != Some(scale)
-                                    || (state.cache_key.bounds != bounds
-                                        && !window.platform_window.is_in_resize_loop())
+                                    || (state.cache_key.bounds != bounds && !resizing)
                             });
                         if !needs_render
                             && let Some(mut element_state) = element_state

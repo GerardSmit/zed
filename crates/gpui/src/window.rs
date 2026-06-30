@@ -1040,6 +1040,12 @@ pub struct Window {
     input_latency_tracker: InputLatencyTracker,
     last_input_modality: InputModality,
     pub(crate) refreshing: bool,
+    /// Set by the app while the user is interactively resizing the *layout* (dragging a dock/panel
+    /// divider) — as opposed to the OS window (`PlatformWindow::is_in_resize_loop`). Layer views
+    /// read it to cull (composite their cached texture) during the drag instead of re-rendering,
+    /// exactly like the window resize loop, so dragging a panel divider doesn't re-render every
+    /// cached tool window each frame. Cleared (and followed by a `refresh`) when the drag ends.
+    pub(crate) resizing_layout: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -1749,6 +1755,7 @@ impl Window {
             input_latency_tracker: InputLatencyTracker::new()?,
             last_input_modality: InputModality::Mouse,
             refreshing: false,
+            resizing_layout: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -1903,6 +1910,20 @@ impl Window {
         if self.invalidator.not_drawing() {
             self.invalidator.set_dirty(true);
         }
+    }
+
+    /// Mark the start/end of an interactive *layout* resize — dragging a dock/panel divider, as
+    /// opposed to the OS window. While set, layer views cull (composite their cached offscreen
+    /// texture) when their bounds change instead of re-rendering, so dragging a divider tracks the
+    /// cursor without re-rendering every cached tool window each frame. Pair `set(true)` on each
+    /// drag-move with `set(false)` + [`refresh`](Self::refresh) on release for a crisp final frame.
+    pub fn set_resizing_layout(&mut self, resizing: bool) {
+        self.resizing_layout = resizing;
+    }
+
+    /// Whether an interactive layout resize (dock/panel divider drag) is in progress.
+    pub fn is_resizing_layout(&self) -> bool {
+        self.resizing_layout
     }
 
     /// Close this window.
