@@ -57,6 +57,18 @@ pub(crate) struct WebWindowInner {
     pub(crate) is_composing: Cell<bool>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
+    /// False until the first frame is sized + rendered. The initial size applies immediately (no
+    /// blank wait); subsequent size changes (window resize) are debounced.
+    has_rendered: Cell<bool>,
+    /// True while a resize is in flight (between the last ResizeObserver tick and the debounce
+    /// timer firing). `draw` keeps the current buffer while set, so the browser stretches the last
+    /// frame to the new display size — a cheap "cull" instead of re-rendering every tick.
+    resizing: Cell<bool>,
+    /// Handle of the pending debounce `setTimeout`, so a new tick can cancel + restart it.
+    resize_timer: Cell<Option<i32>>,
+    /// The latest (clamped_w, clamped_h, logical_w, logical_h, dpr) seen mid-resize, applied when
+    /// the debounce timer fires.
+    pending_resize: RefCell<Option<(u32, u32, f32, f32, f32)>>,
 }
 
 pub struct WebWindow {
@@ -195,6 +207,10 @@ impl WebWindow {
             is_composing: Cell::new(false),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
+            has_rendered: Cell::new(false),
+            resizing: Cell::new(false),
+            resize_timer: Cell::new(None),
+            pending_resize: RefCell::new(None),
         });
 
         let raf_closure = inner.create_raf_closure();
@@ -277,33 +293,91 @@ impl WebWindow {
             let clamped_width = physical_width.min(max_texture_dimension);
             let clamped_height = physical_height.min(max_texture_dimension);
 
-            inner
-                .pending_physical_size
-                .set(Some((clamped_width, clamped_height)));
-
-            {
-                let mut s = inner.state.borrow_mut();
-                s.bounds.size = Size {
-                    width: px(logical_width),
-                    height: px(logical_height),
-                };
-                s.scale_factor = dpr_f32;
-            }
-
-            let new_size = Size {
-                width: px(logical_width),
-                height: px(logical_height),
-            };
-
-            let mut cbs = inner.callbacks.borrow_mut();
-            if let Some(ref mut callback) = cbs.resize {
-                callback(new_size, dpr_f32);
+            if !inner.has_rendered.get() {
+                // First frame (initial load): size + render immediately, no resize-loop.
+                inner.has_rendered.set(true);
+                inner.resizing.set(false);
+                inner.apply_size(
+                    clamped_width,
+                    clamped_height,
+                    logical_width,
+                    logical_height,
+                    dpr_f32,
+                );
+            } else {
+                // A window resize is in flight. The window itself keeps rendering — it reflows and
+                // re-renders at the new size each tick — but `resizing` (read by is_in_resize_loop)
+                // makes GPUI use request_redraw, so cached layers (tool windows, the editor) just
+                // composite their stale texture instead of re-rendering, exactly like the Windows
+                // resize loop. A 250ms-quiet debounce then does one crisp full re-render.
+                inner.resizing.set(true);
+                inner.apply_size(
+                    clamped_width,
+                    clamped_height,
+                    logical_width,
+                    logical_height,
+                    dpr_f32,
+                );
+                *inner.pending_resize.borrow_mut() = Some((
+                    clamped_width,
+                    clamped_height,
+                    logical_width,
+                    logical_height,
+                    dpr_f32,
+                ));
+                inner.schedule_resize_apply();
             }
         })
     }
 }
 
 impl WebWindowInner {
+    /// Apply a new window size: queue the physical size for the next `draw`, update the logical
+    /// bounds + scale, and notify GPUI so it re-lays-out and renders crisp at the new size.
+    fn apply_size(&self, clamped_w: u32, clamped_h: u32, logical_w: f32, logical_h: f32, dpr: f32) {
+        self.pending_physical_size.set(Some((clamped_w, clamped_h)));
+        {
+            let mut s = self.state.borrow_mut();
+            s.bounds.size = Size {
+                width: px(logical_w),
+                height: px(logical_h),
+            };
+            s.scale_factor = dpr;
+        }
+        let new_size = Size {
+            width: px(logical_w),
+            height: px(logical_h),
+        };
+        if let Some(ref mut callback) = self.callbacks.borrow_mut().resize {
+            callback(new_size, dpr);
+        }
+    }
+
+    /// (Re)start the 250ms resize debounce. While it's pending, `resizing` stays set so layers
+    /// composite their cached texture (cull). When it fires after a quiet 250ms, it clears the flag
+    /// and re-applies the latest size — one crisp full re-render (layers re-rendered) at the final
+    /// dimensions, mirroring the Windows WM_EXITSIZEMOVE force-redraw.
+    fn schedule_resize_apply(self: &Rc<Self>) {
+        if let Some(id) = self.resize_timer.take() {
+            self.browser_window.clear_timeout_with_handle(id);
+        }
+        let inner = Rc::clone(self);
+        let cb = Closure::once_into_js(move || {
+            inner.resize_timer.set(None);
+            inner.resizing.set(false);
+            let pending = inner.pending_resize.borrow_mut().take();
+            if let Some((cw, ch, lw, lh, dpr)) = pending {
+                inner.apply_size(cw, ch, lw, lh, dpr);
+            }
+        });
+        if let Ok(id) = self
+            .browser_window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(cb.unchecked_ref(), 250)
+        {
+            self.resize_timer.set(Some(id));
+        }
+    }
+
     fn create_raf_closure(self: &Rc<Self>) -> Closure<dyn FnMut()> {
         let raf_handle: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
         let raf_handle_inner = Rc::clone(&raf_handle);
@@ -511,6 +585,12 @@ impl raw_window_handle::HasDisplayHandle for WebWindow {
 impl PlatformWindow for WebWindow {
     fn bounds(&self) -> Bounds<Pixels> {
         self.inner.state.borrow().bounds
+    }
+
+    /// True while a window resize is in flight (until the 250ms debounce settles). GPUI reads this
+    /// in `bounds_changed` to cull-composite cached layers during resize instead of re-rendering.
+    fn is_in_resize_loop(&self) -> bool {
+        self.inner.resizing.get()
     }
 
     fn is_maximized(&self) -> bool {

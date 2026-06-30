@@ -72,9 +72,11 @@ impl AnyView {
     /// re-renders it crisp with correct hitboxes. Implies [`cached`](Self::cached) for layout.
     pub fn layer(mut self, style: StyleRefinement) -> Self {
         self.cached_style = Some(style.into());
-        // The wgpu layer compositor has unresolved web-specific issues (relayout crispness and
-        // composite sizing), so on wasm fall back to plain cached/inline rendering — always crisp
-        // and correctly sized. Native (DirectX) keeps real layer compositing.
+        // The wgpu layer compositor still renders layered views ~70px too narrow on web (the
+        // minimap stops short of the right edge); until that's fixed, fall back to plain
+        // cached/inline rendering on wasm — crisp and correctly sized. The resize-loop scaffolding
+        // (is_in_resize_loop + the 250ms debounce in gpui_web) is in place for when layers return.
+        // Native (DirectX) keeps real layer compositing.
         #[cfg(not(target_family = "wasm"))]
         {
             self.is_layer = true;
