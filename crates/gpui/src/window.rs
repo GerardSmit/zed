@@ -4215,7 +4215,7 @@ impl Window {
         &mut self,
         layer_id: crate::LayerId,
         bounds: Bounds<Pixels>,
-        size: Size<DevicePixels>,
+        _size: Size<DevicePixels>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         use crate::{PaintSurface, PaintSurfaceSource, Scene, SceneLayer};
@@ -4223,19 +4223,27 @@ impl Window {
         let parent_scene = std::mem::replace(&mut self.next_frame.scene, Scene::default());
         let result = f(self);
         let mut layer_scene = std::mem::replace(&mut self.next_frame.scene, parent_scene);
-        let origin = self.snap_bounds(bounds).origin;
+        let composite_bounds = self.snap_bounds(bounds);
+        let origin = composite_bounds.origin;
         layer_scene.translate(point(
             crate::ScaledPixels(-origin.x.0),
             crate::ScaledPixels(-origin.y.0),
         ));
         layer_scene.finish();
+        // The texture size MUST equal the snapped composite size, not the caller's unsnapped
+        // `size`. The surface shader computes tex_coord = unit_vertex * bounds_size / tex_size; if
+        // tex_size differs from the snapped composite bounds the texture is scaled (blurry, wrong
+        // size). Snapping both to the same integer device size makes it a crisp 1:1 sample.
+        let size = Size {
+            width: DevicePixels(composite_bounds.size.width.0 as i32),
+            height: DevicePixels(composite_bounds.size.height.0 as i32),
+        };
         self.next_frame.scene.layers.push(SceneLayer {
             id: layer_id,
             size,
             needs_render: true,
             scene: Some(Box::new(layer_scene)),
         });
-        let composite_bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
