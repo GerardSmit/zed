@@ -1624,7 +1624,8 @@ impl WgpuRenderer {
     fn render_layers(
         &mut self,
         scene: &Scene,
-        encoder: &mut wgpu::CommandEncoder,
+        // Layers now submit their own command buffers (see below); the main encoder is unused here.
+        _encoder: &mut wgpu::CommandEncoder,
         instance_offset: &mut u64,
     ) {
         for layer in &scene.layers {
@@ -1704,9 +1705,20 @@ impl WgpuRenderer {
                 self.surface_config.width = saved_width;
                 self.surface_config.height = saved_height;
 
+                // Each layer is recorded + submitted in its OWN command buffer. queue.write_buffer
+                // is deferred to the start of submit, so if every layer and the main pass shared one
+                // submit the LAST globals write (the window viewport) would apply to all passes —
+                // rendering layers against the wrong viewport (garbled, mis-scaled). A per-layer
+                // submit makes this layer's globals write take effect for exactly its own pass.
+                let mut layer_encoder = self.resources().device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor {
+                        label: Some("layer_encoder"),
+                    },
+                );
+
                 let mut layer_instance_offset: u64 = 0;
 
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                let mut pass = layer_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("layer_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &layer_view,
@@ -1740,11 +1752,11 @@ impl WgpuRenderer {
                             }
                             drop(pass);
                             let did_draw = self.draw_paths_to_intermediate(
-                                encoder,
+                                &mut layer_encoder,
                                 paths,
                                 &mut layer_instance_offset,
                             );
-                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            pass = layer_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("layer_pass_continued"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                     view: &layer_view,
@@ -1802,9 +1814,15 @@ impl WgpuRenderer {
                         break;
                     }
                 }
-                // `pass` is dropped here, finishing the layer render pass.
+                // Finish the layer render pass before consuming the encoder.
+                drop(pass);
                 // Update the shared instance_offset to account for data written.
                 *instance_offset = (*instance_offset).max(layer_instance_offset);
+
+                // Submit this layer on its own so its globals write applies to its pass only.
+                self.resources()
+                    .queue
+                    .submit(std::iter::once(layer_encoder.finish()));
             }
         }
 
