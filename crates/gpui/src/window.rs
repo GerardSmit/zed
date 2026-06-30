@@ -1955,12 +1955,17 @@ impl Window {
         // Only the views whose focus styling actually changed need to re-render: the one losing
         // focus and the one gaining it (plus their ancestors, handled by the dirty-view walk).
         // Invalidate just those instead of `refresh()`-ing the entire window — which would
-        // re-render every view and bypass the element cache. Fall back to a full refresh if a
-        // focus target isn't resolvable in the last frame (e.g. a freshly created element).
+        // re-render every view and bypass every element/layer cache.
+        //
+        // If a focus target isn't resolvable in the last frame (e.g. focusing a background tab that
+        // wasn't painted), only request a redraw rather than a full refresh: the view becomes
+        // visible when its container re-renders (the activating code notifies it), and cached layers
+        // that didn't change can still reuse their paint. A full refresh here made every tool-window
+        // panel re-render on each Ctrl+Tab.
         if !(self.invalidate_focus_view(previous_focus, cx)
             && self.invalidate_focus_view(Some(handle.id), cx))
         {
-            self.refresh();
+            self.request_redraw();
         }
     }
 
