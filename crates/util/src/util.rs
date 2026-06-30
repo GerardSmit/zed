@@ -1,17 +1,27 @@
+// Modules that drive a native filesystem / subprocess / shell (via smol, async_fs, async_zip,
+// std::process, std::fs) cannot compile on wasm32-unknown-unknown. text/rope/editor only use the
+// pure helpers below, so the browser build simply omits these.
+#[cfg(not(target_family = "wasm"))]
 pub mod archive;
+#[cfg(not(target_family = "wasm"))]
 pub mod command;
 pub mod disambiguate;
+#[cfg(not(target_family = "wasm"))]
 pub mod fs;
 pub mod markdown;
 pub mod path_list;
 pub mod paths;
+#[cfg(not(target_family = "wasm"))]
 pub mod process;
 pub mod redact;
 pub mod rel_path;
 pub mod schemars;
 pub mod serde;
+#[cfg(not(target_family = "wasm"))]
 pub mod shell;
+#[cfg(not(target_family = "wasm"))]
 pub mod shell_builder;
+#[cfg(not(target_family = "wasm"))]
 pub mod shell_env;
 pub mod size;
 #[cfg(any(test, feature = "test-support"))]
@@ -36,6 +46,7 @@ pub use take_until::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use util_macros::{line_endings, path, uri};
 
+#[cfg(not(target_family = "wasm"))]
 pub use self::shell::{
     get_default_system_shell, get_default_system_shell_preferring_bash, get_system_shell,
 };
@@ -308,6 +319,7 @@ fn load_shell_from_passwd() -> Result<()> {
 }
 
 /// Returns a shell escaped path for the current zed executable
+#[cfg(not(target_family = "wasm"))]
 pub fn get_shell_safe_zed_path(shell_kind: shell::ShellKind) -> anyhow::Result<String> {
     use anyhow::Context as _;
     use paths::PathExt;

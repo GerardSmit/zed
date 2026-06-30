@@ -308,6 +308,15 @@ impl CosmicTextSystemState {
             });
         }
 
+        // wasm has no system fonts, so a requested OS family ("Consolas", ".SystemUIFont") or
+        // GPUI's default family won't be in the database. Returning an empty list makes `font_id`
+        // fail and the text disappears; instead fall back to the first registered font so all UI
+        // text renders. Native keeps strict matching (the OS provides the families).
+        #[cfg(target_family = "wasm")]
+        if loaded_font_ids.is_empty() && !self.loaded_fonts.is_empty() {
+            loaded_font_ids.push(FontId(0));
+        }
+
         Ok(loaded_font_ids)
     }
 

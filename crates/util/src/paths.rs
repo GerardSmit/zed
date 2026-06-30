@@ -31,7 +31,15 @@ pub fn home_dir() -> &'static PathBuf {
                 PathBuf::from("/home/zed")
             }
         } else {
-            dirs::home_dir().expect("failed to determine home directory")
+            #[cfg(not(target_family = "wasm"))]
+            {
+                dirs::home_dir().expect("failed to determine home directory")
+            }
+            // No home directory in a browser; callers that matter are native-only anyway.
+            #[cfg(target_family = "wasm")]
+            {
+                PathBuf::from("/")
+            }
         }
     })
 }

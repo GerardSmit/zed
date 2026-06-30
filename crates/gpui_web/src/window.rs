@@ -147,9 +147,20 @@ impl WebWindow {
 
         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
 
+        // Seed the window size from the browser viewport instead of 0x0. The ResizeObserver hasn't
+        // fired yet, so a 0-size first frame would make content lay out at zero — which crashes
+        // layout math that assumes a positive viewport (e.g. the editor minimap). The observer
+        // corrects this to the exact canvas size on the next frame.
         let initial_bounds = Bounds {
             origin: Point::default(),
-            size: Size::default(),
+            size: Size {
+                width: px(browser_window.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(1024.0) as f32),
+                height: px(browser_window
+                    .inner_height()
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(768.0) as f32),
+            },
         };
 
         let mutable_state = WebWindowMutableState {

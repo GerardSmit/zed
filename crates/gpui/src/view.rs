@@ -72,7 +72,13 @@ impl AnyView {
     /// re-renders it crisp with correct hitboxes. Implies [`cached`](Self::cached) for layout.
     pub fn layer(mut self, style: StyleRefinement) -> Self {
         self.cached_style = Some(style.into());
-        self.is_layer = true;
+        // Layer compositing (offscreen GPU texture capture/composite) is only implemented in the
+        // DirectX backend, not wgpu. On wasm, fall back to plain caching so layered views (editor,
+        // tool windows) render inline instead of into an unsupported surface that draws nothing.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.is_layer = true;
+        }
         self
     }
 
