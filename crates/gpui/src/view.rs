@@ -265,15 +265,40 @@ impl Element for AnyView {
             if self.is_layer && !caching_disabled {
                 let layer_id = crate::LayerId(self.entity_id().as_u64());
                 let size = bounds.size.to_device_pixels(window.scale_factor());
-                if let Some(mut element) = element.take() {
-                    // Content (re)rendered this frame: paint the subtree into the layer's texture.
-                    window.capture_layer(layer_id, bounds, size, |window| {
-                        element.paint(window, cx);
-                    });
-                } else {
-                    // Unchanged: composite the existing texture at the current bounds.
-                    window.composite_layer(layer_id, bounds, size);
-                }
+                window.with_element_state::<AnyViewState, _>(
+                    global_id.unwrap(),
+                    |element_state, window| {
+                        let mut element_state = element_state.unwrap();
+                        if let Some(mut element) = element.take() {
+                            // Content (re)rendered: paint the subtree into the layer texture. Only
+                            // the visual scene is redirected — the view's mouse listeners, input
+                            // handlers, and cursor styles register on the main frame as usual. The
+                            // recorded paint range (those listeners + the composite surface) is what
+                            // later frames replay to stay interactive.
+                            let paint_start = window.paint_index();
+                            window.capture_layer(layer_id, bounds, size, |window| {
+                                element.paint(window, cx);
+                            });
+                            let paint_end = window.paint_index();
+                            element_state.paint_range = paint_start..paint_end;
+                        } else if element_state.cache_key.bounds == bounds {
+                            // Unchanged and same bounds: replay the cached composite AND its
+                            // listeners/handlers — the panel stays fully clickable/scrollable while
+                            // skipping the re-render. This is the common (non-resize) case.
+                            let paint_start = window.paint_index();
+                            window.reuse_paint(element_state.paint_range.clone());
+                            let paint_end = window.paint_index();
+                            element_state.paint_range = paint_start..paint_end;
+                        } else {
+                            // Bounds changed (live edge-drag resize): composite the existing texture
+                            // at the new bounds without re-rendering. Input is briefly inert (you're
+                            // dragging the window edge); the resize-end refresh re-renders and
+                            // restores it. Keep `paint_range` so the next replay still has listeners.
+                            window.composite_layer(layer_id, bounds, size);
+                        }
+                        ((), element_state)
+                    },
+                );
                 return;
             }
             if self.cached_style.is_some() && !caching_disabled {
