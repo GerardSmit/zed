@@ -207,6 +207,13 @@ impl Application {
             let cx = &mut *this.borrow_mut();
             on_finish_launching(cx);
         }));
+        // On native platforms `platform.run` blocks the event loop until quit, so dropping `self`
+        // here is correct cleanup. On wasm it returns immediately (the loop is driven by the
+        // browser via `spawn_local`/rAF), so dropping `self` would free the last `Rc<App>` once the
+        // launch future completes — taking every window and its event closures with it. Leak the
+        // app so it lives for the page's lifetime.
+        #[cfg(target_family = "wasm")]
+        std::mem::forget(self);
     }
 
     /// Register a handler to be invoked when the platform instructs the application

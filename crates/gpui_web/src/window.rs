@@ -642,6 +642,15 @@ impl PlatformWindow for WebWindow {
 
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>) {
         self.inner.callbacks.borrow_mut().resize = Some(callback);
+        // The ResizeObserver's first callback fires during construction, before GPUI wires this
+        // handler, so the real size is delivered to a `None` callback and the window's logical
+        // bounds stay at their initial value (leaving layout centered in a tiny area). Reset the
+        // cached size and re-observe so the observer re-delivers the current size to the
+        // now-registered handler. Re-observing is async, avoiding re-entrant borrows.
+        self.inner.last_physical_size.set((0, 0));
+        if let Some(observer) = &self._resize_observer {
+            self.inner.observe_canvas(observer);
+        }
     }
 
     fn on_moved(&self, callback: Box<dyn FnMut()>) {
@@ -665,18 +674,31 @@ impl PlatformWindow for WebWindow {
     }
 
     fn draw(&self, scene: &Scene) {
-        if let Some((width, height)) = self.inner.pending_physical_size.take() {
-            if self.inner.canvas.width() != width || self.inner.canvas.height() != height {
-                self.inner.canvas.set_width(width);
-                self.inner.canvas.set_height(height);
-            }
+        // Prefer a size queued by the ResizeObserver, but fall back to the canvas's current layout
+        // size. The observer's first callback can fire before GPUI wires its resize handler, so the
+        // queued size is lost and the canvas would otherwise stay at its initial 1x1; syncing from
+        // the displayed size here lets the very first paint (which runs in a post-layout rAF) pick
+        // up the real dimensions regardless.
+        let (width, height) = self.inner.pending_physical_size.take().unwrap_or_else(|| {
+            let dpr = self.inner.browser_window.device_pixel_ratio();
+            let max = self.inner.state.borrow().max_texture_dimension;
+            let w = (self.inner.canvas.client_width().max(0) as f64 * dpr).round() as u32;
+            let h = (self.inner.canvas.client_height().max(0) as f64 * dpr).round() as u32;
+            (w.min(max), h.min(max))
+        });
+
+        if width > 0
+            && height > 0
+            && (self.inner.canvas.width() != width || self.inner.canvas.height() != height)
+        {
+            self.inner.canvas.set_width(width);
+            self.inner.canvas.set_height(height);
 
             let mut state = self.inner.state.borrow_mut();
             state.renderer.update_drawable_size(Size {
                 width: DevicePixels(width as i32),
                 height: DevicePixels(height as i32),
             });
-            drop(state);
         }
 
         self.inner.state.borrow_mut().renderer.draw(scene);
