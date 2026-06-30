@@ -125,8 +125,13 @@ impl WebWindowInner {
     }
 
     fn dispatch_input(&self, input: PlatformInput) -> Option<DispatchEventResult> {
-        let mut borrowed = self.callbacks.borrow_mut();
-        borrowed.input.as_mut().map(|callback| callback(input))
+        // Take the callback out so the borrow is released for the duration of the call: input
+        // handlers can synchronously dispatch another input (e.g. a dock-resize drag), and holding
+        // `callbacks` borrowed across the call would double-borrow and panic ("already borrowed").
+        let mut callback = self.callbacks.borrow_mut().input.take()?;
+        let result = callback(input);
+        self.callbacks.borrow_mut().input = Some(callback);
+        Some(result)
     }
 
     fn register_pointer_down(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
