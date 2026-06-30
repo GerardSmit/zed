@@ -1,4 +1,8 @@
+// `std::time::Instant::now()` panics on wasm; web-time backs it with performance.now().
+#[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 pub trait SystemClock: Send + Sync {
     /// Returns the current date and time in UTC.

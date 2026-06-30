@@ -29,6 +29,11 @@ smallvec.workspace = true
 sum_tree.workspace = true
 util.workspace = true
 
+# `std::time::Instant` panics on wasm; web-time backs it with performance.now() (re-exports std on
+# native). Used for edit-transaction timestamps.
+[target.'cfg(target_family = "wasm")'.dependencies]
+web-time = "1"
+
 [dev-dependencies]
 collections = { workspace = true, features = ["test-support"] }
 ctor.workspace = true

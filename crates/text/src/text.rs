@@ -34,8 +34,16 @@ use std::{
     ops::{self, Deref, Range, Sub},
     str,
     sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+// `std::time::Instant::now()` panics on wasm32-unknown-unknown ("time not implemented"); web-time
+// backs it with performance.now(). On native it re-exports std, so this is free there.
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
+
 pub use subscription::*;
 pub use sum_tree::Bias;
 use sum_tree::{Dimensions, FilterCursor, SumTree, Summary, TreeMap, TreeSet};
