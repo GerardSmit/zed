@@ -159,12 +159,16 @@ struct WgpuResources {
 }
 
 impl WgpuResources {
+    /// Drop the window-sized path/MSAA intermediates so they're lazily recreated at the new size.
+    /// Does NOT touch `layer_textures`: those are per-layer (not surface-sized) and are the cached
+    /// textures the resize cull composites — clearing them every resize frame made tool windows go
+    /// invisible mid-resize. Per-layer textures are resized by `ensure_layer_texture` and dropped by
+    /// `evict_stale_layers`; only a real device loss invalidates them (handled at the call site).
     fn invalidate_intermediate_textures(&mut self) {
         self.path_intermediate_texture = None;
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
-        self.layer_textures.clear();
     }
 }
 
@@ -1188,6 +1192,9 @@ impl WgpuRenderer {
             } else if self.failed_frame_count > 5 {
                 if let Some(res) = self.resources.as_mut() {
                     res.invalidate_intermediate_textures();
+                    // A real GPU error may have lost the device — drop the cached layer textures
+                    // too so they're recaptured fresh (resize alone must not reach here).
+                    res.layer_textures.clear();
                 }
                 self.atlas.clear();
                 self.needs_redraw = true;

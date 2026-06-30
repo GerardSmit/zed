@@ -3238,6 +3238,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "smallvec",
+ "web-time",
 ]
 
 [[package]]
@@ -18426,6 +18427,7 @@ dependencies = [
  "smallvec",
  "sum_tree",
  "util",
+ "web-time",
  "zlog",
 ]
 
