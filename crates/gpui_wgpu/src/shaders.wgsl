@@ -1410,12 +1410,18 @@ fn fs_layer_composite(input: LayerSurfaceVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    // Stretch the whole layer texture across the surface. When the texture matches the surface
-    // size (the normal, settled case) this is a crisp 1:1 sample. While compositing a stale cached
-    // layer at new bounds mid-resize, the texture is smaller/larger than the surface — stretching
-    // fills the surface with the old frame (slightly soft) instead of culling everything past the
-    // old extent, which left the grown area transparent and made the layer appear to vanish.
-    let tex_coord = input.unit_vertex;
+    // Cull (DirectX parity): sample the cached texture at its captured 1:1 size, anchored at the
+    // surface origin. bounds.size / tex_size is the fraction of the new surface the old texture
+    // covers; when they match (settled) tex_coord is exactly [0,1]. Mid-resize the surface is a
+    // different size than the cached texture — keep the texture crisp at its own size and discard
+    // past its extent (the window reflows around it) rather than stretching it to fill.
+    let bounds_size = layer_surface_locals.bounds.size;
+    let tex_size = layer_surface_locals.tex_size;
+    let tex_coord = input.unit_vertex * bounds_size / tex_size;
+
+    if (any(tex_coord > vec2<f32>(1.0))) {
+        return vec4<f32>(0.0);
+    }
 
     // Sample the layer texture. The layer was rendered with straight alpha.
     let sample = textureSampleLevel(t_layer, s_layer, tex_coord, 0.0);
