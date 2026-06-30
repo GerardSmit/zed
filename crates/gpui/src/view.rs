@@ -307,8 +307,15 @@ impl Element for AnyView {
                             // Bounds changed (live edge-drag resize): composite the existing texture
                             // at the new bounds without re-rendering. Input is briefly inert (you're
                             // dragging the window edge); the resize-end refresh re-renders and
-                            // restores it. Keep `paint_range` so the next replay still has listeners.
+                            // restores it. Re-record `paint_range` around the composite so it stays
+                            // valid for the next frame's replay — leaving the previous frame's range
+                            // cached would later index a now-smaller rendered frame and panic
+                            // ("range end index out of range"). The composite adds scene but no
+                            // listeners, so the recorded range is consistent (input simply inert).
+                            let paint_start = window.paint_index();
                             window.composite_layer(layer_id, bounds, size);
+                            let paint_end = window.paint_index();
+                            element_state.paint_range = paint_start..paint_end;
                         }
                         ((), element_state)
                     },
