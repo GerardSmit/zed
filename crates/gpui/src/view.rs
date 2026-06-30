@@ -187,10 +187,18 @@ impl Element for AnyView {
                         // stale (acceptable mid-resize; a content change or resize-settle frame is
                         // `view_dirty` and re-renders crisp). Only re-render the texture when dirty,
                         // first paint, or scale changed.
+                        // Re-render (re-layout) the layer when it's dirty, the scale changed, or
+                        // its bounds changed — EXCEPT mid-resize, where we deliberately reuse the
+                        // stale prepaint and composite the cached texture (the cull). Without the
+                        // bounds check, a layer laid out at one size and then grown (e.g. the window
+                        // settling, or a dock toggle) keeps its old, too-narrow content inside the
+                        // new, larger composite bounds.
                         let needs_render = view_dirty
-                            || element_state
-                                .as_ref()
-                                .map_or(true, |state| state.layer_scale != Some(scale));
+                            || element_state.as_ref().map_or(true, |state| {
+                                state.layer_scale != Some(scale)
+                                    || (state.cache_key.bounds != bounds
+                                        && !window.platform_window.is_in_resize_loop())
+                            });
                         if !needs_render
                             && let Some(mut element_state) = element_state
                         {
