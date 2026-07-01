@@ -24,6 +24,14 @@ pub fn single_threaded_web() -> gpui::Application {
     gpui::Application::with_platform(Rc::new(gpui_web::WebPlatform::new(false)))
 }
 
+/// A web application that uses the multi-threaded dispatcher (a pool of shared-memory web-worker
+/// background threads). Requires cross-origin isolation (COOP/COEP) so `SharedArrayBuffer` exists;
+/// falls back to the main thread at runtime when it doesn't.
+#[cfg(target_family = "wasm")]
+pub fn multi_threaded_web() -> gpui::Application {
+    gpui::Application::with_platform(Rc::new(gpui_web::WebPlatform::new(true)))
+}
+
 /// Initializes panic hooks and logging for the web platform.
 /// Call this before running the application in a wasm_bindgen entrypoint.
 #[cfg(target_family = "wasm")]
