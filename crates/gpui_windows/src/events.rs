@@ -28,6 +28,7 @@ pub(crate) const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = WM_USER + 5;
 pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
 pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
+pub(crate) const WM_GPUI_CTRL_CAPSLOCK: u32 = WM_USER + 9;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 
@@ -101,6 +102,7 @@ impl WindowsWindowInner {
             WM_SYSKEYUP => self.handle_syskeyup_msg(wparam, lparam),
             WM_KEYUP => self.handle_keyup_msg(wparam, lparam),
             WM_GPUI_KEYDOWN => self.handle_keydown_msg(wparam, lparam),
+            WM_GPUI_CTRL_CAPSLOCK => self.handle_ctrl_capslock_shortcut(wparam),
             WM_CHAR => self.handle_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
@@ -405,6 +407,33 @@ impl WindowsWindowInner {
         }) else {
             return Some(1);
         };
+
+        let Some(mut func) = self.state.callbacks.input.take() else {
+            return Some(1);
+        };
+
+        let handled = !func(input).propagate;
+        self.state.callbacks.input.set(Some(func));
+
+        if handled { Some(0) } else { Some(1) }
+    }
+
+    fn handle_ctrl_capslock_shortcut(&self, wparam: WPARAM) -> Option<isize> {
+        let input = PlatformInput::KeyDown(KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers {
+                    control: true,
+                    alt: false,
+                    shift: wparam.0 & 1 != 0,
+                    platform: false,
+                    function: false,
+                },
+                key: "capslock".to_string(),
+                key_char: None,
+            },
+            is_held: false,
+            prefer_character_input: false,
+        });
 
         let Some(mut func) = self.state.callbacks.input.take() else {
             return Some(1);
@@ -1422,6 +1451,16 @@ where
         }
         VK_PACKET => None,
         VK_CAPITAL => {
+            if modifiers.control && !modifiers.alt && !modifiers.platform {
+                return Some(f(
+                    Keystroke {
+                        modifiers,
+                        key: "capslock".to_string(),
+                        key_char: None,
+                    },
+                    false,
+                ));
+            }
             let capslock = current_capslock();
             if state
                 .last_reported_capslock

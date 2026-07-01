@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     rc::{Rc, Weak},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -33,6 +33,7 @@ use gpui::*;
 pub struct WindowsPlatform {
     inner: Rc<WindowsPlatformInner>,
     raw_window_handles: Arc<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    ctrl_capslock_hook: Option<HHOOK>,
     // The below members will never change throughout the entire lifecycle of the app.
     headless: bool,
     icon: HICON,
@@ -80,6 +81,8 @@ struct PlatformCallbacks {
     keyboard_layout_change: Cell<Option<Box<dyn FnMut()>>>,
     system_wake: Cell<Option<Box<dyn FnMut()>>>,
 }
+
+static CTRL_CAPSLOCK_WINDOWS: OnceLock<Arc<RwLock<SmallVec<[SafeHwnd; 4]>>>> = OnceLock::new();
 
 impl WindowsPlatformState {
     fn new(directx_devices: Option<DirectXDevices>) -> Self {
@@ -184,11 +187,18 @@ impl WindowsPlatform {
         } else {
             HICON::default()
         };
+        let ctrl_capslock_hook = if !headless {
+            let _ = CTRL_CAPSLOCK_WINDOWS.set(raw_window_handles.clone());
+            install_ctrl_capslock_hook().log_err()
+        } else {
+            None
+        };
 
         Ok(Self {
             inner,
             handle,
             raw_window_handles,
+            ctrl_capslock_hook,
             headless,
             icon,
             background_executor,
@@ -358,6 +368,83 @@ fn translate_accelerator(msg: &MSG) -> Option<()> {
         )
     };
     (result.0 == 0).then_some(())
+}
+
+fn install_ctrl_capslock_hook() -> Result<HHOOK> {
+    unsafe {
+        let module = GetModuleHandleW(None).context("Getting module handle for keyboard hook")?;
+        SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(ctrl_capslock_keyboard_proc),
+            Some(HINSTANCE(module.0)),
+            0,
+        )
+        .context("Installing Ctrl+Caps Lock keyboard hook")
+    }
+}
+
+unsafe extern "system" fn ctrl_capslock_keyboard_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code == HC_ACTION as i32 && ctrl_capslock_event_should_be_suppressed(wparam, lparam) {
+        return LRESULT(1);
+    }
+
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+fn ctrl_capslock_event_should_be_suppressed(wparam: WPARAM, lparam: LPARAM) -> bool {
+    let msg = wparam.0 as u32;
+    if msg != WM_KEYDOWN && msg != WM_SYSKEYDOWN && msg != WM_KEYUP && msg != WM_SYSKEYUP {
+        return false;
+    }
+
+    let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    if info.vkCode != VK_CAPITAL.0 as u32 {
+        return false;
+    }
+
+    if !is_async_key_pressed(VK_CONTROL)
+        || is_async_key_pressed(VK_MENU)
+        || is_async_key_pressed(VK_LWIN)
+        || is_async_key_pressed(VK_RWIN)
+    {
+        return false;
+    }
+
+    let Some(hwnd) = ctrl_capslock_target_window() else {
+        return false;
+    };
+
+    if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+        let shift = usize::from(is_async_key_pressed(VK_SHIFT));
+        unsafe {
+            PostMessageW(Some(hwnd), WM_GPUI_CTRL_CAPSLOCK, WPARAM(shift), LPARAM(0)).log_err();
+        }
+    }
+
+    true
+}
+
+fn ctrl_capslock_target_window() -> Option<HWND> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return None;
+    }
+
+    let windows = CTRL_CAPSLOCK_WINDOWS.get()?;
+    windows
+        .read()
+        .iter()
+        .any(|entry| entry.as_raw() == hwnd)
+        .then_some(hwnd)
+}
+
+#[inline]
+fn is_async_key_pressed(key: VIRTUAL_KEY) -> bool {
+    unsafe { GetAsyncKeyState(key.0 as i32) < 0 }
 }
 
 impl Platform for WindowsPlatform {
@@ -1057,6 +1144,9 @@ impl WindowsPlatformInner {
 impl Drop for WindowsPlatform {
     fn drop(&mut self) {
         unsafe {
+            if let Some(hook) = self.ctrl_capslock_hook.take() {
+                UnhookWindowsHookEx(hook).log_err();
+            }
             if let Some(notification) = self.suspend_resume_notification.borrow_mut().take() {
                 // SAFETY: notification was returned by RegisterSuspendResumeNotification.
                 UnregisterSuspendResumeNotification(notification).log_err();

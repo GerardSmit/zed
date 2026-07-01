@@ -896,12 +896,13 @@ impl PlatformWindow for WindowsWindow {
     fn start_window_move(&self) {
         unsafe {
             ReleaseCapture().log_err();
-            SendMessageW(
-                self.0.hwnd,
+            PostMessageW(
+                Some(self.0.hwnd),
                 WM_NCLBUTTONDOWN,
-                Some(WPARAM(HTCAPTION as usize)),
-                Some(LPARAM(0)),
-            );
+                WPARAM(HTCAPTION as usize),
+                LPARAM(0),
+            )
+            .log_err();
         }
     }
 
