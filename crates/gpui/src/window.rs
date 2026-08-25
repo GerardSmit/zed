@@ -861,6 +861,7 @@ pub(crate) struct PaintIndex {
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
+    window_control_hitboxes_index: usize,
     line_layout_index: LineLayoutIndex,
 }
 
@@ -3207,6 +3208,7 @@ impl Window {
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             line_layout_index: self.text_system.layout_index(),
         }
     }
@@ -3239,6 +3241,16 @@ impl Window {
         self.next_frame.tab_stops.replay(
             &self.rendered_frame.tab_stops.insertion_history
                 [range.start.tab_handle_index..range.end.tab_handle_index],
+        );
+        // The OS asks the *rendered* frame which regions are caption / min / max / close. A
+        // cache-hit frame reuses its subtree's paint without re-running it, so without replaying
+        // these the window controls and caption drag silently stop working on every cached frame —
+        // which is what kept the titlebar from being cacheable at all.
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes[range.start.window_control_hitboxes_index
+                ..range.end.window_control_hitboxes_index]
+                .iter()
+                .cloned(),
         );
 
         self.text_system
