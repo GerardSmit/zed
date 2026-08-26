@@ -909,6 +909,16 @@ impl TextLayout {
         self.0.borrow().as_ref().unwrap().bounds.unwrap()
     }
 
+    /// The bounds of this layout, or `None` when it has not been prepainted this frame.
+    ///
+    /// An element can be built and laid out and still never paint — culled by a virtualized
+    /// list, or on the unpainted side of a branch — and its bounds are only set during prepaint.
+    /// A caller collecting layouts as it renders cannot know which of them will survive, so it
+    /// needs to ask rather than assume; [`Self::bounds`] panics on exactly that case.
+    pub fn bounds_if_painted(&self) -> Option<Bounds<Pixels>> {
+        self.0.borrow().as_ref().and_then(|layout| layout.bounds)
+    }
+
     /// The line height for this layout.
     pub fn line_height(&self) -> Pixels {
         self.0.borrow().as_ref().unwrap().line_height
