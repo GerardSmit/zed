@@ -973,6 +973,47 @@ impl StateInner {
         self.items = SumTree::from_iter(measured_items, ());
     }
 
+    /// Measure every item that has no cached height, at `available_width`.
+    ///
+    /// Only `ListSizingBehavior::Infer` needs this. That mode reports the sum over *all* items as
+    /// the element's height, and an unmeasured item sums as zero — so any item past the window
+    /// `layout_items` walked would be reported as occupying no space, and a list whose content
+    /// grew past its last bounds could never report its way out of them.
+    fn measure_unmeasured_items(
+        &mut self,
+        available_width: Pixels,
+        render_item: &mut RenderItemFn,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if !self.items.summary().has_unknown_height {
+            return;
+        }
+
+        let available_item_space = size(
+            AvailableSpace::Definite(available_width),
+            AvailableSpace::MinContent,
+        );
+        let measured_items: Vec<ListItem> = self
+            .items
+            .clone()
+            .iter()
+            .enumerate()
+            .map(|(ix, item)| {
+                let size = item.size().unwrap_or_else(|| {
+                    let mut element = render_item(ix, window, cx);
+                    element.layout_as_root(available_item_space, window, cx)
+                });
+                ListItem::Measured {
+                    size,
+                    focus_handle: item.focus_handle(),
+                }
+            })
+            .collect();
+
+        self.items = SumTree::from_iter(measured_items, ());
+    }
+
     fn layout_items(
         &mut self,
         available_width: Option<Pixels>,
@@ -1425,8 +1466,19 @@ impl Element for List {
                         window.rem_size(),
                     );
 
+                    // A list that reports its own height must measure at the width it will
+                    // actually be painted at. Passing `None` here measures against
+                    // `AvailableSpace::MinContent`, which wraps every line of a code block or a
+                    // paragraph against its longest word — so the height reported to the parent
+                    // is a multiple of the height the list then paints, and the parent reserves
+                    // the difference as blank space. The last painted width is the best answer
+                    // available; on the very first layout there is none, and min-content is then
+                    // the honest intrinsic measurement it always was.
+                    let available_width =
+                        state.last_layout_bounds.map(|bounds| bounds.size.width);
+
                     let layout_response = state.layout_items(
-                        None,
+                        available_width,
                         available_height,
                         &padding,
                         &mut self.render_item,
@@ -1434,6 +1486,10 @@ impl Element for List {
                         cx,
                     );
                     let max_element_width = layout_response.max_item_width;
+
+                    if let Some(width) = available_width {
+                        state.measure_unmeasured_items(width, &mut self.render_item, window, cx);
+                    }
 
                     let summary = state.items.summary();
                     let total_height = summary.height;
