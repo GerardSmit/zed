@@ -1953,6 +1953,7 @@ impl Window {
         true
     }
 
+    /// Move keyboard focus to `handle` and notify the affected view.
     pub fn focus(&mut self, handle: &FocusHandle, cx: &mut App) {
         if !self.focus_enabled || self.focus == Some(handle.id) {
             return;

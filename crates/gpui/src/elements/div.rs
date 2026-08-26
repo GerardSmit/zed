@@ -2915,7 +2915,7 @@ impl Interactivity {
             {
                 let active_state = active_state.clone();
                 let current_view = window.current_view();
-                window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, cx| {
                     if phase == DispatchPhase::Capture && active_state.borrow().is_clicked() {
                         *active_state.borrow_mut() = ElementClickedState::default();
                         cx.notify(current_view);

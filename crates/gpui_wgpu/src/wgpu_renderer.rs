@@ -65,7 +65,7 @@ const LAYER_EVICT_FRAMES: u32 = 3;
 
 /// One cached offscreen texture for a layered view.
 struct LayerTexture {
-    texture: wgpu::Texture,
+    _texture: wgpu::Texture,
     view: wgpu::TextureView,
     width: u32,
     height: u32,
@@ -1890,7 +1890,7 @@ impl WgpuRenderer {
                 resources.path_intermediate_view = None;
                 resources.path_msaa_texture = None;
                 resources.path_msaa_view = None;
-                drop(resources);
+                let _ = resources;
                 self.ensure_intermediate_textures();
             }
         }
@@ -1933,7 +1933,7 @@ impl WgpuRenderer {
         resources.layer_textures.insert(
             id.0,
             LayerTexture {
-                texture,
+                _texture: texture,
                 view,
                 width,
                 height,
