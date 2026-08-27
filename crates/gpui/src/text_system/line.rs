@@ -1,7 +1,7 @@
 use crate::{
     App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window,
-    WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
+    ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, TextShadow,
+    UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -36,6 +36,9 @@ pub struct DecorationRun {
 
     /// The strikethrough style for this run
     pub strikethrough: Option<StrikethroughStyle>,
+
+    /// The drop shadow painted under this run's glyphs
+    pub text_shadow: Option<TextShadow>,
 }
 
 /// A line of text that has been shaped and decorated.
@@ -89,6 +92,20 @@ impl ShapedLine {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
+        if has_shadow(&self.decoration_runs) {
+            paint_line(
+                origin,
+                &self.layout,
+                line_height,
+                align,
+                align_width,
+                &self.decoration_runs,
+                &[],
+                GlyphPass::Shadow,
+                window,
+                cx,
+            )?;
+        }
         paint_line(
             origin,
             &self.layout,
@@ -97,6 +114,7 @@ impl ShapedLine {
             align_width,
             &self.decoration_runs,
             &[],
+            GlyphPass::Glyphs,
             window,
             cx,
         )?;
@@ -194,6 +212,7 @@ impl ShapedLine {
                     background_color: decoration.background_color,
                     underline: decoration.underline,
                     strikethrough: decoration.strikethrough,
+                    text_shadow: decoration.text_shadow,
                 });
                 right_decorations.push(DecorationRun {
                     len: right_len,
@@ -201,6 +220,7 @@ impl ShapedLine {
                     background_color: decoration.background_color,
                     underline: decoration.underline,
                     strikethrough: decoration.strikethrough,
+                    text_shadow: decoration.text_shadow,
                 });
             }
 
@@ -285,6 +305,20 @@ impl WrappedLine {
             None => self.layout.wrap_width,
         };
 
+        if has_shadow(&self.decoration_runs) {
+            paint_line(
+                origin,
+                &self.layout.unwrapped_layout,
+                line_height,
+                align,
+                align_width,
+                &self.decoration_runs,
+                &self.wrap_boundaries,
+                GlyphPass::Shadow,
+                window,
+                cx,
+            )?;
+        }
         paint_line(
             origin,
             &self.layout.unwrapped_layout,
@@ -293,6 +327,7 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            GlyphPass::Glyphs,
             window,
             cx,
         )?;
@@ -331,6 +366,40 @@ impl WrappedLine {
     }
 }
 
+/// Which half of a shadowed line is being drawn.
+///
+/// A shadow has to go under *every* glyph on the line, not just the one it belongs to, so the two
+/// cannot be interleaved in one walk: the second letter's shadow would land on top of the first
+/// letter's ink. The line is walked twice instead, which costs a second pass over an
+/// already-computed layout — no reshaping, no second text layout — and only when some run on the
+/// line actually asks for a shadow.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum GlyphPass {
+    /// Only the blurred masks, and none of the decorations.
+    Shadow,
+    /// The glyphs themselves, with their underlines and strikethroughs.
+    Glyphs,
+}
+
+/// Whether any run on this line asks for a shadow, and so whether the extra pass is worth walking.
+fn has_shadow(decoration_runs: &[DecorationRun]) -> bool {
+    decoration_runs.iter().any(|run| run.text_shadow.is_some())
+}
+
+/// How far past the line's own box a shadow can reach, so the layer's content mask does not clip
+/// the last glyph's shadow off.
+fn shadow_overhang(decoration_runs: &[DecorationRun]) -> Pixels {
+    decoration_runs
+        .iter()
+        .filter_map(|run| run.text_shadow.as_ref())
+        .map(|shadow| {
+            let offset = shadow.offset.x.0.abs().max(shadow.offset.y.0.abs());
+            // Three sigma, matching `text_system::glyph_blur::padding`, plus the displacement.
+            px(offset + shadow.blur_radius.0 * 1.5)
+        })
+        .fold(px(0.), Pixels::max)
+}
+
 fn paint_line(
     origin: Point<Pixels>,
     layout: &LineLayout,
@@ -339,6 +408,7 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    pass: GlyphPass,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
@@ -348,7 +418,26 @@ fn paint_line(
             layout.width,
             line_height * (wrap_boundaries.len() as f32 + 1.),
         ),
-    );
+    )
+    .dilate(shadow_overhang(decoration_runs));
+    // The shadow pass reuses this whole walk — alignment, wrapping, run boundaries — so that the
+    // masks land under exactly the glyphs they belong to. Blanking the decorations is what keeps it
+    // from painting the underlines and washes a second time.
+    let shadow_only;
+    let decoration_runs = if pass == GlyphPass::Shadow {
+        shadow_only = decoration_runs
+            .iter()
+            .map(|run| DecorationRun {
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+                ..run.clone()
+            })
+            .collect::<SmallVec<[DecorationRun; 32]>>();
+        &shadow_only[..]
+    } else {
+        decoration_runs
+    };
     window.paint_layer(line_bounds, |window| {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
@@ -356,6 +445,7 @@ fn paint_line(
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
         let mut color = black();
+        let mut shadow: Option<TextShadow> = None;
         let mut current_underline: Option<(Point<Pixels>, UnderlineStyle)> = None;
         let mut current_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
         let text_system = cx.text_system().clone();
@@ -485,8 +575,10 @@ fn paint_line(
 
                         run_end += style_run.len as usize;
                         color = style_run.color;
+                        shadow = style_run.text_shadow;
                     } else {
                         run_end = layout.len;
+                        shadow = None;
                         finished_underline = current_underline.take();
                         finished_strikethrough = current_strikethrough.take();
                     }
@@ -524,21 +616,41 @@ fn paint_line(
                 let content_mask = window.content_mask();
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
-                    if glyph.is_emoji {
-                        window.paint_emoji(
-                            glyph_origin + baseline_offset + vertical_offset,
-                            run.font_id,
-                            glyph.id,
-                            layout.font_size,
-                        )?;
-                    } else {
-                        window.paint_glyph(
-                            glyph_origin + baseline_offset + vertical_offset,
-                            run.font_id,
-                            glyph.id,
-                            layout.font_size,
-                            color,
-                        )?;
+                    let position = glyph_origin + baseline_offset + vertical_offset;
+                    match pass {
+                        // An emoji has no coverage mask to blur, so it casts no shadow rather than
+                        // a smeared copy of itself.
+                        GlyphPass::Shadow => {
+                            if let Some(shadow) = shadow.as_ref()
+                                && !glyph.is_emoji
+                            {
+                                window.paint_glyph_shadow(
+                                    position,
+                                    run.font_id,
+                                    glyph.id,
+                                    layout.font_size,
+                                    shadow,
+                                )?;
+                            }
+                        }
+                        GlyphPass::Glyphs => {
+                            if glyph.is_emoji {
+                                window.paint_emoji(
+                                    position,
+                                    run.font_id,
+                                    glyph.id,
+                                    layout.font_size,
+                                )?;
+                            } else {
+                                window.paint_glyph(
+                                    position,
+                                    run.font_id,
+                                    glyph.id,
+                                    layout.font_size,
+                                    color,
+                                )?;
+                            }
+                        }
                     }
                 }
             }
@@ -978,6 +1090,7 @@ mod tests {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    text_shadow: None,
                 },
                 DecorationRun {
                     len: 3,
@@ -985,6 +1098,7 @@ mod tests {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    text_shadow: None,
                 },
                 DecorationRun {
                     len: 1,
@@ -992,6 +1106,7 @@ mod tests {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    text_shadow: None,
                 },
             ],
         );

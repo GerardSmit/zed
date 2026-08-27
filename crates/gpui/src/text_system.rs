@@ -1,5 +1,6 @@
 mod font_fallbacks;
 mod font_features;
+mod glyph_blur;
 mod line;
 mod line_layout;
 mod line_wrapper;
@@ -13,8 +14,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Bounds, DevicePixels, Hsla, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
-    StrikethroughStyle, TextRenderingMode, UnderlineStyle, px,
+    Bounds, DevicePixels, Hsla, IsZero as _, Pixels, PlatformTextSystem, Point, Result,
+    SharedString, Size, StrikethroughStyle, TextRenderingMode, TextShadow, UnderlineStyle, px,
 };
 use anyhow::{Context as _, anyhow};
 use collections::FxHashMap;
@@ -327,7 +328,20 @@ impl TextSystem {
             Ok(*bounds)
         } else {
             let mut raster_bounds = RwLockUpgradableReadGuard::upgrade(raster_bounds);
-            let bounds = self.platform_text_system.glyph_raster_bounds(params)?;
+            // A blurred glyph is the *sharp* glyph's mask, grown by the blur's reach. The platform
+            // rasteriser knows nothing about the blur, so it is asked about the sharp glyph and the
+            // padding is added here — one implementation, every backend.
+            let bounds = if params.blur == 0 {
+                self.platform_text_system.glyph_raster_bounds(params)?
+            } else {
+                let sharp = params.sharp();
+                let inner = self.platform_text_system.glyph_raster_bounds(&sharp)?;
+                if inner.is_zero() {
+                    inner
+                } else {
+                    inner.dilate(DevicePixels(glyph_blur::padding(params.blur)))
+                }
+            };
             raster_bounds.insert(params.clone(), bounds);
             Ok(bounds)
         }
@@ -337,9 +351,18 @@ impl TextSystem {
         &self,
         params: &RenderGlyphParams,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        let raster_bounds = self.raster_bounds(params)?;
-        self.platform_text_system
-            .rasterize_glyph(params, raster_bounds)
+        if params.blur == 0 {
+            let raster_bounds = self.raster_bounds(params)?;
+            return self
+                .platform_text_system
+                .rasterize_glyph(params, raster_bounds);
+        }
+        let sharp = params.sharp();
+        let sharp_bounds = self.raster_bounds(&sharp)?;
+        let (size, mask) = self
+            .platform_text_system
+            .rasterize_glyph(&sharp, sharp_bounds)?;
+        Ok(glyph_blur::blur_mask(&mask, size, params.blur))
     }
 
     /// Returns the dilation level to use for a glyph painted in the given color.
@@ -413,6 +436,7 @@ impl WindowTextSystem {
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.background_color == run.background_color
+                && last_run.text_shadow == run.text_shadow
             {
                 last_run.len += run.len as u32;
                 continue;
@@ -423,6 +447,7 @@ impl WindowTextSystem {
                 background_color: run.background_color,
                 underline: run.underline,
                 strikethrough: run.strikethrough,
+                text_shadow: run.text_shadow,
             });
         }
 
@@ -461,6 +486,7 @@ impl WindowTextSystem {
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.background_color == run.background_color
+                && last_run.text_shadow == run.text_shadow
             {
                 last_run.len += run.len as u32;
                 continue;
@@ -471,6 +497,7 @@ impl WindowTextSystem {
                 background_color: run.background_color,
                 underline: run.underline,
                 strikethrough: run.strikethrough,
+                text_shadow: run.text_shadow,
             });
         }
 
@@ -539,6 +566,7 @@ impl WindowTextSystem {
                     && last_run.underline == run.underline
                     && last_run.strikethrough == run.strikethrough
                     && last_run.background_color == run.background_color
+                    && last_run.text_shadow == run.text_shadow
                 {
                     last_run.len += run_len_within_line as u32;
                     false
@@ -549,6 +577,7 @@ impl WindowTextSystem {
                         background_color: run.background_color,
                         underline: run.underline,
                         strikethrough: run.strikethrough,
+                        text_shadow: run.text_shadow,
                     });
                     true
                 };
@@ -997,6 +1026,8 @@ pub struct TextRun {
     pub underline: Option<UnderlineStyle>,
     /// The strikethrough style (if any)
     pub strikethrough: Option<StrikethroughStyle>,
+    /// The drop shadow painted under this run's glyphs (if any)
+    pub text_shadow: Option<TextShadow>,
 }
 
 #[cfg(all(target_os = "macos", test))]
@@ -1029,6 +1060,33 @@ pub struct RenderGlyphParams {
     pub is_emoji: bool,
     pub subpixel_rendering: bool,
     pub dilation: u8,
+    /// The Gaussian blur radius, in device pixels, this glyph's coverage mask is convolved with
+    /// before it reaches the atlas. Zero for an ordinary glyph; non-zero only for the mask a
+    /// [`TextShadow`] is drawn from. Clamped by the text system to a bound that keeps the padded
+    /// tile from being a way to ask the atlas for a megabyte per letter.
+    pub blur: u8,
+}
+
+impl RenderGlyphParams {
+    /// The same glyph with no blur: what the platform rasteriser is actually asked for, and the
+    /// cache key the unblurred mask lives under.
+    pub(crate) fn sharp(&self) -> Self {
+        Self {
+            blur: 0,
+            ..self.clone()
+        }
+    }
+}
+
+/// Quantise a blur radius in device pixels into the cache key, clamped to what the atlas can
+/// afford. See [`glyph_blur::MAX_BLUR_RADIUS`].
+pub(crate) fn quantize_blur_radius(device_pixels: f32) -> u8 {
+    if !device_pixels.is_finite() || device_pixels < 0.5 {
+        return 0;
+    }
+    device_pixels
+        .round()
+        .min(glyph_blur::MAX_BLUR_RADIUS as f32) as u8
 }
 
 impl Eq for RenderGlyphParams {}
@@ -1043,6 +1101,7 @@ impl Hash for RenderGlyphParams {
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
         self.dilation.hash(state);
+        self.blur.hash(state);
     }
 }
 

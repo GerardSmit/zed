@@ -3,7 +3,7 @@ use crate::{
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, Hsla, JustifyContent, Length, SharedString,
     StrikethroughStyle, StyleRefinement, TemplateColumnMinSize, TextAlign, TextOverflow,
-    TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
+    TextShadow, TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -513,6 +513,16 @@ pub trait Styled: Sized {
     /// This value cascades to its child elements.
     fn text_color(mut self, color: impl Into<Hsla>) -> Self {
         self.text_style().color = Some(color.into());
+        self
+    }
+
+    /// Sets a soft drop shadow under this element's text.
+    ///
+    /// This is a real blur of the glyphs' coverage mask, not extra painted copies of the run — see
+    /// [`TextShadow`]. It cascades to child elements, and every run that inherits it pays one extra
+    /// pass over an already-shaped line, plus one atlas entry per distinct glyph and blur radius.
+    fn text_shadow(mut self, shadow: TextShadow) -> Self {
+        self.text_style().text_shadow = Some(shadow);
         self
     }
 

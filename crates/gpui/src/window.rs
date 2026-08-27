@@ -14,8 +14,8 @@ use crate::{
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextShadow,
+    TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
     WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
     transparent_black,
@@ -3971,6 +3971,7 @@ impl Window {
             is_emoji: false,
             subpixel_rendering,
             dilation,
+            blur: 0,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
@@ -4009,6 +4010,89 @@ impl Window {
                     transformation: TransformationMatrix::unit(),
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Paints the blurred shadow of a single glyph into the scene, under wherever the glyph itself
+    /// will be painted.
+    ///
+    /// The shadow is the glyph's own coverage mask, Gaussian-blurred and cached in the sprite atlas
+    /// like any other glyph, then drawn as a `MonochromeSprite` tinted with the shadow colour. That
+    /// is the whole of the mechanism, and it is why the shadow is genuinely soft: painting the run
+    /// again in a darker colour cannot be, because every copy is a fully antialiased glyph.
+    ///
+    /// Callers should paint every shadow on a line before any of its glyphs, or one letter's
+    /// shadow lands on the previous letter's ink. [`ShapedLine::paint`](crate::ShapedLine::paint)
+    /// does that; prefer it to calling this directly.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_glyph_shadow(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        shadow: &TextShadow,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        if shadow.color.a <= 0. {
+            return Ok(());
+        }
+
+        let element_opacity = self.element_opacity();
+        let scale_factor = self.scale_factor();
+        let glyph_origin = (origin + shadow.offset).scale(scale_factor);
+
+        let quantized_origin = Point::new(
+            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                / SUBPIXEL_VARIANTS_X as f32,
+            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+                / SUBPIXEL_VARIANTS_Y as f32,
+        );
+        let subpixel_variant = Point::new(
+            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+        );
+        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant,
+            scale_factor,
+            is_emoji: false,
+            // A shadow is a single-channel mask by construction: subpixel coverage would tint its
+            // fringes, and stem darkening is for legibility of ink the user reads, not of a blur.
+            subpixel_rendering: false,
+            dilation: 0,
+            blur: crate::text_system::quantize_blur_radius(shadow.blur_radius.0 * scale_factor),
+        };
+
+        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        if !raster_bounds.is_zero() {
+            let tile = self
+                .sprite_atlas
+                .get_or_insert_with(&params.clone().into(), &mut || {
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    Ok(Some((size, Cow::Owned(bytes))))
+                })?
+                .expect("Callback above only errors or returns Some");
+            let bounds = Bounds {
+                origin: integer_origin + raster_bounds.origin.map(Into::into),
+                size: tile.bounds.size.map(Into::into),
+            };
+            self.next_frame.scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds,
+                content_mask: self.snapped_content_mask(),
+                color: shadow.color.opacity(element_opacity),
+                tile,
+                transformation: TransformationMatrix::unit(),
+            });
         }
         Ok(())
     }
@@ -4061,6 +4145,7 @@ impl Window {
             is_emoji: true,
             subpixel_rendering: false,
             dilation: 0,
+            blur: 0,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;

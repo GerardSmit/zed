@@ -465,6 +465,10 @@ pub struct TextStyle {
     /// The strikethrough style of the text
     pub strikethrough: Option<StrikethroughStyle>,
 
+    /// A soft drop shadow painted under the glyphs, for text that has to stay legible over content
+    /// the application does not own.
+    pub text_shadow: Option<TextShadow>,
+
     /// How to handle whitespace in the text
     pub white_space: WhiteSpace,
 
@@ -493,6 +497,7 @@ impl Default for TextStyle {
             background_color: None,
             underline: None,
             strikethrough: None,
+            text_shadow: None,
             white_space: WhiteSpace::Normal,
             text_overflow: None,
             text_align: TextAlign::default(),
@@ -532,6 +537,10 @@ impl TextStyle {
             self.strikethrough = Some(strikethrough);
         }
 
+        if let Some(text_shadow) = style.text_shadow {
+            self.text_shadow = Some(text_shadow);
+        }
+
         self
     }
 
@@ -566,6 +575,7 @@ impl TextStyle {
             background_color: self.background_color,
             underline: self.underline,
             strikethrough: self.strikethrough,
+            text_shadow: self.text_shadow,
         }
     }
 }
@@ -592,6 +602,9 @@ pub struct HighlightStyle {
     /// The underline style of the text
     pub strikethrough: Option<StrikethroughStyle>,
 
+    /// The drop shadow painted under this run's glyphs
+    pub text_shadow: Option<TextShadow>,
+
     /// Similar to the CSS `opacity` property, this will cause the text to be less vibrant.
     pub fade_out: Option<f32>,
 }
@@ -606,6 +619,7 @@ impl Hash for HighlightStyle {
         self.background_color.hash(state);
         self.underline.hash(state);
         self.strikethrough.hash(state);
+        self.text_shadow.hash(state);
         state.write_u32(u32::from_be_bytes(
             self.fade_out.map(|f| f.to_be_bytes()).unwrap_or_default(),
         ));
@@ -844,6 +858,32 @@ pub struct StrikethroughStyle {
     pub color: Option<Hsla>,
 }
 
+/// A soft drop shadow painted under a run of text.
+///
+/// The renderer produces this by blurring the glyphs' own coverage mask, which is the only way to
+/// get a *soft* edge: a shadow assembled out of extra painted copies of the run is a stack of
+/// sharp ghost letters, because every copy is a fully hinted, fully antialiased glyph. See
+/// `text_system::glyph_blur`.
+///
+/// Authored like a CSS `text-shadow`, and against the same convention as [`crate::BoxShadow`]: the
+/// blur radius is two standard deviations, so the same number produces the same softness in both.
+///
+/// Emoji do not take a shadow. A colour glyph has no coverage mask to blur, and blurring its
+/// colours produces a smeared copy of the emoji rather than a shadow under it.
+#[derive(
+    Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
+)]
+pub struct TextShadow {
+    /// The colour of the shadow. Its alpha is the shadow's opacity.
+    pub color: Hsla,
+
+    /// How far the shadow is displaced from the glyphs, in logical pixels.
+    pub offset: Point<Pixels>,
+
+    /// How soft the shadow is, in logical pixels. Zero is a hard offset copy.
+    pub blur_radius: Pixels,
+}
+
 /// The kinds of fill that can be applied to a shape.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub enum Fill {
@@ -901,6 +941,7 @@ impl From<&TextStyle> for HighlightStyle {
             background_color: other.background_color,
             underline: other.underline,
             strikethrough: other.strikethrough,
+            text_shadow: other.text_shadow,
             fade_out: None,
         }
     }
@@ -934,6 +975,7 @@ impl HighlightStyle {
             background_color: other.background_color.or(self.background_color),
             underline: other.underline.or(self.underline),
             strikethrough: other.strikethrough.or(self.strikethrough),
+            text_shadow: other.text_shadow.or(self.text_shadow),
             fade_out: other
                 .fade_out
                 .map(|source_fade| {
@@ -1358,6 +1400,7 @@ mod tests {
                 color: Some(red()),
                 wavy: true,
             }),
+            text_shadow: None,
         };
         let expected_style = style_b;
 
@@ -1390,6 +1433,7 @@ mod tests {
                 color: None,
                 wavy: false,
             }),
+            text_shadow: None,
         };
 
         let expected_style = HighlightStyle {
@@ -1408,6 +1452,7 @@ mod tests {
                 color: None,
                 wavy: false,
             }),
+            text_shadow: None,
         };
 
         let style_c = style_c.highlight(style_d);
