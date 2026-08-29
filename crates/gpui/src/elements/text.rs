@@ -413,6 +413,16 @@ impl StyledText {
         &self.layout
     }
 
+    /// Reuse a layout retained by the caller.
+    ///
+    /// The caller must supply a fresh layout when the text or any run that affects shaping or
+    /// painting changes. This is useful for virtualized text whose position changes every frame
+    /// while its content and width stay fixed.
+    pub fn with_layout(mut self, layout: TextLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
     /// Set the styling attributes for the given text, as well as
     /// as any ranges of text that have had their style customized.
     pub fn with_default_highlights(
