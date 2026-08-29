@@ -8,8 +8,8 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    PaintSurfaceSource, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
+    Shadow, Size, Surface, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -27,7 +27,7 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use std::{cell::Cell, collections::HashMap, ffi::c_void, mem, ptr, sync::Arc};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -125,6 +125,7 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    layer_surfaces_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -133,10 +134,21 @@ pub(crate) struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
+    /// Cached view layers keyed by the stable `LayerId` emitted by GPUI's scene.
+    ///
+    /// The scene contains only viewport-sized view layers, and this map is retained against the
+    /// current frame before drawing, so scrolling away or closing a surface releases its texture.
+    cached_layers: HashMap<u64, CachedLayerTexture>,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+}
+
+struct CachedLayerTexture {
+    texture: metal::Texture,
+    width: u64,
+    height: u64,
 }
 
 #[repr(C)]
@@ -322,6 +334,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let layer_surfaces_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "layer_surfaces",
+            "surface_vertex",
+            "layer_surface_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -344,6 +364,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            layer_surfaces_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -351,6 +372,7 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            cached_layers: HashMap::new(),
             #[cfg(any(test, feature = "test-support"))]
             headless_render_target: None,
         }
@@ -444,6 +466,7 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        self.retain_scene_layers(scene);
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -832,6 +855,7 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
+        self.render_scene_layers(scene)?;
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
@@ -956,6 +980,85 @@ impl MetalRenderer {
         }
 
         Ok(command_buffer.to_owned())
+    }
+
+    fn retain_scene_layers(&mut self, scene: &Scene) {
+        let mut live = std::collections::HashSet::new();
+        fn collect(scene: &Scene, live: &mut std::collections::HashSet<u64>) {
+            for layer in &scene.layers {
+                live.insert(layer.id.0);
+                if let Some(scene) = layer.scene.as_deref() {
+                    collect(scene, live);
+                }
+            }
+        }
+        collect(scene, &mut live);
+        self.cached_layers.retain(|id, _| live.contains(id));
+    }
+
+    /// Render dirty cached view layers before the main pass composites them.
+    ///
+    /// Each layer gets its own instance buffer and command buffer. Waiting here is conservative
+    /// but correct: the main pass cannot sample a texture while the CPU has already reused the
+    /// instance bytes that produced it. Cached layers redraw only when their view is dirty; the
+    /// resize fast path merely composites the retained texture and does not wait.
+    fn render_scene_layers(&mut self, scene: &Scene) -> Result<()> {
+        for layer in &scene.layers {
+            if layer.size.width.0 <= 0 || layer.size.height.0 <= 0 {
+                continue;
+            }
+            let width = layer.size.width.0 as u64;
+            let height = layer.size.height.0 as u64;
+            let recreate = self
+                .cached_layers
+                .get(&layer.id.0)
+                .is_none_or(|cached| cached.width != width || cached.height != height);
+            if recreate {
+                let descriptor = metal::TextureDescriptor::new();
+                descriptor.set_width(width);
+                descriptor.set_height(height);
+                descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+                descriptor.set_usage(
+                    metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+                );
+                descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+                self.cached_layers.insert(
+                    layer.id.0,
+                    CachedLayerTexture {
+                        texture: self.device.new_texture(&descriptor),
+                        width,
+                        height,
+                    },
+                );
+            }
+
+            if !layer.needs_render && !recreate {
+                continue;
+            }
+            let Some(layer_scene) = layer.scene.as_deref() else {
+                continue;
+            };
+            let texture = self
+                .cached_layers
+                .get(&layer.id.0)
+                .expect("the layer texture was ensured above")
+                .texture
+                .clone();
+            let mut instance_buffer = self
+                .instance_buffer_pool
+                .lock()
+                .acquire(&self.device, self.is_unified_memory);
+            let command_buffer = self.draw_primitives_to_texture(
+                layer_scene,
+                &mut instance_buffer,
+                &texture,
+                layer.size,
+            )?;
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            self.instance_buffer_pool.lock().release(instance_buffer);
+        }
+        Ok(())
     }
 
     fn draw_paths_to_intermediate(
@@ -1475,7 +1578,6 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1488,38 +1590,74 @@ impl MetalRenderer {
         );
 
         for surface in surfaces {
-            let texture_size = size(
-                DevicePixels::from(surface.image_buffer.get_width() as i32),
-                DevicePixels::from(surface.image_buffer.get_height() as i32),
-            );
-
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
-
-            let y_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
-                    0,
-                )
-                .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
-                    1,
-                )
-                .unwrap();
+            let texture_size;
+            let mut video_textures = None;
+            match &surface.source {
+                PaintSurfaceSource::Image(image_buffer) => {
+                    command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+                    texture_size = size(
+                        DevicePixels::from(image_buffer.get_width() as i32),
+                        DevicePixels::from(image_buffer.get_height() as i32),
+                    );
+                    assert_eq!(
+                        image_buffer.get_pixel_format(),
+                        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                    );
+                    let y_texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::R8Unorm,
+                            image_buffer.get_width_of_plane(0),
+                            image_buffer.get_height_of_plane(0),
+                            0,
+                        )
+                        .unwrap();
+                    let cb_cr_texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::RG8Unorm,
+                            image_buffer.get_width_of_plane(1),
+                            image_buffer.get_height_of_plane(1),
+                            1,
+                        )
+                        .unwrap();
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::YTexture as u64,
+                        unsafe {
+                            let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+                            Some(metal::TextureRef::from_ptr(texture as *mut _))
+                        },
+                    );
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::CbCrTexture as u64,
+                        unsafe {
+                            let texture =
+                                CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
+                            Some(metal::TextureRef::from_ptr(texture as *mut _))
+                        },
+                    );
+                    video_textures = Some((y_texture, cb_cr_texture));
+                }
+                PaintSurfaceSource::Layer(id) => {
+                    let Some(layer) = self.cached_layers.get(&id.0) else {
+                        continue;
+                    };
+                    command_encoder
+                        .set_render_pipeline_state(&self.layer_surfaces_pipeline_state);
+                    texture_size = size(
+                        DevicePixels::from(layer.width as i32),
+                        DevicePixels::from(layer.height as i32),
+                    );
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::YTexture as u64,
+                        Some(&layer.texture),
+                    );
+                }
+            }
 
             align_offset(instance_offset);
             let next_offset = *instance_offset + mem::size_of::<Surface>();
@@ -1537,16 +1675,6 @@ impl MetalRenderer {
                 mem::size_of_val(&texture_size) as u64,
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
-            // let y_texture = y_texture.get_texture().unwrap().
-            command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
-            command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
-
             unsafe {
                 let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)
                     .add(*instance_offset)
@@ -1561,6 +1689,9 @@ impl MetalRenderer {
             }
 
             command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+            // Keep the CoreVideo wrappers alive until Metal has encoded the draw that references
+            // their textures.
+            drop(video_textures);
             *instance_offset = next_offset;
         }
         true
