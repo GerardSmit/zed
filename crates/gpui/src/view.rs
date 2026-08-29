@@ -180,7 +180,11 @@ impl Element for AnyView {
                     let view_dirty =
                         window.dirty_views.contains(&self.entity_id()) || window.refreshing;
 
-                    if self.is_layer {
+                    // The Metal backend does not yet provide a stable cached-layer compositor.
+                    // Rendering these views inline on macOS is the correctness fallback: it costs
+                    // the layer cache, but prevents whole view trees (including their text atlas
+                    // sprites) from flickering or disappearing between presented frames.
+                    if self.is_layer && !cfg!(target_os = "macos") {
                         // Layer fast path: when content is unchanged (and scale matches), skip
                         // render + layout entirely and reuse last frame's prepaint — paint will
                         // composite the existing texture at the new bounds. Hitboxes go briefly
@@ -216,7 +220,8 @@ impl Element for AnyView {
                             element_state.prepaint_range = prepaint_start..prepaint_end;
                             return (None, element_state);
                         }
-                    } else if let Some(mut element_state) = element_state
+                    } else if !self.is_layer
+                        && let Some(mut element_state) = element_state
                         && element_state.cache_key.bounds == bounds
                         && element_state.cache_key.content_mask == content_mask
                         && element_state.cache_key.text_style == text_style
@@ -276,7 +281,7 @@ impl Element for AnyView {
     ) {
         window.with_rendered_view(self.entity_id(), |window| {
             let caching_disabled = window.is_inspector_picking(cx);
-            if self.is_layer && !caching_disabled {
+            if self.is_layer && !cfg!(target_os = "macos") && !caching_disabled {
                 let layer_id = crate::LayerId(self.entity_id().as_u64());
                 let size = bounds.size.to_device_pixels(window.scale_factor());
                 window.with_element_state::<AnyViewState, _>(
