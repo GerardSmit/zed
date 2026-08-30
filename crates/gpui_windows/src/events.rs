@@ -1201,16 +1201,22 @@ impl WindowsWindowInner {
     }
 
     fn handle_cursor_changed(&self, lparam: LPARAM) -> Option<isize> {
-        let had_cursor = self.state.current_cursor.get().is_some();
-
-        self.state.current_cursor.set(if lparam.0 == 0 {
+        let previous = self.state.current_cursor.get();
+        let next = if lparam.0 == 0 {
             None
         } else {
             Some(HCURSOR(lparam.0 as _))
-        });
+        };
+        self.state.current_cursor.set(next);
 
-        if had_cursor != self.state.current_cursor.get().is_some() {
-            unsafe { SetCursor(self.state.current_cursor.get()) };
+        // Apply the new cursor now rather than leaving it to the next `WM_SETCURSOR`. Windows does
+        // not send that message while the mouse is captured, and does not send it at all until the
+        // pointer moves -- so a drag that ended with the pointer standing still kept the dragged
+        // element's cursor (a resize grip's arrows, most visibly) until something else moved the
+        // mouse. `WM_SETCURSOR` still wins over this for the non-client frame, which is handled in
+        // `handle_set_cursor`.
+        if previous.map(|cursor| cursor.0) != next.map(|cursor| cursor.0) {
+            unsafe { SetCursor(next) };
         }
 
         Some(0)
