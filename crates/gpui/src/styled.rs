@@ -1,9 +1,9 @@
 use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
-    FontWeight, GridPlacement, GridTemplate, Hsla, JustifyContent, Length, SharedString,
-    StrikethroughStyle, StyleRefinement, TemplateColumnMinSize, TextAlign, TextOverflow,
-    TextShadow, TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
+    FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
+    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow, TextShadow,
+    TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -762,7 +762,7 @@ pub trait Styled: Sized {
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {
             repeat: cols,
-            min_size: TemplateColumnMinSize::Zero,
+            min_size: GridTemplateMinSize::Zero,
         });
         self
     }
@@ -772,7 +772,7 @@ pub trait Styled: Sized {
     fn grid_cols_min_content(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {
             repeat: cols,
-            min_size: TemplateColumnMinSize::MinContent,
+            min_size: GridTemplateMinSize::MinContent,
         });
         self
     }
@@ -781,7 +781,7 @@ pub trait Styled: Sized {
     fn grid_cols_max_content(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {
             repeat: cols,
-            min_size: TemplateColumnMinSize::MaxContent,
+            min_size: GridTemplateMinSize::MaxContent,
         });
         self
     }
@@ -790,7 +790,26 @@ pub trait Styled: Sized {
     fn grid_rows(mut self, rows: u16) -> Self {
         self.style().grid_rows = Some(GridTemplate {
             repeat: rows,
-            min_size: TemplateColumnMinSize::Zero,
+            min_size: GridTemplateMinSize::Zero,
+        });
+        self
+    }
+
+    /// Sets the grid rows with min-content minimum sizing.
+    /// Unlike grid_rows, it won't shrink to height 0 in AvailableSpace::MinContent constraints.
+    fn grid_rows_min_content(mut self, rows: u16) -> Self {
+        self.style().grid_rows = Some(GridTemplate {
+            repeat: rows,
+            min_size: GridTemplateMinSize::MinContent,
+        });
+        self
+    }
+
+    /// Sets the grid rows with max-content maximum sizing for content-based row heights.
+    fn grid_rows_max_content(mut self, rows: u16) -> Self {
+        self.style().grid_rows = Some(GridTemplate {
+            repeat: rows,
+            min_size: GridTemplateMinSize::MaxContent,
         });
         self
     }

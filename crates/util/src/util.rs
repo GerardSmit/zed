@@ -8,21 +8,21 @@ pub mod command;
 pub mod disambiguate;
 #[cfg(not(target_family = "wasm"))]
 pub mod fs;
-pub mod markdown;
-pub mod path_list;
-pub mod paths;
 #[cfg(not(target_family = "wasm"))]
 pub mod process;
-pub mod redact;
-pub mod rel_path;
-pub mod schemars;
-pub mod serde;
 #[cfg(not(target_family = "wasm"))]
 pub mod shell;
 #[cfg(not(target_family = "wasm"))]
 pub mod shell_builder;
 #[cfg(not(target_family = "wasm"))]
 pub mod shell_env;
+
+pub mod markdown;
+pub mod path_list;
+pub mod paths;
+pub mod redact;
+pub mod schemars;
+pub mod serde;
 pub mod size;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
@@ -31,7 +31,7 @@ pub mod time;
 use anyhow::Result;
 use itertools::Either;
 use regex::Regex;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::{
     borrow::Cow,
@@ -41,6 +41,9 @@ use std::{
 use unicase::UniCase;
 
 pub use gpui_util::*;
+pub use path::PathExt;
+pub use path::normalize_path;
+pub use path::rel_path;
 
 pub use take_until::*;
 #[cfg(any(test, feature = "test-support"))]
@@ -217,28 +220,6 @@ where
             start_index = index;
         }
     }
-}
-
-pub fn truncate_to_bottom_n_sorted_by<T, F>(items: &mut Vec<T>, limit: usize, compare: &F)
-where
-    F: Fn(&T, &T) -> Ordering,
-{
-    if limit == 0 {
-        items.truncate(0);
-    }
-    if items.len() <= limit {
-        items.sort_by(compare);
-        return;
-    }
-    // When limit is near to items.len() it may be more efficient to sort the whole list and
-    // truncate, rather than always doing selection first as is done below. It's hard to analyze
-    // where the threshold for this should be since the quickselect style algorithm used by
-    // `select_nth_unstable_by` makes the prefix partially sorted, and so its work is not wasted -
-    // the expected number of comparisons needed by `sort_by` is less than it is for some arbitrary
-    // unsorted input.
-    items.select_nth_unstable_by(limit, compare);
-    items.truncate(limit);
-    items.sort_by(compare);
 }
 
 /// Prevents execution of the application with root privileges on Unix systems.
@@ -462,6 +443,9 @@ pub fn merge_json_lenient_value_into(
     }
 }
 
+/// Merges `source` into `target`: objects are merged recursively, key by key;
+/// any other colliding value in `target` — including arrays — is replaced by
+/// `source`'s value wholesale.
 pub fn merge_json_value_into(source: serde_json::Value, target: &mut serde_json::Value) {
     use serde_json::Value;
 
@@ -475,13 +459,30 @@ pub fn merge_json_value_into(source: serde_json::Value, target: &mut serde_json:
                 }
             }
         }
+        (source, target) => *target = source,
+    }
+}
 
-        (Value::Array(source), Value::Array(target)) => {
-            for value in source {
-                target.push(value);
+pub fn union_json_value_into(source: serde_json::Value, target: &mut serde_json::Value) {
+    use serde_json::Value;
+
+    match (source, target) {
+        (Value::Object(source), Value::Object(target)) => {
+            for (key, value) in source {
+                if let Some(target) = target.get_mut(&key) {
+                    union_json_value_into(value, target);
+                } else {
+                    target.insert(key, value);
+                }
             }
         }
-
+        (Value::Array(source), Value::Array(target)) => {
+            for value in source {
+                if !target.contains(&value) {
+                    target.push(value);
+                }
+            }
+        }
         (source, target) => *target = source,
     }
 }
@@ -793,36 +794,6 @@ impl<O> From<anyhow::Result<O>> for ConnectionResult<O> {
     }
 }
 
-/// Normalizes a path by resolving `.` and `..` components without
-/// requiring the path to exist on disk (unlike `canonicalize`).
-pub fn normalize_path(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut components = path.components().peekable();
-    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
-        components.next();
-        PathBuf::from(c.as_os_str())
-    } else {
-        PathBuf::new()
-    };
-
-    for component in components {
-        match component {
-            Component::Prefix(..) => unreachable!(),
-            Component::RootDir => {
-                ret.push(component.as_os_str());
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                ret.pop();
-            }
-            Component::Normal(c) => {
-                ret.push(c);
-            }
-        }
-    }
-    ret
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1124,5 +1095,103 @@ Line 3"#
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (0..6, "héllo")); // 'é' is 2 bytes
         assert_eq!(result[1], (10..15, "world")); // '🦀' is 4 bytes
+    }
+
+    #[test]
+    fn test_merge_json_values() {
+        use serde_json::json;
+
+        let mut target = json!({
+            "unchanged": 1,
+            "replaced_scalar": "old",
+            "replaced_array": ["default-1", "default-2"],
+            "nulled": true,
+            "array_becomes_object": [1, 2],
+            "object_becomes_scalar": { "x": 1 },
+            "nested": {
+                "kept": true,
+                "overridden": 2,
+                "args": ["--default"],
+                "deeper": { "list": [1, 2], "other": "kept" },
+            },
+        });
+        let source = json!({
+            "replaced_scalar": "new",
+            "replaced_array": ["default-2", "user"],
+            "nulled": null,
+            "array_becomes_object": { "y": 2 },
+            "object_becomes_scalar": 3,
+            "inserted": ["brand-new"],
+            "nested": {
+                "overridden": 20,
+                "args": ["--user"],
+                "deeper": { "list": [3] },
+                "inserted": { "z": true },
+            },
+        });
+
+        merge_json_value_into(source, &mut target);
+
+        assert_eq!(
+            target,
+            json!({
+                "unchanged": 1,
+                "replaced_scalar": "new",
+                "replaced_array": ["default-2", "user"],
+                "nulled": null,
+                "array_becomes_object": { "y": 2 },
+                "object_becomes_scalar": 3,
+                "inserted": ["brand-new"],
+                "nested": {
+                    "kept": true,
+                    "overridden": 20,
+                    "args": ["--user"],
+                    "deeper": { "list": [3], "other": "kept" },
+                    "inserted": { "z": true },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn test_union_json_values() {
+        use serde_json::json;
+
+        let mut target = json!({
+            "unchanged": 1,
+            "replaced_scalar": "old",
+            "unioned_array": ["shared", "first"],
+            "nested": {
+                "kept": true,
+                "plugins": [{ "name": "first-plugin" }],
+                "scalar": 2,
+            },
+        });
+        let source = json!({
+            "replaced_scalar": "new",
+            "unioned_array": ["shared", "second"],
+            "inserted": ["brand-new"],
+            "nested": {
+                "plugins": [{ "name": "second-plugin" }],
+                "scalar": 20,
+            },
+        });
+
+        union_json_value_into(source, &mut target);
+
+        assert_eq!(
+            target,
+            json!({
+                "unchanged": 1,
+                "replaced_scalar": "new",
+                "unioned_array": ["shared", "first", "second"],
+                "inserted": ["brand-new"],
+                "nested": {
+                    "kept": true,
+                    "plugins": [{ "name": "first-plugin" }, { "name": "second-plugin" }],
+                    "scalar": 20,
+                },
+            })
+        );
     }
 }
