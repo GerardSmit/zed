@@ -445,7 +445,7 @@ impl WindowTextSystem {
             "text argument should not contain newlines"
         );
 
-        let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
+        let mut decoration_runs = SmallVec::<[DecorationRun; 2]>::new();
         for run in runs {
             if let Some(last_run) = decoration_runs.last_mut()
                 && last_run.color == run.color
@@ -495,7 +495,7 @@ impl WindowTextSystem {
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> ShapedLine {
-        let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
+        let mut decoration_runs = SmallVec::<[DecorationRun; 2]>::new();
         for run in runs {
             if let Some(last_run) = decoration_runs.last_mut()
                 && last_run.color == run.color
@@ -567,7 +567,9 @@ impl WindowTextSystem {
         let mut process_line = |line_text: SharedString, line_start, line_end| {
             font_runs.clear();
 
-            let mut decoration_runs = <Vec<DecorationRun>>::with_capacity(32);
+            // Most UI labels have a single style. Reserving 32 large decoration records for
+            // every line retained several KiB even for a one-word label.
+            let mut decoration_runs = <Vec<DecorationRun>>::with_capacity(1);
             let mut run_start = line_start;
             while run_start < line_end {
                 let Some(run) = runs.peek_mut() else {

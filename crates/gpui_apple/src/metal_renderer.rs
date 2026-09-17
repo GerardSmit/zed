@@ -43,6 +43,8 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+// Path rasterization is scratch work, not a retained full-window image. Reuse one tile.
+const PATH_TILE_SIZE: i32 = 512;
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -65,7 +67,7 @@ pub struct InstanceBufferPool {
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: 2 * 1024 * 1024,
+            buffer_size: 128 * 1024,
             buffers: Vec::new(),
         }
     }
@@ -106,13 +108,14 @@ impl InstanceBufferPool {
     }
 
     pub(crate) fn release(&mut self, buffer: InstanceBuffer) {
-        if buffer.size == self.buffer_size {
+        if buffer.size == self.buffer_size && self.buffers.len() < 3 {
             self.buffers.push(buffer.metal_buffer)
         }
     }
 }
 
 pub struct MetalRenderer {
+    display_buffering: gpui::DisplayBufferingState,
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
     is_apple_gpu: bool,
@@ -174,7 +177,9 @@ impl MetalRenderer {
         // Support direct-to-display rendering if the window is not transparent
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
-        layer.set_maximum_drawable_count(3);
+        layer.set_maximum_drawable_count(
+            gpui::DisplayBufferingState::new(gpui::display_buffering()).drawable_count(),
+        );
         // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
         #[cfg(any(test, feature = "test-support"))]
         layer.set_framebuffer_only(false);
@@ -353,6 +358,7 @@ impl MetalRenderer {
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
         Self {
+            display_buffering: gpui::DisplayBufferingState::new(gpui::display_buffering()),
             device,
             layer,
             presents_with_transaction: false,
@@ -393,6 +399,17 @@ impl MetalRenderer {
             .unwrap_or(ptr::null_mut())
     }
 
+    /// Actual scratch allocation, for GPU memory regression tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn path_scratch_size(&self) -> Option<Size<DevicePixels>> {
+        self.path_intermediate_texture.as_ref().map(|texture| {
+            size(
+                DevicePixels(texture.width() as i32),
+                DevicePixels(texture.height() as i32),
+            )
+        })
+    }
+
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
         &self.sprite_atlas
     }
@@ -417,7 +434,6 @@ impl MetalRenderer {
                 ];
             }
         }
-        self.update_path_intermediate_textures(size);
     }
 
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
@@ -430,6 +446,15 @@ impl MetalRenderer {
             return;
         }
 
+        if self
+            .path_intermediate_texture
+            .as_ref()
+            .is_some_and(|texture| {
+                texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+            })
+        {
+            return;
+        }
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.0 as u64);
         texture_descriptor.set_height(size.height.0 as u64);
@@ -480,11 +505,18 @@ impl MetalRenderer {
                 return;
             }
         };
+        // Apply device preferences before acquiring a drawable, including to existing windows.
+        self.display_buffering.set_mode(gpui::display_buffering());
+        let drawable_count = self.display_buffering.drawable_count();
+        if layer.maximum_drawable_count() != drawable_count {
+            layer.set_maximum_drawable_count(drawable_count);
+        }
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        let acquisition_start = std::time::Instant::now();
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -495,6 +527,8 @@ impl MetalRenderer {
             return;
         };
 
+        self.display_buffering
+            .observe_wait(acquisition_start, acquisition_start.elapsed());
         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
@@ -601,9 +635,6 @@ impl MetalRenderer {
             anyhow::bail!("Invalid size for render_scene_to_image: {:?}", size);
         }
 
-        // Update path intermediate textures for this size
-        self.update_path_intermediate_textures(size);
-
         // Create an offscreen texture as render target
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.0 as u64);
@@ -645,8 +676,6 @@ impl MetalRenderer {
             anyhow::bail!("Invalid size for render_scene: {:?}", size);
         }
 
-        self.update_path_intermediate_textures(size);
-
         let needs_new_target = self.headless_render_target.as_ref().is_none_or(|texture| {
             texture.width() != size.width.0 as u64 || texture.height() != size.height.0 as u64
         });
@@ -683,6 +712,22 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
         self.render_scene_layers(scene)?;
+        let scratch_size = visible_path_bounds(&scene.paths, viewport_size).map_or(
+            size(DevicePixels(0), DevicePixels(0)),
+            |bounds| {
+                size(
+                    DevicePixels(
+                        ((bounds.right().0.ceil() - bounds.origin.x.0.floor()) as i32)
+                            .min(PATH_TILE_SIZE),
+                    ),
+                    DevicePixels(
+                        ((bounds.bottom().0.ceil() - bounds.origin.y.0.floor()) as i32)
+                            .min(PATH_TILE_SIZE),
+                    ),
+                )
+            },
+        );
+        self.update_path_intermediate_textures(scratch_size);
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
@@ -704,31 +749,45 @@ impl MetalRenderer {
                 }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
-                    command_encoder.end_encoding();
-
-                    let did_draw = self.draw_paths_to_intermediate(
-                        paths,
-                        writer,
-                        viewport_size,
-                        command_buffer,
-                    )?;
-
-                    command_encoder = new_command_encoder_for_texture(
-                        command_buffer,
-                        texture,
-                        viewport_size,
-                        None,
-                    );
-
-                    if did_draw {
-                        if let Err(error) = self.draw_paths_from_intermediate(
-                            paths,
-                            writer,
-                            viewport_size,
-                            command_encoder,
-                        ) {
+                    let Some(bounds) = visible_path_bounds(paths, viewport_size) else {
+                        continue;
+                    };
+                    let left = bounds.origin.x.0.floor() as i32;
+                    let top = bounds.origin.y.0.floor() as i32;
+                    let right = bounds.right().0.ceil() as i32;
+                    let bottom = bounds.bottom().0.ceil() as i32;
+                    for y in (top..bottom).step_by(PATH_TILE_SIZE as usize) {
+                        for x in (left..right).step_by(PATH_TILE_SIZE as usize) {
+                            let tile = Bounds::new(
+                                point(ScaledPixels(x as f32), ScaledPixels(y as f32)),
+                                size(
+                                    ScaledPixels((right - x).min(PATH_TILE_SIZE) as f32),
+                                    ScaledPixels((bottom - y).min(PATH_TILE_SIZE) as f32),
+                                ),
+                            );
+                            if !paths
+                                .iter()
+                                .any(|path| nonempty_bounds(path.clipped_bounds().intersect(&tile)))
+                            {
+                                continue;
+                            }
                             command_encoder.end_encoding();
-                            return Err(error);
+                            self.draw_paths_to_intermediate(paths, writer, tile, command_buffer)?;
+                            command_encoder = new_command_encoder_for_texture(
+                                command_buffer,
+                                texture,
+                                viewport_size,
+                                None,
+                            );
+                            if let Err(error) = self.draw_paths_from_intermediate(
+                                tile,
+                                writer,
+                                viewport_size,
+                                command_encoder,
+                            ) {
+                                command_encoder.end_encoding();
+                                return Err(error);
+                            }
                         }
                     }
                 }
@@ -841,7 +900,7 @@ impl MetalRenderer {
         &self,
         paths: &[Path<ScaledPixels>],
         writer: &mut InstanceBufferWriter,
-        viewport_size: Size<DevicePixels>,
+        tile: Bounds<ScaledPixels>,
         command_buffer: &metal::CommandBufferRef,
     ) -> Result<bool> {
         if paths.is_empty() {
@@ -854,13 +913,22 @@ impl MetalRenderer {
 
         let mut vertices = Vec::new();
         for path in paths {
+            if !nonempty_bounds(path.clipped_bounds().intersect(&tile)) {
+                continue;
+            }
+            let mut bounds = path.bounds.intersect(&path.content_mask.bounds);
+            bounds.origin = bounds.origin - tile.origin;
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
-                xy_position: v.xy_position,
+                xy_position: v.xy_position - tile.origin,
                 st_position: v.st_position,
                 color: path.color,
-                bounds: path.bounds.intersect(&path.content_mask.bounds),
+                bounds,
             }));
         }
+        let viewport_size = size(
+            DevicePixels(intermediate_texture.width() as i32),
+            DevicePixels(intermediate_texture.height() as i32),
+        );
         let vertex_instance_bindings = writer.write(&vertices)?;
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
@@ -993,14 +1061,11 @@ impl MetalRenderer {
 
     fn draw_paths_from_intermediate(
         &self,
-        paths: &[Path<ScaledPixels>],
+        tile: Bounds<ScaledPixels>,
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> Result<()> {
-        let Some(first_path) = paths.first() else {
-            return Ok(());
-        };
         let intermediate_texture = self
             .path_intermediate_texture
             .as_ref()
@@ -1023,28 +1088,18 @@ impl MetalRenderer {
             Some(intermediate_texture),
         );
 
-        // When copying paths from the intermediate texture to the drawable,
-        // each pixel must only be copied once, in case of transparent paths.
-        //
-        // If all paths have the same draw order, then their bounds are all
-        // disjoint, so we can copy each path's bounds individually. If this
-        // batch combines different draw orders, we perform a single copy
-        // for a minimal spanning rect.
-        let sprites;
-        if paths.last().unwrap().order == first_path.order {
-            sprites = paths
-                .iter()
-                .map(|path| PathSprite {
-                    bounds: path.clipped_bounds(),
-                })
-                .collect();
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            sprites = vec![PathSprite { bounds }];
-        }
+        // Each pixel belongs to one integer-aligned tile, so transparent paths are composited
+        // exactly once, including across tile seams. Empty pixels in the tile are transparent.
+        let sprites = [PathSprite {
+            bounds: tile,
+            texture_bounds: Bounds::new(
+                tile.origin,
+                size(
+                    ScaledPixels(intermediate_texture.width() as f32),
+                    ScaledPixels(intermediate_texture.height() as f32),
+                ),
+            ),
+        }];
 
         let sprite_instance_bindings = writer.write(&sprites)?;
         command_encoder.set_vertex_buffer(
@@ -1709,6 +1764,7 @@ enum PathRasterizationInputIndex {
 #[repr(C)]
 pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
+    pub texture_bounds: Bounds<ScaledPixels>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1749,4 +1805,26 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
     }
+}
+
+fn nonempty_bounds(bounds: Bounds<ScaledPixels>) -> bool {
+    bounds.size.width.0 > 0. && bounds.size.height.0 > 0.
+}
+
+fn visible_path_bounds(
+    paths: &[Path<ScaledPixels>],
+    viewport: Size<DevicePixels>,
+) -> Option<Bounds<ScaledPixels>> {
+    let viewport = Bounds::new(
+        point(ScaledPixels(0.), ScaledPixels(0.)),
+        size(
+            ScaledPixels(viewport.width.0 as f32),
+            ScaledPixels(viewport.height.0 as f32),
+        ),
+    );
+    paths
+        .iter()
+        .map(|path| path.clipped_bounds().intersect(&viewport))
+        .filter(|bounds| nonempty_bounds(*bounds))
+        .reduce(|a, b| a.union(&b))
 }

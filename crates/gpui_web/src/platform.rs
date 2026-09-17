@@ -618,12 +618,21 @@ impl Platform for WebPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        if let Some(text) = item.text()
-            && let Some(window) = web_sys::window()
-        {
+        let Some(text) = item.text() else {
+            return;
+        };
+        let navigator = self.browser_window.navigator();
+        // `navigator.clipboard` is undefined outside secure contexts (plain
+        // `http://` on anything but localhost); invoking a method on it there
+        // throws through wasm-bindgen and unwinds the input handler.
+        let clipboard_available = js_sys::Reflect::get(navigator.as_ref(), &"clipboard".into())
+            .is_ok_and(|clipboard| !clipboard.is_undefined() && !clipboard.is_null());
+        if clipboard_available {
             // Fire-and-forget; called synchronously inside the user's input
             // event, which satisfies the browser's user-activation requirement.
-            drop(window.navigator().clipboard().write_text(&text));
+            drop(navigator.clipboard().write_text(&text));
+        } else if !exec_command_copy(&self.browser_window, &text) {
+            log::warn!("clipboard write unavailable: not a secure context and execCommand failed");
         }
     }
 
@@ -654,6 +663,48 @@ impl Platform for WebPlatform {
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>) {
         self.callbacks.borrow_mut().keyboard_layout_change = Some(callback);
     }
+}
+
+/// Legacy clipboard write for insecure contexts: selects the text in a
+/// throwaway off-screen textarea and runs `document.execCommand("copy")`,
+/// which (unlike `navigator.clipboard`) works over plain `http://` as long as
+/// it runs inside a user gesture. Focus is handed back to whatever held it.
+fn exec_command_copy(window: &web_sys::Window, text: &str) -> bool {
+    let Some(document) = window.document() else {
+        return false;
+    };
+    let Some(body) = document.body() else {
+        return false;
+    };
+    let previously_focused = document
+        .active_element()
+        .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok());
+    let Ok(textarea) = document
+        .create_element("textarea")
+        .and_then(|element| element.dyn_into::<web_sys::HtmlTextAreaElement>().map_err(Into::into))
+    else {
+        return false;
+    };
+    textarea.set_value(text);
+    textarea.set_read_only(true);
+    let style = textarea.style();
+    drop(style.set_property("position", "fixed"));
+    drop(style.set_property("top", "0"));
+    drop(style.set_property("left", "-9999px"));
+    drop(style.set_property("opacity", "0"));
+    if body.append_child(&textarea).is_err() {
+        return false;
+    }
+    drop(textarea.focus());
+    textarea.select();
+    let copied = document
+        .dyn_ref::<web_sys::HtmlDocument>()
+        .is_some_and(|document| document.exec_command("copy").unwrap_or(false));
+    drop(body.remove_child(&textarea));
+    if let Some(element) = previously_focused {
+        drop(element.focus());
+    }
+    copied
 }
 
 /// Maps a `navigator.clipboard.read()` rejection to a [`ClipboardReadError`].

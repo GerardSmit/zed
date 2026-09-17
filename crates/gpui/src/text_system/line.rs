@@ -49,7 +49,7 @@ pub struct ShapedLine {
     pub(crate) layout: Arc<LineLayout>,
     /// The text that was shaped for this line.
     pub text: SharedString,
-    pub(crate) decoration_runs: SmallVec<[DecorationRun; 32]>,
+    pub(crate) decoration_runs: SmallVec<[DecorationRun; 2]>,
 }
 
 impl ShapedLine {
@@ -444,7 +444,7 @@ fn paint_line(
                 strikethrough: None,
                 ..run.clone()
             })
-            .collect::<SmallVec<[DecorationRun; 32]>>();
+            .collect::<SmallVec<[DecorationRun; 2]>>();
         &shadow_only[..]
     } else {
         decoration_runs

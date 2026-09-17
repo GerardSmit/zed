@@ -1,3 +1,6 @@
+mod display_buffering;
+pub use display_buffering::*;
+
 mod app_menu;
 mod keyboard;
 mod keystroke;

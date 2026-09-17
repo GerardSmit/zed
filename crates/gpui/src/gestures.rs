@@ -238,7 +238,7 @@ const VELOCITY_MAX_SAMPLES: usize = 20;
 /// [`ClickEvent::Touch`](crate::ClickEvent), which keeps every existing
 /// mouse-driven behavior (click listeners, caret placement, double-tap
 /// selection) working before elements grow a direct tap-delivery path.
-/// Long-press and pinch recognition are not implemented yet, and additional
+/// Holds synthesize a secondary click. Pinch recognition is not implemented, and additional
 /// touches are ignored while one is being recognized.
 pub(crate) struct TouchGestureRecognizer {
     tuning: GestureTuning,
@@ -254,7 +254,7 @@ pub(crate) enum RecognizedTouchGesture {
     /// One step of a pan (or of its post-release momentum), delivered to
     /// scroll listeners at the pan's starting position.
     Scroll(ScrollWheelEvent),
-    /// A recognized tap, delivered as a synthesized mouse press and release.
+    /// A recognized tap or hold, delivered as a primary or secondary mouse click.
     Tap {
         down: MouseDownEvent,
         up: MouseUpEvent,
@@ -264,15 +264,18 @@ pub(crate) enum RecognizedTouchGesture {
 enum TouchGestureState {
     Idle,
     /// The touch is still within `touch_slop` of where it started: it can
-    /// still resolve into either a tap or a pan.
+    /// still resolve into a tap, hold, or pan.
     Pending(ActiveTouch),
     /// The touch exceeded `touch_slop`: it is a pan until it ends, and its
     /// movement flows out as scroll events.
     Panning(ActiveTouch),
+    /// A secondary click already fired. Swallow movement and release until lift-off.
+    Held(TouchId),
 }
 
 struct ActiveTouch {
     id: TouchId,
+    started_at: Instant,
     start_position: Point<Pixels>,
     last_position: Point<Pixels>,
     velocity_tracker: VelocityTracker,
@@ -306,8 +309,9 @@ impl TouchGestureRecognizer {
     pub(crate) fn handle_event(
         &mut self,
         event: &TouchEvent,
+        now: Instant,
     ) -> SmallVec<[RecognizedTouchGesture; 2]> {
-        self.handle_event_at(event, Instant::now())
+        self.handle_event_at(event, now)
     }
 
     fn handle_event_at(
@@ -330,6 +334,7 @@ impl TouchGestureRecognizer {
                     velocity_tracker.push(now, event.position);
                     self.state = TouchGestureState::Pending(ActiveTouch {
                         id: event.id,
+                        started_at: now,
                         start_position: event.position,
                         last_position: event.position,
                         velocity_tracker,
@@ -369,6 +374,7 @@ impl TouchGestureRecognizer {
                 other => self.state = other,
             },
             TouchPhase::Ended => match mem::replace(&mut self.state, TouchGestureState::Idle) {
+                TouchGestureState::Held(id) if id == event.id => {}
                 TouchGestureState::Pending(touch) if touch.id == event.id => {
                     let tap_count = match &self.last_tap {
                         Some(tap)
@@ -443,6 +449,7 @@ impl TouchGestureRecognizer {
                 other => self.state = other,
             },
             TouchPhase::Cancelled => match mem::replace(&mut self.state, TouchGestureState::Idle) {
+                TouchGestureState::Held(id) if id == event.id => {}
                 TouchGestureState::Pending(touch) if touch.id == event.id => {}
                 TouchGestureState::Panning(touch) if touch.id == event.id => {
                     recognized.push(RecognizedTouchGesture::Scroll(scroll_event(
@@ -459,6 +466,41 @@ impl TouchGestureRecognizer {
 
     pub(crate) fn has_momentum(&self) -> bool {
         self.momentum.is_some()
+    }
+
+    pub(crate) fn has_pending_hold(&self) -> bool {
+        matches!(self.state, TouchGestureState::Pending(_))
+    }
+
+    pub(crate) fn tick_hold(&mut self, now: Instant) -> Option<RecognizedTouchGesture> {
+        self.tick_hold_at(now)
+    }
+
+    fn tick_hold_at(&mut self, now: Instant) -> Option<RecognizedTouchGesture> {
+        let TouchGestureState::Pending(touch) = &self.state else {
+            return None;
+        };
+        if now.duration_since(touch.started_at) < self.tuning.long_press_duration {
+            return None;
+        }
+        let position = touch.start_position;
+        self.state = TouchGestureState::Held(touch.id);
+        self.last_tap = None;
+        Some(RecognizedTouchGesture::Tap {
+            down: MouseDownEvent {
+                button: MouseButton::Right,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            },
+            up: MouseUpEvent {
+                button: MouseButton::Right,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            },
+        })
     }
 
     /// Advances post-fling momentum by one frame, returning the scroll step
@@ -619,6 +661,71 @@ fn quadratic_velocity_at_newest(times: &[f64], values: &[f64]) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::point;
+
+    #[test]
+    fn stationary_hold_secondary_clicks_once_without_release_tap() {
+        let mut recognizer = TouchGestureRecognizer::new(GestureTuning::default());
+        let now = Instant::now();
+        recognizer.handle_event_at(&touch_event(TouchId(1), TouchPhase::Started, 10., 20.), now);
+        assert!(
+            recognizer
+                .tick_hold_at(now + Duration::from_millis(499))
+                .is_none()
+        );
+        let gesture = recognizer.tick_hold_at(now + Duration::from_millis(500));
+        let Some(RecognizedTouchGesture::Tap { down, up }) = gesture else {
+            panic!("expected secondary click, got {gesture:?}");
+        };
+        assert_eq!(down.button, MouseButton::Right);
+        assert_eq!(up.button, MouseButton::Right);
+        assert_eq!(down.position, point(px(10.), px(20.)));
+        assert!(
+            recognizer
+                .tick_hold_at(now + Duration::from_secs(1))
+                .is_none()
+        );
+        assert!(
+            recognizer
+                .handle_event_at(
+                    &touch_event(TouchId(1), TouchPhase::Ended, 10., 20.),
+                    now + Duration::from_secs(1),
+                )
+                .is_empty()
+        );
+        assert!(!recognizer.has_pending_hold());
+        recognizer.handle_event_at(
+            &touch_event(TouchId(2), TouchPhase::Started, 10., 20.),
+            now + Duration::from_secs(2),
+        );
+        let tap = recognizer.handle_event_at(
+            &touch_event(TouchId(2), TouchPhase::Ended, 10., 20.),
+            now + Duration::from_millis(2050),
+        );
+        assert!(
+            matches!(tap.as_slice(), [RecognizedTouchGesture::Tap { down, .. }]
+            if down.button == MouseButton::Left && down.click_count == 1)
+        );
+    }
+
+    #[test]
+    fn scrolling_cancellation_and_quick_taps_cancel_hold() {
+        for phase in [TouchPhase::Moved, TouchPhase::Cancelled, TouchPhase::Ended] {
+            let mut recognizer = TouchGestureRecognizer::new(GestureTuning::default());
+            let now = Instant::now();
+            recognizer
+                .handle_event_at(&touch_event(TouchId(1), TouchPhase::Started, 10., 20.), now);
+            recognizer.handle_event_at(
+                &touch_event(TouchId(1), phase, 10., 60.),
+                now + Duration::from_millis(100),
+            );
+            assert!(!recognizer.has_pending_hold());
+            assert!(
+                recognizer
+                    .tick_hold_at(now + Duration::from_secs(1))
+                    .is_none()
+            );
+        }
+    }
 
     #[test]
     fn ongoing_scroll_locks_to_dominant_axis() {

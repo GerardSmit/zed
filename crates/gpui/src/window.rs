@@ -331,7 +331,7 @@ slotmap::new_key_type! {
 thread_local! {
     /// Fallback arena used when no app-specific arena is active.
     /// In production, each window draw sets CURRENT_ELEMENT_ARENA to the app's arena.
-    pub(crate) static ELEMENT_ARENA: RefCell<Arena> = RefCell::new(Arena::new(1024 * 1024));
+    pub(crate) static ELEMENT_ARENA: RefCell<Arena> = RefCell::new(Arena::new(128 * 1024));
 
     /// Points to the current App's element arena during draw operations.
     /// This allows multiple test Apps to have isolated arenas, preventing
@@ -1194,6 +1194,7 @@ pub struct Window {
     window_profiler: profiler::WindowProfiler,
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
+    touch_gesture_tick_scheduled: bool,
     pub(crate) refreshing: bool,
     /// Set by the app while the user is interactively resizing the *layout* (dragging a dock/panel
     /// divider) — as opposed to the OS window (`PlatformWindow::is_in_resize_loop`). Layer views
@@ -1893,6 +1894,7 @@ impl Window {
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
             last_input_modality: InputModality::Mouse,
+            touch_gesture_tick_scheduled: false,
             touch_gestures: TouchGestureRecognizer::new(
                 cx.platform
                     .gestures()
@@ -5470,7 +5472,9 @@ impl Window {
     /// dispatches whatever it resolves (scroll steps, synthesized taps)
     /// through the ordinary mouse-event path.
     fn dispatch_touch_event(&mut self, event: &TouchEvent, cx: &mut App) {
-        let recognized_gestures = self.touch_gestures.handle_event(event);
+        let recognized_gestures = self
+            .touch_gestures
+            .handle_event(event, cx.background_executor.now());
         let mut tapped = false;
         for gesture in recognized_gestures {
             tapped |= matches!(gesture, RecognizedTouchGesture::Tap { .. });
@@ -5484,8 +5488,8 @@ impl Window {
         if tapped && self.invalidator.is_dirty() {
             self.draw(cx).clear(cx);
         }
-        if self.touch_gestures.has_momentum() {
-            self.schedule_touch_momentum_tick();
+        if self.touch_gestures.has_momentum() || self.touch_gestures.has_pending_hold() {
+            self.schedule_touch_gesture_tick();
         }
     }
 
@@ -5506,13 +5510,21 @@ impl Window {
         }
     }
 
-    fn schedule_touch_momentum_tick(&mut self) {
+    fn schedule_touch_gesture_tick(&mut self) {
+        if self.touch_gesture_tick_scheduled {
+            return;
+        }
+        self.touch_gesture_tick_scheduled = true;
         self.on_next_frame(|window, cx| {
+            window.touch_gesture_tick_scheduled = false;
+            if let Some(gesture) = window.touch_gestures.tick_hold(cx.background_executor.now()) {
+                window.dispatch_recognized_touch_gesture(gesture, cx);
+            }
             if let Some(gesture) = window.touch_gestures.tick_momentum() {
                 window.dispatch_recognized_touch_gesture(gesture, cx);
             }
-            if window.touch_gestures.has_momentum() {
-                window.schedule_touch_momentum_tick();
+            if window.touch_gestures.has_momentum() || window.touch_gestures.has_pending_hold() {
+                window.schedule_touch_gesture_tick();
             }
         });
     }
