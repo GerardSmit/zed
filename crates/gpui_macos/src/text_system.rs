@@ -5,6 +5,7 @@ use core_foundation::{
     array::{CFArray, CFArrayRef},
     attributed_string::CFMutableAttributedString,
     base::{CFRange, CFType, TCFType},
+    dictionary::CFDictionary,
     number::CFNumber,
     string::CFString,
 };
@@ -30,7 +31,6 @@ use font_kit::{
     hinting::HintingOptions,
     metrics::Metrics,
     properties::{Style as FontkitStyle, Weight as FontkitWeight},
-    source::SystemSource,
     sources::mem::MemSource,
 };
 use gpui::{
@@ -53,6 +53,26 @@ use crate::open_type::apply_features_and_fallbacks;
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
 
+// CTFontCollectionCreateMatchingFontDescriptors returns a +1 reference (Create Rule).
+// Keep this in one place for both the font picker and normal family loading.
+fn matching_font_descriptors(
+    collection: &core_text::font_collection::CTFontCollection,
+) -> Option<CFArray<CTFontDescriptor>> {
+    unsafe extern "C" {
+        fn CTFontCollectionCreateMatchingFontDescriptors(
+            collection: CTFontCollectionRef,
+        ) -> CFArrayRef;
+    }
+    unsafe {
+        let array = CTFontCollectionCreateMatchingFontDescriptors(collection.as_concrete_TypeRef());
+        if array.is_null() {
+            None
+        } else {
+            Some(CFArray::wrap_under_create_rule(array))
+        }
+    }
+}
+
 /// macOS text system using CoreText for font shaping.
 pub struct MacTextSystem(RwLock<MacTextSystemState>);
 
@@ -65,7 +85,6 @@ struct FontKey {
 
 struct MacTextSystemState {
     memory_source: MemSource,
-    system_source: SystemSource,
     fonts: Vec<FontKitFont>,
     font_selections: HashMap<Font, FontId>,
     font_ids_by_postscript_name: HashMap<String, FontId>,
@@ -78,7 +97,6 @@ impl MacTextSystem {
     pub fn new() -> Self {
         Self(RwLock::new(MacTextSystemState {
             memory_source: MemSource::empty(),
-            system_source: SystemSource::new(),
             fonts: Vec::new(),
             font_selections: HashMap::default(),
             font_ids_by_postscript_name: HashMap::default(),
@@ -102,25 +120,7 @@ impl PlatformTextSystem for MacTextSystem {
     fn all_font_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         let collection = core_text::font_collection::create_for_all_families();
-        // NOTE: We intentionally avoid using `collection.get_descriptors()` here because
-        // it has a memory leak bug in core-text v21.0.0. The upstream code uses
-        // `wrap_under_get_rule` but `CTFontCollectionCreateMatchingFontDescriptors`
-        // follows the Create Rule (caller owns the result), so it should use
-        // `wrap_under_create_rule`. We call the function directly with correct memory management.
-        unsafe extern "C" {
-            fn CTFontCollectionCreateMatchingFontDescriptors(
-                collection: CTFontCollectionRef,
-            ) -> CFArrayRef;
-        }
-        let descriptors: Option<CFArray<CTFontDescriptor>> = unsafe {
-            let array_ref =
-                CTFontCollectionCreateMatchingFontDescriptors(collection.as_concrete_TypeRef());
-            if array_ref.is_null() {
-                None
-            } else {
-                Some(CFArray::wrap_under_create_rule(array_ref))
-            }
-        };
+        let descriptors = matching_font_descriptors(&collection);
         let Some(descriptors) = descriptors else {
             return names;
         };
@@ -283,13 +283,40 @@ impl MacTextSystemState {
 
         let mut font_ids = SmallVec::new();
         let mut postscript_names_seen = HashSet::default();
-        let family = self
-            .memory_source
-            .select_family_by_name(name)
-            .or_else(|_| self.system_source.select_family_by_name(name))?;
-        for font in family.fonts() {
-            let mut font = font.load()?;
-
+        let fonts = match self.memory_source.select_family_by_name(name) {
+            Ok(family) => family
+                .fonts()
+                .iter()
+                .map(|font| font.load())
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(_) => {
+                // Match the same family as font-kit, but own the returned descriptor array.
+                // core-text 21's get_descriptors() leaks its Create-rule reference; font-kit's
+                // system source calls it every time features/fallbacks produce a new FontKey.
+                let attributes = CFDictionary::from_CFType_pairs(&[(
+                    CFString::new("NSFontFamilyAttribute"),
+                    CFString::new(name).as_CFType(),
+                )]);
+                let descriptor = core_text::font_descriptor::new_from_attributes(&attributes);
+                let descriptors = CFArray::from_CFTypes(&[descriptor]);
+                let collection = core_text::font_collection::new_from_descriptors(&descriptors);
+                matching_font_descriptors(&collection)
+                    .map(|descriptors| {
+                        descriptors
+                            .into_iter()
+                            .map(|descriptor| {
+                                let native = core_text::font::new_from_descriptor(&descriptor, 16.);
+                                unsafe { FontKitFont::from_core_text_font_no_path(native) }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            }
+        };
+        if fonts.is_empty() {
+            return Err(anyhow!("font family {name:?} not found"));
+        }
+        for mut font in fonts {
             apply_features_and_fallbacks(&mut font, features, fallbacks)?;
             // This block contains a precautionary fix to guard against loading fonts
             // that might cause panics due to `.unwrap()`s up the chain.

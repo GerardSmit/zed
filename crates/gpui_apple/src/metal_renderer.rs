@@ -495,6 +495,12 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        // Metal returns autoreleased drawables and encoders. Drain them every frame rather
+        // than retaining them until AppKit happens to drain its outer event-loop pool.
+        objc::rc::autoreleasepool(|| self.draw_inner(scene));
+    }
+
+    fn draw_inner(&mut self, scene: &Scene) {
         self.retain_scene_layers(scene);
         let layer = match &self.layer {
             Some(l) => l.clone(),
