@@ -7,22 +7,23 @@ use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextRenderingMode, TextShadow, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    Capslock, ClipboardItem, Context, Corners, CursorHideMode, CursorStyle, Decorations,
+    DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
+    Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId,
+    GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, ScrollDelta, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextInputConfiguration, TextRenderingMode, TextShadow, TextStyle, TextStyleRefinement,
+    ThermalState, TransformationMatrix, UTF16Selection, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
+    transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -1131,6 +1132,143 @@ enum InputModality {
     Touch,
 }
 
+/// Wraps an element's [`InputHandler`] so that the geometry it exchanges with the platform's
+/// text input system is in the platform's space rather than the window's zoomed space. The
+/// element answers in the space it was laid out in; the platform positions its IME candidate
+/// window in its own. This is the only seam where the two meet.
+struct ZoomedInputHandler {
+    inner: Box<dyn InputHandler>,
+}
+
+impl InputHandler for ZoomedInputHandler {
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        self.inner
+            .selected_text_range(ignore_disabled_input, window, cx)
+    }
+
+    fn marked_text_range(&mut self, window: &mut Window, cx: &mut App) -> Option<Range<usize>> {
+        self.inner.marked_text_range(window, cx)
+    }
+
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<String> {
+        self.inner
+            .text_for_range(range_utf16, adjusted_range, window, cx)
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        replacement_range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.inner
+            .replace_text_in_range(replacement_range, text, window, cx)
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.inner.replace_and_mark_text_in_range(
+            range_utf16,
+            new_text,
+            new_selected_range,
+            window,
+            cx,
+        )
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut App) {
+        self.inner.unmark_text(window, cx)
+    }
+
+    fn paste(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut App) {
+        self.inner.paste(item, window, cx)
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        let bounds = self.inner.bounds_for_range(range_utf16, window, cx)?;
+        Some(window.to_platform_bounds(bounds))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<usize> {
+        let point = window.from_platform_point(point);
+        self.inner.character_index_for_point(point, window, cx)
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.inner.set_selected_text_range(range_utf16, window, cx)
+    }
+
+    fn element_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
+        let bounds = self.inner.element_bounds(window, cx)?;
+        Some(window.to_platform_bounds(bounds))
+    }
+
+    fn text_length_utf16(&mut self, window: &mut Window, cx: &mut App) -> Option<usize> {
+        self.inner.text_length_utf16(window, cx)
+    }
+
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        self.inner.apple_press_and_hold_enabled()
+    }
+
+    fn accepts_text_input(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.inner.accepts_text_input(window, cx)
+    }
+
+    fn text_input_editable_range(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Range<usize>> {
+        self.inner.text_input_editable_range(window, cx)
+    }
+
+    fn prefers_ime_for_printable_keys(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.inner.prefers_ime_for_printable_keys(window, cx)
+    }
+
+    fn text_input_configuration(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> TextInputConfiguration {
+        self.inner.text_input_configuration(window, cx)
+    }
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -1180,6 +1318,10 @@ pub struct Window {
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
+    /// Application zoom folded into `scale_factor`. Everything inside the window (layout, hit
+    /// testing, `viewport_size`, `mouse_position`) is in zoomed logical pixels; the platform
+    /// window never sees this factor. See [`Window::set_zoom`].
+    zoom: f32,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -1883,6 +2025,7 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            zoom: 1.0,
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -2244,16 +2387,30 @@ impl Window {
     /// - `Some(&[])` is an empty region, so the window receives no pointer or touch input.
     /// - `None` resets the region to the default, so the whole window receives input again.
     pub fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
-        self.platform_window.set_input_region(region);
+        if self.zoom == 1.0 {
+            self.platform_window.set_input_region(region);
+            return;
+        }
+        let region = region.map(|rects| {
+            rects
+                .iter()
+                .map(|rect| self.to_platform_bounds(*rect))
+                .collect::<Vec<_>>()
+        });
+        self.platform_window.set_input_region(region.as_deref());
     }
 
     /// Return the `WindowBounds` to indicate that how a window should be opened
     /// after it has been closed
+    ///
+    /// Like [`Window::bounds`], this is OS space, not divided by [`Window::zoom`].
     pub fn window_bounds(&self) -> WindowBounds {
         self.platform_window.window_bounds()
     }
 
     /// Return the `WindowBounds` excluding insets (Wayland and X11)
+    ///
+    /// Like [`Window::bounds`], this is OS space, not divided by [`Window::zoom`].
     pub fn inner_window_bounds(&self) -> WindowBounds {
         self.platform_window.inner_window_bounds()
     }
@@ -2510,10 +2667,8 @@ impl Window {
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
         let prev_scale_factor = self.scale_factor;
-        self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
+        self.sync_geometry_from_platform();
         self.display_id = self.platform_window.display().map(|display| display.id());
-        self.mouse_position = self.platform_window.mouse_position();
 
         if self.scale_factor != prev_scale_factor {
             // DPI change: glyphs must be re-rasterized at the new scale, so bypass all caches now.
@@ -2537,7 +2692,22 @@ impl Window {
             .retain(&(), |callback| callback(self, cx));
     }
 
+    /// Re-derives `scale_factor`, `viewport_size` and `mouse_position` from the platform window
+    /// and the current zoom. The platform reports unzoomed values; the window keeps zoomed ones.
+    fn sync_geometry_from_platform(&mut self) {
+        self.scale_factor = self.platform_scale_factor() * self.zoom;
+        let zoom = self.zoom;
+        self.viewport_size = self
+            .platform_window
+            .content_size()
+            .map(|value| px(value.0 / zoom));
+        self.mouse_position = self.from_platform_point(self.platform_window.mouse_position());
+    }
+
     /// Returns the bounds of the current window in the global coordinate space, which could span across multiple displays.
+    ///
+    /// Unlike [`Window::viewport_size`], this is not divided by [`Window::zoom`]: it is the
+    /// platform's own geometry, in the same space as [`Window::resize`].
     pub fn bounds(&self) -> Bounds<Pixels> {
         self.platform_window.bounds()
     }
@@ -2560,7 +2730,7 @@ impl Window {
         self.rendered_frame.scene.quads.clone()
     }
 
-    /// Set the content size of the window.
+    /// Set the content size of the window, in the platform's (unzoomed) logical pixels.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
     }
@@ -2596,7 +2766,8 @@ impl Window {
         self.appearance
     }
 
-    /// Returns the size of the drawable area within the window.
+    /// Returns the size of the drawable area within the window, in zoomed logical pixels
+    /// (the platform's content size divided by [`Window::zoom`]).
     pub fn viewport_size(&self) -> Size<Pixels> {
         self.viewport_size
     }
@@ -2628,7 +2799,8 @@ impl Window {
 
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
-        self.platform_window.show_window_menu(position)
+        self.platform_window
+            .show_window_menu(self.to_platform_point(position))
     }
 
     /// Handle window movement for Linux and macOS.
@@ -2642,7 +2814,7 @@ impl Window {
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);
-        self.platform_window.set_client_inset(inset);
+        self.platform_window.set_client_inset(inset * self.zoom);
     }
 
     /// Returns the client_inset value by [`Self::set_client_inset`].
@@ -2679,7 +2851,8 @@ impl Window {
     /// Sets the position of the macOS traffic light buttons.
     #[cfg(target_os = "macos")]
     pub fn set_traffic_light_position(&self, position: Point<Pixels>) {
-        self.platform_window.set_traffic_light_position(position);
+        self.platform_window
+            .set_traffic_light_position(self.to_platform_point(position));
     }
 
     /// Sets the application identifier.
@@ -2717,18 +2890,77 @@ impl Window {
         self.platform_window.show_character_palette();
     }
 
-    /// The scale factor of the display associated with the window. For example, it could
-    /// return 2.0 for a "retina" display, indicating that each logical pixel should actually
-    /// be rendered as two pixels on screen.
+    /// The number of device pixels per logical pixel. This is the display's own scale factor
+    /// (2.0 on a "retina" display) multiplied by the window's [`Window::zoom`].
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
     }
 
-    /// Overrides the display scale factor for tests.
+    /// The display's scale factor as the platform reports it, without the window's zoom.
+    pub fn platform_scale_factor(&self) -> f32 {
+        self.platform_window.scale_factor()
+    }
+
+    /// Overrides the effective scale factor for tests. This is a raw override of the
+    /// combined value; the next `bounds_changed` or `set_zoom` recomputes it.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
         self.scale_factor = scale_factor;
         self.refresh();
+    }
+
+    /// The window's zoom factor. `1.0` is unzoomed; see [`Window::set_zoom`].
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// The smallest zoom [`Window::set_zoom`] accepts.
+    pub const MIN_ZOOM: f32 = 0.8;
+    /// The largest zoom [`Window::set_zoom`] accepts.
+    pub const MAX_ZOOM: f32 = 2.0;
+
+    /// Sets the window's zoom factor, clamped to `MIN_ZOOM..=MAX_ZOOM`.
+    ///
+    /// Zoom multiplies the effective [`Window::scale_factor`], so every size expressed in
+    /// logical pixels renders larger, and the window's logical viewport shrinks by the same
+    /// factor. Input positions are divided by the zoom as they enter the window and geometry
+    /// handed back to the platform (IME caret rectangles, window menu positions) is multiplied
+    /// by it, so the platform window itself is unaware of zoom.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        let zoom = if zoom.is_finite() {
+            zoom.clamp(Self::MIN_ZOOM, Self::MAX_ZOOM)
+        } else {
+            1.0
+        };
+        if zoom == self.zoom {
+            return;
+        }
+        self.zoom = zoom;
+        self.sync_geometry_from_platform();
+        if let Some(inset) = self.client_inset {
+            self.platform_window.set_client_inset(inset * zoom);
+        }
+        // Same as a DPI change: glyphs must be re-rasterized at the new scale, so bypass all
+        // caches rather than re-laying-out with cached layers.
+        self.refresh();
+    }
+
+    /// Converts a point from the window's zoomed logical space to the platform's space.
+    fn to_platform_point(&self, point: Point<Pixels>) -> Point<Pixels> {
+        let zoom = self.zoom;
+        point.map(|value| value * zoom)
+    }
+
+    /// Converts bounds from the window's zoomed logical space to the platform's space.
+    fn to_platform_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        let zoom = self.zoom;
+        bounds.map(|value| value * zoom)
+    }
+
+    /// Converts a point from the platform's space to the window's zoomed logical space.
+    fn from_platform_point(&self, point: Point<Pixels>) -> Point<Pixels> {
+        let zoom = self.zoom;
+        point.map(|value| px(value.0 / zoom))
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the
@@ -5104,7 +5336,12 @@ impl Window {
             let cx = self.to_async(cx);
             self.next_frame
                 .input_handlers
-                .push(Some(PlatformInputHandler::new(cx, Box::new(input_handler))));
+                .push(Some(PlatformInputHandler::new(
+                    cx,
+                    Box::new(ZoomedInputHandler {
+                        inner: Box::new(input_handler),
+                    }),
+                )));
         }
     }
 
@@ -5317,6 +5554,10 @@ impl Window {
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
+        // The platform delivers positions in its own space; everything below (hit testing,
+        // element bounds, the drag-out check) works in the zoomed space, so convert once here.
+        let event = self.event_from_platform(event);
+
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
@@ -5438,6 +5679,69 @@ impl Window {
         }
     }
 
+    /// Divides every position carried by a platform input event by the window zoom. Pixel
+    /// scroll deltas are distances in the same space and are divided too; line deltas and
+    /// pinch ratios are unitless.
+    fn event_from_platform(&self, event: PlatformInput) -> PlatformInput {
+        if self.zoom == 1.0 {
+            return event;
+        }
+        match event {
+            PlatformInput::MouseMove(mut mouse_move) => {
+                mouse_move.position = self.from_platform_point(mouse_move.position);
+                PlatformInput::MouseMove(mouse_move)
+            }
+            PlatformInput::MouseDown(mut mouse_down) => {
+                mouse_down.position = self.from_platform_point(mouse_down.position);
+                PlatformInput::MouseDown(mouse_down)
+            }
+            PlatformInput::MouseUp(mut mouse_up) => {
+                mouse_up.position = self.from_platform_point(mouse_up.position);
+                PlatformInput::MouseUp(mouse_up)
+            }
+            PlatformInput::MousePressure(mut mouse_pressure) => {
+                mouse_pressure.position = self.from_platform_point(mouse_pressure.position);
+                PlatformInput::MousePressure(mouse_pressure)
+            }
+            PlatformInput::MouseExited(mut mouse_exited) => {
+                mouse_exited.position = self.from_platform_point(mouse_exited.position);
+                PlatformInput::MouseExited(mouse_exited)
+            }
+            PlatformInput::ScrollWheel(mut scroll_wheel) => {
+                scroll_wheel.position = self.from_platform_point(scroll_wheel.position);
+                if let ScrollDelta::Pixels(delta) = scroll_wheel.delta {
+                    scroll_wheel.delta = ScrollDelta::Pixels(self.from_platform_point(delta));
+                }
+                PlatformInput::ScrollWheel(scroll_wheel)
+            }
+            PlatformInput::Pinch(mut pinch) => {
+                pinch.position = self.from_platform_point(pinch.position);
+                PlatformInput::Pinch(pinch)
+            }
+            PlatformInput::FileDrop(file_drop) => PlatformInput::FileDrop(match file_drop {
+                FileDropEvent::Entered { position, paths } => FileDropEvent::Entered {
+                    position: self.from_platform_point(position),
+                    paths,
+                },
+                FileDropEvent::Pending { position } => FileDropEvent::Pending {
+                    position: self.from_platform_point(position),
+                },
+                FileDropEvent::Submit { position } => FileDropEvent::Submit {
+                    position: self.from_platform_point(position),
+                },
+                FileDropEvent::Exited => FileDropEvent::Exited,
+                FileDropEvent::Ended => FileDropEvent::Ended,
+            }),
+            PlatformInput::Touch(mut touch) => {
+                touch.position = self.from_platform_point(touch.position);
+                PlatformInput::Touch(touch)
+            }
+            PlatformInput::KeyDown(_)
+            | PlatformInput::KeyUp(_)
+            | PlatformInput::ModifiersChanged(_) => event,
+        }
+    }
+
     fn promote_external_drag_to_platform(&mut self, event: &PlatformInput, cx: &mut App) {
         let PlatformInput::MouseMove(mouse_move) = event else {
             return;
@@ -5517,7 +5821,10 @@ impl Window {
         self.touch_gesture_tick_scheduled = true;
         self.on_next_frame(|window, cx| {
             window.touch_gesture_tick_scheduled = false;
-            if let Some(gesture) = window.touch_gestures.tick_hold(cx.background_executor.now()) {
+            if let Some(gesture) = window
+                .touch_gestures
+                .tick_hold(cx.background_executor.now())
+            {
                 window.dispatch_recognized_touch_gesture(gesture, cx);
             }
             if let Some(gesture) = window.touch_gestures.tick_momentum() {
@@ -6503,7 +6810,7 @@ impl Window {
         match request.action {
             accesskit::Action::Click => {
                 if let Some(bounds) = self.a11y.node_bounds.get(&request.target_node).copied() {
-                    let center = bounds.center();
+                    let center = self.to_platform_point(bounds.center());
                     let mouse_down = PlatformInput::MouseDown(crate::MouseDownEvent {
                         button: MouseButton::Left,
                         position: center,
@@ -7266,13 +7573,14 @@ mod tests {
     };
 
     use crate::{
-        AnyWindowHandle, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
+        AnyWindowHandle, App, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
-        InputEvent as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-        MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
-        StatefulInteractiveElement as _, Styled, TestAppContext, Window, WindowAppearance,
-        WindowOptions, canvas, div, point, px, size,
+        InputEvent as _, InputHandler, InteractiveElement as _, IntoElement, MouseButton,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
+        RequestFrameOptions, StatefulInteractiveElement as _, Styled, TestAppContext,
+        UTF16Selection, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
+    use std::ops::Range;
 
     struct EmptyView;
 
@@ -7972,5 +8280,242 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
+    }
+
+    struct ClickTarget {
+        clicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for ClickTarget {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let clicks = self.clicks.clone();
+            div().size_full().child(
+                div()
+                    .id("target")
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(100.))
+                    .h(px(100.))
+                    .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+            )
+        }
+    }
+
+    fn click_at(window: &mut Window, cx: &mut App, position: Point<Pixels>) {
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    fn test_zoom_shrinks_the_viewport_and_hit_tests_in_zoomed_space(cx: &mut TestAppContext) {
+        let clicks = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let clicks = clicks.clone();
+            move |_, _| ClickTarget { clicks }
+        });
+
+        // At zoom 1.0 an OS click at (105, 105) misses the 100x100 target.
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            click_at(window, cx, point(px(105.), px(105.)));
+        })
+        .unwrap();
+        assert_eq!(clicks.get(), 0);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            let platform_size = window.bounds().size;
+            let platform_scale = window.platform_scale_factor();
+            window.set_zoom(1.5);
+            assert_eq!(window.zoom(), 1.5);
+            assert_eq!(window.scale_factor(), platform_scale * 1.5);
+            assert_eq!(
+                window.viewport_size(),
+                size(
+                    px(platform_size.width.0 / 1.5),
+                    px(platform_size.height.0 / 1.5)
+                )
+            );
+
+            window.draw(cx).clear(cx);
+            // The same OS position is (70, 70) in zoomed space, inside the target.
+            click_at(window, cx, point(px(105.), px(105.)));
+            assert_eq!(window.mouse_position(), point(px(70.), px(70.)));
+        })
+        .unwrap();
+        assert_eq!(clicks.get(), 1);
+
+        // Past the target's zoomed extent (100 * 1.5 = 150 OS pixels) it misses again.
+        cx.update_window(window.into(), |_, window, cx| {
+            click_at(window, cx, point(px(160.), px(160.)));
+        })
+        .unwrap();
+        assert_eq!(clicks.get(), 1);
+
+        // Zoom 1.0 restores the unzoomed geometry.
+        cx.update_window(window.into(), |_, window, cx| {
+            let platform_size = window.bounds().size;
+            window.set_zoom(1.0);
+            assert_eq!(window.scale_factor(), window.platform_scale_factor());
+            assert_eq!(window.viewport_size(), platform_size);
+            window.draw(cx).clear(cx);
+            click_at(window, cx, point(px(105.), px(105.)));
+        })
+        .unwrap();
+        assert_eq!(clicks.get(), 1);
+    }
+
+    #[gpui::test]
+    fn test_zoom_is_clamped(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        cx.update_window(window.into(), |_, window, _| {
+            window.set_zoom(5.0);
+            assert_eq!(window.zoom(), Window::MAX_ZOOM);
+            window.set_zoom(0.1);
+            assert_eq!(window.zoom(), Window::MIN_ZOOM);
+            window.set_zoom(f32::NAN);
+            assert_eq!(window.zoom(), 1.0);
+            window.set_zoom(1.2);
+            assert_eq!(window.zoom(), 1.2);
+        })
+        .unwrap();
+    }
+
+    struct FixedBoundsInputHandler;
+
+    impl InputHandler for FixedBoundsInputHandler {
+        fn selected_text_range(
+            &mut self,
+            _: bool,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<UTF16Selection> {
+            Some(UTF16Selection {
+                range: 0..0,
+                reversed: false,
+            })
+        }
+
+        fn marked_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<Range<usize>> {
+            None
+        }
+
+        fn text_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<String> {
+            None
+        }
+
+        fn replace_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            _: &str,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            _: &str,
+            _: Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+
+        fn unmark_text(&mut self, _: &mut Window, _: &mut App) {}
+
+        fn bounds_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<Bounds<Pixels>> {
+            Some(Bounds::new(point(px(10.), px(20.)), size(px(30.), px(40.))))
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            point: Point<Pixels>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<usize> {
+            Some(point.x.0 as usize)
+        }
+    }
+
+    struct TextField {
+        focus_handle: FocusHandle,
+    }
+
+    impl Render for TextField {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let focus_handle = self.focus_handle.clone();
+            div()
+                .size_full()
+                .track_focus(&self.focus_handle)
+                .child(canvas(
+                    |_, _, _| {},
+                    move |_, _, window, cx| {
+                        window.handle_input(&focus_handle, FixedBoundsInputHandler, cx)
+                    },
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn test_ime_geometry_crosses_the_platform_seam_in_platform_space(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle, cx);
+            TextField { focus_handle }
+        });
+
+        let mut input_handler = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.set_zoom(1.5);
+                window.draw(cx).clear(cx);
+                window.platform_window.take_input_handler()
+            })
+            .unwrap()
+            .expect("the focused field registers an input handler while drawing");
+
+        assert_eq!(
+            input_handler.bounds_for_range(0..0),
+            Some(Bounds::new(point(px(15.), px(30.)), size(px(45.), px(60.))))
+        );
+        assert_eq!(
+            input_handler.ime_candidate_bounds(),
+            Some(Bounds::new(point(px(15.), px(30.)), size(px(45.), px(60.))))
+        );
+        assert_eq!(
+            input_handler.character_index_for_point(point(px(150.), px(0.))),
+            Some(100)
+        );
     }
 }
