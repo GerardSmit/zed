@@ -1027,6 +1027,9 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
 
 struct PathSprite {
     Bounds bounds;
+    // Size of the path intermediate texture in device pixels. It can be larger than the viewport:
+    // a cached layer pass rasterizes into the top-left of a texture sized for the largest target.
+    float2 tex_size;
 };
 
 struct PathSpriteVertexOutput {
@@ -1044,7 +1047,7 @@ PathSpriteVertexOutput path_sprite_vertex(uint vertex_id: SV_VertexID, uint spri
     float4 device_position = to_device_position(unit_vertex, sprite.bounds);
 
     float2 screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    float2 texture_coords = screen_position / global_viewport_size;
+    float2 texture_coords = screen_position / sprite.tex_size;
 
     PathSpriteVertexOutput output;
     output.position = device_position;

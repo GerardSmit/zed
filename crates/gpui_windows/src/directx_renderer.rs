@@ -81,11 +81,14 @@ struct DirectXResources {
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
-    // Path intermediate textures (with MSAA)
+    // Path intermediate textures (with MSAA). Sized to the back buffer, and grown to fit any
+    // cached layer larger than it, so the main pass and every layer pass rasterize their paths
+    // into the same pair; `path_intermediate_size` is what the path sprite pass samples by.
     path_intermediate_texture: ID3D11Texture2D,
     path_intermediate_srv: Option<ID3D11ShaderResourceView>,
     path_intermediate_msaa_texture: ID3D11Texture2D,
     path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
+    path_intermediate_size: (u32, u32),
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
@@ -412,7 +415,13 @@ impl DirectXRenderer {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
         })?;
-        self.render_scene(scene, true)
+        let render_target_view = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .render_target_view
+            .clone();
+        self.render_scene(scene, &render_target_view)
     }
 
     /// Drop layer textures whose view stopped compositing (closed/hidden tab or panel), so their
@@ -442,11 +451,15 @@ impl DirectXRenderer {
         });
     }
 
-    /// Draw a scene's primitive batches into the currently-bound render target. Shared by the main
-    /// pass and the per-layer offscreen passes. `allow_paths` is false for layer passes: the path
-    /// pipeline uses a window-sized MSAA intermediate and rebinds the main target when it finishes,
-    /// which would corrupt an in-progress layer pass — path support in layers is a follow-up.
-    fn render_scene(&mut self, scene: &Scene, allow_paths: bool) -> Result<()> {
+    /// Draw a scene's primitive batches into the currently-bound render target, which is
+    /// `render_target_view`. Shared by the main pass and the per-layer offscreen passes: the path
+    /// pipeline rasterizes into the shared MSAA intermediate and then rebinds `render_target_view`
+    /// to copy the result back, so the pass it interrupts carries on where it left off.
+    fn render_scene(
+        &mut self,
+        scene: &Scene,
+        render_target_view: &Option<ID3D11RenderTargetView>,
+    ) -> Result<()> {
         self.upload_scene_buffers(scene)?;
 
         let annotation = self
@@ -462,11 +475,8 @@ impl DirectXRenderer {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
-                    if !allow_paths {
-                        continue;
-                    }
                     let paths = &scene.paths[range];
-                    self.draw_paths_to_intermediate(paths)?;
+                    self.draw_paths_to_intermediate(paths, render_target_view)?;
                     self.draw_paths_from_intermediate(paths)
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
@@ -520,6 +530,10 @@ impl DirectXRenderer {
             let Some(devices) = self.devices.clone() else {
                 continue;
             };
+            self.resources
+                .as_mut()
+                .context("resources missing")?
+                .ensure_path_intermediate_fits(&devices, width, height)?;
             let rtv = self
                 .layers
                 .get(&layer.id.0)
@@ -568,10 +582,11 @@ impl DirectXRenderer {
                     .device_context
                     .RSSetViewports(Some(slice::from_ref(&layer_viewport)));
             }
-            self.render_scene(sub_scene, false)?;
+            let rendered = self.render_scene(sub_scene, &Some(rtv));
             if let Some(resources) = self.resources.as_mut() {
                 resources.viewport = saved_viewport;
             }
+            rendered?;
         }
         Ok(())
     }
@@ -811,7 +826,11 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+    fn draw_paths_to_intermediate(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        render_target_view: &Option<ID3D11RenderTargetView>,
+    ) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -865,10 +884,15 @@ impl DirectXRenderer {
                 0,
                 RENDER_TARGET_FORMAT,
             );
-            // Restore main render target
+            // Restore the render target this batch belongs to: the back buffer for the main pass,
+            // the layer texture for a layer pass. The viewport survives a target change, but the
+            // intermediate may be larger than the target, so set it again to be explicit.
             devices
                 .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+                .OMSetRenderTargets(Some(slice::from_ref(render_target_view)), None);
+            devices
+                .device_context
+                .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
         }
 
         Ok(())
@@ -886,11 +910,16 @@ impl DirectXRenderer {
         // disjoint, so we can copy each path's bounds individually. If this
         // batch combines different draw orders, we perform a single copy
         // for a minimal spanning rect.
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let (width, height) = resources.path_intermediate_size;
+        let tex_size = [width as f32, height as f32];
         let sprites = if paths.last().unwrap().order == first_path.order {
             paths
                 .iter()
                 .map(|path| PathSprite {
                     bounds: path.clipped_bounds(),
+                    tex_size,
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -898,11 +927,9 @@ impl DirectXRenderer {
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            vec![PathSprite { bounds }]
+            vec![PathSprite { bounds, tex_size }]
         };
 
-        let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
         self.pipelines.path_sprite_pipeline.update_buffer(
             &devices.device,
             &devices.device_context,
@@ -1258,8 +1285,37 @@ impl DirectXResources {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
             path_intermediate_srv,
+            path_intermediate_size: (width, height),
             viewport,
         })
+    }
+
+    /// Make the path intermediate at least `width` x `height`, for a layer pass whose target is
+    /// larger than the back buffer. Grow-only: a pass rasterizes into the top-left of the
+    /// intermediate through its own viewport and the sprite pass samples by the intermediate's
+    /// real size, so a texture bigger than the target is fine, and one smaller would clip.
+    fn ensure_path_intermediate_fits(
+        &mut self,
+        devices: &DirectXRendererDevices,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let (current_width, current_height) = self.path_intermediate_size;
+        if width <= current_width && height <= current_height {
+            return Ok(());
+        }
+        let width = width.max(current_width);
+        let height = height.max(current_height);
+        let (path_intermediate_texture, path_intermediate_srv) =
+            create_path_intermediate_texture(&devices.device, width, height)?;
+        let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
+            create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
+        self.path_intermediate_texture = path_intermediate_texture;
+        self.path_intermediate_srv = path_intermediate_srv;
+        self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
+        self.path_intermediate_msaa_view = path_intermediate_msaa_view;
+        self.path_intermediate_size = (width, height);
+        Ok(())
     }
 
     #[inline]
@@ -1284,6 +1340,7 @@ impl DirectXResources {
         self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
         self.path_intermediate_srv = path_intermediate_srv;
+        self.path_intermediate_size = (width, height);
         self.viewport = viewport;
         Ok(())
     }
@@ -1633,10 +1690,14 @@ struct PathRasterizationSprite {
     bounds: Bounds<ScaledPixels>,
 }
 
+/// One instance for the path sprite pass; mirrors the HLSL `PathSprite`. `tex_size` is the
+/// path intermediate's size in device pixels, which the shader samples by; it can be larger than
+/// the pass's viewport once a cached layer has grown it.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+    tex_size: [f32; 2],
 }
 
 impl Drop for DirectXRenderer {
