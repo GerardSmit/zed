@@ -3906,6 +3906,52 @@ impl Window {
         }
     }
 
+    /// Clip painted children to rounded bounds using disjoint device-pixel scissor bands.
+    /// The middle stays one rectangle; only visible corner rows need additional masks.
+    pub(crate) fn with_rounded_clip<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        radii: Corners<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let bounds = self.snap_bounds(bounds);
+        let radii = radii.scale(self.scale_factor());
+        let visible = bounds.intersect(&self.snapped_content_mask().bounds);
+        let top_radius = radii.top_left.0.max(radii.top_right.0);
+        let bottom_radius = radii.bottom_left.0.max(radii.bottom_right.0);
+        let inset = |radius: f32, distance: f32| {
+            if distance >= radius || radius <= 0. { 0. }
+            else { radius - (radius * radius - (radius - distance).powi(2)).max(0.).sqrt() }
+        };
+        let mut bands = Vec::new();
+        let mut y = visible.top().0;
+        while y < visible.bottom().0 {
+            let middle_top = bounds.top().0 + top_radius;
+            let middle_bottom = bounds.bottom().0 - bottom_radius;
+            let next = if y >= middle_top && y < middle_bottom {
+                middle_bottom.min(visible.bottom().0)
+            } else {
+                (y.floor() + 1.).min(visible.bottom().0).min(
+                    if y < middle_top { middle_top } else { visible.bottom().0 }
+                )
+            };
+            let sample = (y + next) * 0.5;
+            let from_top = sample - bounds.top().0;
+            let from_bottom = bounds.bottom().0 - sample;
+            let left = inset(radii.top_left.0, from_top).max(inset(radii.bottom_left.0, from_bottom));
+            let right = inset(radii.top_right.0, from_top).max(inset(radii.bottom_right.0, from_bottom));
+            bands.push(Bounds::from_corners(
+                point(ScaledPixels(bounds.left().0 + left), ScaledPixels(y)),
+                point(ScaledPixels(bounds.right().0 - right), ScaledPixels(next)),
+            ));
+            y = next;
+        }
+        self.next_frame.scene.push_rounded_clip(bands);
+        let result = f(self);
+        self.next_frame.scene.pop_rounded_clip();
+        result
+    }
+
     /// Updates the global element offset relative to the current offset. This is used to implement
     /// scrolling. This method should only be called during the prepaint phase of element drawing.
     pub fn with_element_offset<R>(

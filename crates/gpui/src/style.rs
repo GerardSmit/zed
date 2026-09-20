@@ -753,7 +753,13 @@ impl Style {
 
         window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
 
-        continuation(window, cx);
+        if self.overflow.x == Overflow::Hidden && self.overflow.y == Overflow::Hidden
+            && corner_radii != Corners::default()
+        {
+            window.with_rounded_clip(bounds, corner_radii, |window| continuation(window, cx));
+        } else {
+            continuation(window, cx);
+        }
 
         if self.is_border_visible() {
             let border_widths = self.border_widths.to_pixels(rem_size);

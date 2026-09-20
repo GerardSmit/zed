@@ -39,6 +39,7 @@ impl From<bool> for PaddedBool32 {
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
+    rounded_clips: Vec<Vec<Bounds<ScaledPixels>>>,
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
@@ -73,7 +74,16 @@ pub struct SceneLayer {
 
 #[expect(missing_docs)]
 impl Scene {
+    pub(crate) fn push_rounded_clip(&mut self, bands: Vec<Bounds<ScaledPixels>>) {
+        self.rounded_clips.push(bands);
+    }
+
+    pub(crate) fn pop_rounded_clip(&mut self) {
+        self.rounded_clips.pop();
+    }
+
     pub fn clear(&mut self) {
+        self.rounded_clips.clear();
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
@@ -105,7 +115,27 @@ impl Scene {
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let mut primitive = primitive.into();
+        self.insert_clipped_primitive(primitive.into(), 0);
+    }
+
+    fn insert_clipped_primitive(&mut self, primitive: Primitive, depth: usize) {
+        if depth == self.rounded_clips.len() {
+            self.insert_unclipped_primitive(primitive);
+            return;
+        }
+        let visible = primitive.bounds().intersect(&primitive.content_mask().bounds);
+        if visible.is_empty() { return; }
+        for index in 0..self.rounded_clips[depth].len() {
+            let band = self.rounded_clips[depth][index];
+            let bounds = visible.intersect(&band);
+            if bounds.is_empty() { continue; }
+            let mut clipped = primitive.clone();
+            clipped.content_mask_mut().bounds = bounds;
+            self.insert_clipped_primitive(clipped, depth + 1);
+        }
+    }
+
+    fn insert_unclipped_primitive(&mut self, mut primitive: Primitive) {
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -300,6 +330,19 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
+    fn content_mask_mut(&mut self) -> &mut ContentMask<ScaledPixels> {
+        match self {
+            Self::Shadow(value) => &mut value.content_mask,
+            Self::Quad(value) => &mut value.content_mask,
+            Self::Path(value) => &mut value.content_mask,
+            Self::Underline(value) => &mut value.content_mask,
+            Self::MonochromeSprite(value) => &mut value.content_mask,
+            Self::SubpixelSprite(value) => &mut value.content_mask,
+            Self::PolychromeSprite(value) => &mut value.content_mask,
+            Self::Surface(value) => &mut value.content_mask,
+        }
+    }
+
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
