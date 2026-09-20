@@ -741,7 +741,7 @@ impl Style {
                 None => Hsla::default(),
             };
             border_color.a = 0.;
-            window.paint_quad(quad(
+            window.paint_background_quad(quad(
                 bounds,
                 corner_radii,
                 background_color.unwrap_or_default(),

@@ -1295,6 +1295,7 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    background_fill_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2007,6 +2008,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            background_fill_opacity: 1.0,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -4435,6 +4437,20 @@ impl Window {
     /// Note that the `quad.corner_radii` are allowed to exceed the bounds, creating sharp corners
     /// where the circular arcs meet. This will not display well when combined with dashed borders.
     /// Use `Corners::clamp_radii_for_quad_size` if the radii should fit within the bounds.
+    /// Set the opacity of surface backgrounds in this window. Foreground content and borders
+    /// remain at their own opacity. A root view can reset this on every render.
+    pub fn set_background_fill_opacity(&mut self, opacity: f32) {
+        self.background_fill_opacity = opacity.clamp(0.0, 1.0);
+    }
+
+    /// Paint a surface fill using the window's background opacity. Custom elements use this for
+    /// their backgrounds and keep glyphs, carets, and other foreground quads on `paint_quad`.
+    pub fn paint_background_quad(&mut self, mut quad: PaintQuad) {
+        quad.background = quad.background.opacity(self.background_fill_opacity);
+        self.paint_quad(quad);
+    }
+
+    /// Paint a quad at the current stacking context without changing its foreground opacity.
     pub fn paint_quad(&mut self, quad: PaintQuad) {
         self.invalidator.debug_assert_paint();
 
