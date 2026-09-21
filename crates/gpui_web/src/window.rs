@@ -1,5 +1,6 @@
 use crate::display::WebDisplay;
 use crate::events::{ClickState, EventListenerHandle, WebEventListeners, is_mac_platform};
+use crate::frame_retry::FrameRetry;
 use crate::ime_mirror::ImeMirror;
 use crate::platform::WebWindowLifecycle;
 use std::sync::Arc;
@@ -94,6 +95,7 @@ pub(crate) struct WebWindowInner {
     /// the debounce timer fires.
     pending_resize: RefCell<Option<(u32, u32, f32, f32, f32)>>,
     raf_id: Cell<Option<i32>>,
+    frame_retry: RefCell<FrameRetry>,
     raf_function: RefCell<Option<js_sys::Function>>,
 }
 
@@ -238,6 +240,7 @@ impl WebWindow {
             resize_timer: Cell::new(None),
             pending_resize: RefCell::new(None),
             raf_id: Cell::new(None),
+            frame_retry: RefCell::new(FrameRetry::default()),
             raf_function: RefCell::new(None),
         });
 
@@ -452,9 +455,10 @@ impl WebWindowInner {
             this.with_callback(
                 |callbacks| &mut callbacks.request_frame,
                 |callback| {
+                    let retry = this.frame_retry.borrow_mut().take_request();
                     callback(RequestFrameOptions {
-                        require_presentation: false,
-                        force_render: false,
+                        require_presentation: retry.is_some(),
+                        force_render: retry.unwrap_or(false),
                     })
                 },
             );
@@ -914,7 +918,25 @@ impl PlatformWindow for WebWindow {
             });
         }
 
-        self.inner.state.borrow_mut().renderer.draw(scene);
+        let (presented, needs_redraw, device_lost) = {
+            let mut state = self.inner.state.borrow_mut();
+            let presented = state.renderer.draw(scene);
+            (
+                presented,
+                state.renderer.needs_redraw(),
+                state.renderer.device_lost(),
+            )
+        };
+        let retry = self.inner.frame_retry.borrow_mut().record(
+            presented,
+            needs_redraw,
+            device_lost,
+        );
+        if retry {
+            self.inner.wake_frame_loop();
+        } else if !presented && !device_lost {
+            log::warn!("Browser frame presentation failed ten times; waiting for new frame demand");
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

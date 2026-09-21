@@ -8,6 +8,7 @@
 mod dispatcher;
 mod display;
 mod events;
+mod frame_retry;
 mod http_client;
 mod ime_mirror;
 mod keyboard;
