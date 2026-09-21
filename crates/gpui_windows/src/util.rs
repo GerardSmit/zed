@@ -97,10 +97,18 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
     static HAND: OnceLock<SafeCursor> = OnceLock::new();
     static SIZEWE: OnceLock<SafeCursor> = OnceLock::new();
     static SIZENS: OnceLock<SafeCursor> = OnceLock::new();
+    static SCROLL_NS: OnceLock<SafeCursor> = OnceLock::new();
+    static SCROLL_N: OnceLock<SafeCursor> = OnceLock::new();
+    static SCROLL_S: OnceLock<SafeCursor> = OnceLock::new();
     static SIZENWSE: OnceLock<SafeCursor> = OnceLock::new();
     static SIZENESW: OnceLock<SafeCursor> = OnceLock::new();
     static NO: OnceLock<SafeCursor> = OnceLock::new();
     let (lock, name) = match style {
+        // Documented system resources without WinUser.h names. Preserve their native hotspots.
+        // https://learn.microsoft.com/windows/win32/menurc/about-cursors
+        CursorStyle::ScrollUpDown => (&SCROLL_NS, windows::core::PCWSTR(32652 as *const u16)),
+        CursorStyle::ScrollUp => (&SCROLL_N, windows::core::PCWSTR(32655 as *const u16)),
+        CursorStyle::ScrollDown => (&SCROLL_S, windows::core::PCWSTR(32656 as *const u16)),
         CursorStyle::IBeam | CursorStyle::IBeamCursorForVerticalLayout => (&IBEAM, IDC_IBEAM),
         CursorStyle::Crosshair => (&CROSS, IDC_CROSS),
         CursorStyle::PointingHand | CursorStyle::DragLink => (&HAND, IDC_HAND),
@@ -128,6 +136,22 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
             .into()
         })),
     )
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::{load_cursor, CursorStyle};
+
+    #[test]
+    fn scrolling_cursors_are_distinct_system_resources() {
+        let cursors = [CursorStyle::ScrollUpDown, CursorStyle::ScrollUp, CursorStyle::ScrollDown]
+            .map(|style| load_cursor(style).expect("system scrolling cursor"));
+        for (index, cursor) in cursors.iter().enumerate() {
+            assert!(!cursor.is_invalid());
+            assert!(!cursors[..index].contains(cursor));
+            assert_ne!(Some(*cursor), load_cursor(CursorStyle::ResizeUpDown));
+        }
+    }
 }
 
 /// This function is used to configure the dark mode for the window built-in title bar.

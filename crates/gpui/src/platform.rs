@@ -2394,6 +2394,13 @@ pub enum CursorStyle {
     /// corresponds to the CSS cursor value `ns-resize`
     ResizeUpDown,
 
+    /// Vertical autoscroll at rest, with the hotspot at the scrolling origin.
+    ScrollUpDown,
+    /// Vertical autoscroll towards the start of the content.
+    ScrollUp,
+    /// Vertical autoscroll towards the end of the content.
+    ScrollDown,
+
     /// A resize cursor directing up-left and down-right
     /// corresponds to the CSS cursor value `nesw-resize`
     ResizeUpLeftDownRight,

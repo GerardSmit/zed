@@ -2295,13 +2295,13 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
             CursorStyle::OpenHand => msg_send![class!(NSCursor), openHandCursor],
             CursorStyle::PointingHand => msg_send![class!(NSCursor), pointingHandCursor],
             CursorStyle::ResizeLeftRight => msg_send![class!(NSCursor), resizeLeftRightCursor],
-            CursorStyle::ResizeUpDown => msg_send![class!(NSCursor), resizeUpDownCursor],
+            CursorStyle::ResizeUpDown | CursorStyle::ScrollUpDown => msg_send![class!(NSCursor), resizeUpDownCursor],
             CursorStyle::ResizeLeft => msg_send![class!(NSCursor), resizeLeftCursor],
             CursorStyle::ResizeRight => msg_send![class!(NSCursor), resizeRightCursor],
             CursorStyle::ResizeColumn => msg_send![class!(NSCursor), resizeLeftRightCursor],
             CursorStyle::ResizeRow => msg_send![class!(NSCursor), resizeUpDownCursor],
-            CursorStyle::ResizeUp => msg_send![class!(NSCursor), resizeUpCursor],
-            CursorStyle::ResizeDown => msg_send![class!(NSCursor), resizeDownCursor],
+            CursorStyle::ResizeUp | CursorStyle::ScrollUp => msg_send![class!(NSCursor), resizeUpCursor],
+            CursorStyle::ResizeDown | CursorStyle::ScrollDown => msg_send![class!(NSCursor), resizeDownCursor],
 
             // Undocumented, private class methods:
             // https://stackoverflow.com/questions/27242353/cocoa-predefined-resize-mouse-cursor
