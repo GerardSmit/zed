@@ -1647,6 +1647,19 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self.interactivity().tooltip_show_delay(delay);
         self
     }
+
+    /// Anchor the tooltip beside the source's top-left (true) or top-right (false) corner.
+    fn tooltip_at_side(mut self, left: bool) -> Self {
+        self.interactivity().tooltip_at_side = Some(left);
+        self
+    }
+
+    /// Place the tooltip below the button, optionally aligning their right edges.
+    fn tooltip_below(mut self, align_right: bool) -> Self {
+        self.interactivity().tooltip_at_side = Some(align_right);
+        self.interactivity().tooltip_below = true;
+        self
+    }
 }
 
 pub(crate) type MouseDownListener =
@@ -2091,6 +2104,8 @@ pub struct Interactivity {
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
     pub(crate) tooltip_show_delay: Option<Duration>,
+    pub(crate) tooltip_at_side: Option<bool>,
+    pub(crate) tooltip_below: bool,
     pub(crate) window_control: Option<WindowControlArea>,
     pub(crate) hitbox_behavior: HitboxBehavior,
     pub(crate) tab_index: Option<isize>,
@@ -3112,6 +3127,20 @@ impl Interactivity {
                     check_is_hovered,
                     check_is_hovered_during_prepaint,
                     self.tooltip_show_delay,
+                    self.tooltip_at_side.map(|left| {
+                        let origin = if self.tooltip_below {
+                            if left {
+                                hitbox.bounds.bottom_right()
+                            } else {
+                                hitbox.bounds.bottom_left()
+                            }
+                        } else if left {
+                            hitbox.bounds.origin
+                        } else {
+                            hitbox.bounds.top_right()
+                        };
+                        (origin, left, self.tooltip_below)
+                    }),
                     window,
                 );
             }
@@ -3601,6 +3630,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
     check_is_hovered: Rc<dyn Fn(&Window) -> bool>,
     check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> bool>,
     show_delay: Option<Duration>,
+    anchor: Option<(Point<Pixels>, bool, bool)>,
     window: &mut Window,
 ) {
     let current_view = window.current_view();
@@ -3620,6 +3650,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
                 current_view,
                 phase,
                 show_delay,
+                anchor,
                 window,
                 cx,
             )
@@ -3665,6 +3696,7 @@ fn handle_tooltip_mouse_move(
     current_view: EntityId,
     phase: DispatchPhase,
     show_delay: Duration,
+    anchor: Option<(Point<Pixels>, bool, bool)>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -3741,6 +3773,7 @@ fn handle_tooltip_mouse_move(
                                     tooltip: AnyTooltip {
                                         view,
                                         mouse_position: window.mouse_position(),
+                                        anchor,
                                         check_visible_and_update: Rc::new(
                                             move |tooltip_bounds, window, cx| {
                                                 let Some(active_tooltip) =
@@ -3763,6 +3796,8 @@ fn handle_tooltip_mouse_move(
                                 }
                             });
                         *active_tooltip.borrow_mut() = new_tooltip;
+                        // Cached views must prepaint again to publish the new tooltip request.
+                        cx.notify(current_view);
                         window.request_redraw();
                     })
                     .ok();

@@ -3572,6 +3572,33 @@ impl Window {
                 }
             }
 
+            if let Some((anchor, left, below)) = tooltip_request.tooltip.anchor {
+                tooltip_bounds.origin = point(
+                    if below {
+                        if left {
+                            anchor.x - tooltip_size.width
+                        } else {
+                            anchor.x
+                        }
+                    } else if left {
+                        anchor.x - tooltip_size.width - px(6.)
+                    } else {
+                        anchor.x + px(6.)
+                    },
+                    if below { anchor.y + px(6.) } else { anchor.y },
+                );
+                tooltip_bounds.origin.x = tooltip_bounds
+                    .origin
+                    .x
+                    .max(px(4.))
+                    .min((window_bounds.right() - tooltip_size.width - px(4.)).max(px(4.)));
+                tooltip_bounds.origin.y = tooltip_bounds
+                    .origin
+                    .y
+                    .max(px(4.))
+                    .min((window_bounds.bottom() - tooltip_size.height - px(4.)).max(px(4.)));
+            }
+
             // It's possible for an element to have an active tooltip while not being painted (e.g.
             // via the `visible_on_hover` method). Since mouse listeners are not active in this
             // case, instead update the tooltip's visibility here.

@@ -1278,6 +1278,7 @@ impl Element for InteractiveText {
                         check_is_hovered,
                         check_is_hovered_during_prepaint,
                         None,
+                        None,
                         window,
                     );
                 }
