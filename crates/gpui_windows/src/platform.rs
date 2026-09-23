@@ -400,11 +400,96 @@ unsafe extern "system" fn ctrl_capslock_keyboard_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if code == HC_ACTION as i32 && ctrl_capslock_event_should_be_suppressed(wparam, lparam) {
+    if code == HC_ACTION as i32
+        && (ctrl_capslock_event_should_be_suppressed(wparam, lparam)
+            || win_key_remap_event_should_be_suppressed(wparam, lparam))
+    {
         return LRESULT(1);
     }
 
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// Whether the Win+key shortcuts in [`win_key_remap_key`] reach a focused window as the `ctrl-k`
+/// chord instead of reaching the shell. See [`crate::set_win_key_remap`].
+pub(crate) static WIN_KEY_REMAP: AtomicBool = AtomicBool::new(false);
+
+/// The unassigned virtual key AutoHotkey taps to "mask" a swallowed Win combination: without a
+/// key event between Win's press and release, the shell opens Start on the release.
+const MASK_KEY: u16 = 0xE8;
+
+fn win_key_remap_event_should_be_suppressed(wparam: WPARAM, lparam: LPARAM) -> bool {
+    if !WIN_KEY_REMAP.load(Ordering::Relaxed) {
+        return false;
+    }
+    let msg = wparam.0 as u32;
+    if msg != WM_KEYDOWN && msg != WM_SYSKEYDOWN && msg != WM_KEYUP && msg != WM_SYSKEYUP {
+        return false;
+    }
+
+    let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    // Injected keys count too, so a remapper (AutoHotkey, PowerToys) sending Win+arrows is
+    // remapped; the mask key below is not in the set, so it cannot loop back here.
+    if win_key_remap_key(info.vkCode).is_none() {
+        return false;
+    }
+    if !(is_async_key_pressed(VK_LWIN) || is_async_key_pressed(VK_RWIN))
+        || is_async_key_pressed(VK_CONTROL)
+    {
+        return false;
+    }
+
+    let Some(hwnd) = ctrl_capslock_target_window() else {
+        return false;
+    };
+
+    if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+        tap_mask_key();
+        let modifiers = usize::from(is_async_key_pressed(VK_SHIFT))
+            | usize::from(is_async_key_pressed(VK_MENU)) << 1;
+        unsafe {
+            PostMessageW(
+                Some(hwnd),
+                WM_GPUI_WIN_KEY_REMAP,
+                WPARAM(info.vkCode as usize),
+                LPARAM(modifiers as isize),
+            )
+            .log_err();
+        }
+    }
+
+    true
+}
+
+/// The key a remapped Win shortcut arrives as, after `ctrl-k`: the tiling chord's keys.
+pub(crate) fn win_key_remap_key(vk: u32) -> Option<&'static str> {
+    const DIGITS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    Some(match vk {
+        vk if vk == VK_LEFT.0 as u32 => "left",
+        vk if vk == VK_RIGHT.0 as u32 => "right",
+        vk if vk == VK_UP.0 as u32 => "up",
+        vk if vk == VK_DOWN.0 as u32 => "down",
+        0x31..=0x39 => DIGITS[(vk - 0x31) as usize],
+        0x4A => "j",
+        0x52 => "r",
+        0x54 => "t",
+        _ => return None,
+    })
+}
+
+fn tap_mask_key() {
+    let key = |flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(MASK_KEY),
+                dwFlags: flags,
+                ..Default::default()
+            },
+        },
+    };
+    let inputs = [key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)];
+    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
 }
 
 fn ctrl_capslock_event_should_be_suppressed(wparam: WPARAM, lparam: LPARAM) -> bool {
@@ -1661,6 +1746,26 @@ mod tests {
     use gpui::ClipboardItem;
 
     use super::encode_restart_arguments;
+
+    #[test]
+    fn win_key_remap_covers_the_tiling_chord_and_nothing_else() {
+        use super::win_key_remap_key;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_LEFT, VK_RIGHT, VK_UP};
+
+        assert_eq!(win_key_remap_key(VK_LEFT.0 as u32), Some("left"));
+        assert_eq!(win_key_remap_key(VK_RIGHT.0 as u32), Some("right"));
+        assert_eq!(win_key_remap_key(VK_UP.0 as u32), Some("up"));
+        assert_eq!(win_key_remap_key(VK_DOWN.0 as u32), Some("down"));
+        assert_eq!(win_key_remap_key(0x31), Some("1"));
+        assert_eq!(win_key_remap_key(0x39), Some("9"));
+        assert_eq!(win_key_remap_key(u32::from(b'J')), Some("j"));
+        assert_eq!(win_key_remap_key(u32::from(b'R')), Some("r"));
+        assert_eq!(win_key_remap_key(u32::from(b'T')), Some("t"));
+        // Win+0, Win+L (lock), Win+D (desktop) and Win+E (Explorer) stay with the shell.
+        for vk in [0x30, b'L', b'D', b'E'].map(u32::from) {
+            assert_eq!(win_key_remap_key(vk), None, "vk {vk:#x}");
+        }
+    }
 
     #[test]
     fn test_encode_restart_arguments() {

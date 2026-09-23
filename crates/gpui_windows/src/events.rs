@@ -30,6 +30,7 @@ pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
 pub(crate) const WM_GPUI_CTRL_CAPSLOCK: u32 = WM_USER + 9;
 pub(crate) const WM_GPUI_END_SESSION: u32 = WM_USER + 10;
+pub(crate) const WM_GPUI_WIN_KEY_REMAP: u32 = WM_USER + 11;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 
@@ -154,6 +155,7 @@ impl WindowsWindowInner {
             WM_KEYUP => self.handle_keyup_msg(wparam, lparam),
             WM_GPUI_KEYDOWN => self.handle_keydown_msg(wparam, lparam),
             WM_GPUI_CTRL_CAPSLOCK => self.handle_ctrl_capslock_shortcut(wparam),
+            WM_GPUI_WIN_KEY_REMAP => self.handle_win_key_remap(wparam, lparam),
             WM_CHAR => self.handle_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
@@ -505,6 +507,46 @@ impl WindowsWindowInner {
         };
 
         let handled = !func(input).propagate;
+        self.state.callbacks.input.set(Some(func));
+
+        if handled { Some(0) } else { Some(1) }
+    }
+
+    /// A Win shortcut the keyboard hook swallowed: dispatch it as the `ctrl-k` chord it stands for.
+    fn handle_win_key_remap(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        let key = win_key_remap_key(wparam.0 as u32)?;
+        let keystrokes = [
+            Keystroke {
+                modifiers: Modifiers {
+                    control: true,
+                    ..Default::default()
+                },
+                key: "k".to_string(),
+                key_char: None,
+            },
+            Keystroke {
+                modifiers: Modifiers {
+                    shift: lparam.0 & 1 != 0,
+                    alt: lparam.0 & 2 != 0,
+                    ..Default::default()
+                },
+                key: key.to_string(),
+                key_char: None,
+            },
+        ];
+
+        let Some(mut func) = self.state.callbacks.input.take() else {
+            return Some(1);
+        };
+        let mut handled = false;
+        for keystroke in keystrokes {
+            let input = PlatformInput::KeyDown(KeyDownEvent {
+                keystroke,
+                is_held: false,
+                prefer_character_input: false,
+            });
+            handled = !func(input).propagate;
+        }
         self.state.callbacks.input.set(Some(func));
 
         if handled { Some(0) } else { Some(1) }

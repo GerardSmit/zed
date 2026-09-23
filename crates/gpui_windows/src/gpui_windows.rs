@@ -43,6 +43,13 @@ pub use remote_surface::{RemoteSurface, push_surface};
 
 pub(crate) use windows::Win32::Foundation::HWND;
 
+/// While `enabled` and one of this process's windows is in the foreground, Win+arrows,
+/// Win+1…9 and Win+J/R/T (with Shift or Alt) are taken from the shell and delivered to that
+/// window as the `ctrl-k` chord followed by the key. Every other Win shortcut is untouched.
+pub fn set_win_key_remap(enabled: bool) {
+    platform::WIN_KEY_REMAP.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Set the Windows immersive dark-mode flag (the DWM-painted title bar / window frame) on every
 /// top-level window owned by this process. Lets the OS frame follow the active ced theme's
 /// light/dark kind instead of only the OS-wide system setting. No-op failures are ignored.
