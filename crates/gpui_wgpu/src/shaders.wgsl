@@ -200,6 +200,33 @@ fn distance_from_clip_rect(unit_vertex: vec2<f32>, bounds: Bounds, clip_bounds: 
     return distance_from_clip_rect_impl(position, clip_bounds);
 }
 
+// The content mask's vertical fade (`gpui::ContentFade`): absolute device-pixel edges, alpha 0 at
+// `top`/`bottom` and 1 at `*_len` inside them. It follows the mask's `Bounds` in every record, as
+// the Rust `ContentMask { bounds, fade }` does. Four scalars rather than a `vec4`, so it keeps the
+// Rust struct's 4-byte alignment in a storage buffer.
+struct ContentFade {
+    top: f32,
+    top_len: f32,
+    bottom: f32,
+    bottom_len: f32,
+}
+
+fn fade_vector(fade: ContentFade) -> vec4<f32> {
+    return vec4<f32>(fade.top, fade.top_len, fade.bottom, fade.bottom_len);
+}
+
+// The alpha a fade leaves at window height `y`; `fade` is `fade_vector`'s packing.
+fn fade_alpha(y: f32, fade: vec4<f32>) -> f32 {
+    var alpha = 1.0;
+    if (fade.y > 0.0) {
+        alpha *= saturate((y - fade.x) / fade.y);
+    }
+    if (fade.w > 0.0) {
+        alpha *= saturate((fade.z - y) / fade.w);
+    }
+    return alpha;
+}
+
 fn distance_from_clip_rect_transformed(unit_vertex: vec2<f32>, bounds: Bounds, clip_bounds: Bounds, transform: TransformationMatrix) -> vec4<f32> {
     let position = unit_vertex * vec2<f32>(bounds.size) + bounds.origin;
     let transformed = transpose(transform.rotation_scale) * position + transform.translation;
@@ -394,6 +421,12 @@ fn blend_color(color: vec4<f32>, alpha_factor: f32) -> vec4<f32> {
     return vec4<f32>(color.rgb * multiplier, alpha);
 }
 
+// Scale an already-blended colour by a fade: its colour too when the target is premultiplied.
+fn apply_fade(color: vec4<f32>, fade: f32) -> vec4<f32> {
+    let multiplier = select(1.0, fade, globals.premultiplied_alpha != 0u);
+    return vec4<f32>(color.rgb * multiplier, color.a * fade);
+}
+
 
 struct GradientColor {
     solid: vec4<f32>,
@@ -521,6 +554,7 @@ struct Quad {
     border_style: u32,
     bounds: Bounds,
     content_mask: Bounds,
+    content_fade: ContentFade,
     background: Background,
     border_color: Hsla,
     corner_radii: Corners,
@@ -563,6 +597,11 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
 
 @fragment
 fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
+    let fade = fade_alpha(input.position.y, fade_vector(load_quad(input.quad_id).content_fade));
+    return apply_fade(quad_color(input), fade);
+}
+
+fn quad_color(input: QuadVarying) -> vec4<f32> {
     // Alpha clip first, since we don't have `clip_distance`.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
@@ -954,6 +993,7 @@ struct Shadow {
     bounds: Bounds,
     corner_radii: Corners,
     content_mask: Bounds,
+    content_fade: ContentFade,
     color: Hsla,
     // Only consulted when `inset == 1u`: the element's own bounds, used as a rounded-rect
     // clip so the shadow never escapes the element.
@@ -1042,6 +1082,7 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         alpha *= saturate(0.5 - element_distance);
     }
 
+    alpha *= fade_alpha(input.position.y, fade_vector(shadow.content_fade));
     return blend_color(input.color, alpha);
 }
 
@@ -1052,6 +1093,7 @@ struct PathRasterizationVertex {
     st_position: vec2<f32>,
     color: Background,
     bounds: Bounds,
+    fade: ContentFade,
 }
 
 
@@ -1106,6 +1148,9 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
     );
     let color = gradient_color(background, input.position.xy, bounds,
         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
+    // Premultiplied, so the fade scales colour and alpha alike; the sprite pass composites the
+    // intermediate as is.
+    alpha *= fade_alpha(input.position.y, fade_vector(v.fade));
     return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
 }
 
@@ -1151,6 +1196,7 @@ struct Underline {
     pad: u32,
     bounds: Bounds,
     content_mask: Bounds,
+    content_fade: ContentFade,
     color: Hsla,
     thickness: f32,
     wavy: u32,
@@ -1189,9 +1235,10 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     }
 
     let underline = load_underline(input.underline_id);
+    let fade = fade_alpha(input.position.y, fade_vector(underline.content_fade));
     if (underline.wavy == 0u)
     {
-        return blend_color(input.color, input.color.a);
+        return blend_color(input.color, input.color.a * fade);
     }
 
     let half_thickness = underline.thickness * 0.5;
@@ -1207,7 +1254,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     let distance_from_top_border = distance_in_pixels - half_thickness;
     let distance_from_bottom_border = distance_in_pixels + half_thickness;
     let alpha = saturate(0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return blend_color(input.color, alpha * input.color.a);
+    return blend_color(input.color, alpha * input.color.a * fade);
 }
 
 // --- monochrome sprites --- //
@@ -1217,6 +1264,7 @@ struct MonochromeSprite {
     pad: u32,
     bounds: Bounds,
     content_mask: Bounds,
+    content_fade: ContentFade,
     color: Hsla,
     tile: AtlasTile,
     transformation: TransformationMatrix,
@@ -1228,6 +1276,7 @@ struct MonoSpriteVarying {
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) fade: vec4<f32>,
 }
 
 @vertex
@@ -1241,6 +1290,7 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.fade = fade_vector(sprite.content_fade);
     return out;
 }
 
@@ -1254,7 +1304,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    return blend_color(input.color, alpha_corrected);
+    return blend_color(input.color, alpha_corrected * fade_alpha(input.position.y, input.fade));
 }
 
 // --- polychrome sprites --- //
@@ -1266,6 +1316,7 @@ struct PolychromeSprite {
     opacity: f32,
     bounds: Bounds,
     content_mask: Bounds,
+    content_fade: ContentFade,
     corner_radii: Corners,
     tile: AtlasTile,
 }
@@ -1307,7 +1358,8 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
-    return blend_color(color, sprite.opacity * saturate(0.5 - distance));
+    let fade = fade_alpha(input.position.y, fade_vector(sprite.content_fade));
+    return blend_color(color, sprite.opacity * saturate(0.5 - distance) * fade);
 }
 
 // --- surfaces --- //
@@ -1315,6 +1367,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    content_fade: ContentFade,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
@@ -1358,7 +1411,8 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
         1.0);
 
-    return ycbcr_to_RGB * y_cb_cr;
+    let fade = fade_alpha(input.position.y, fade_vector(surface_locals.content_fade));
+    return apply_fade(ycbcr_to_RGB * y_cb_cr, fade);
 }
 
 // --- layer composite --- //
@@ -1373,6 +1427,7 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 struct LayerSurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    content_fade: ContentFade,
     tex_size: vec2<f32>,
     _pad: vec2<f32>,
 }
@@ -1422,7 +1477,8 @@ fn fs_layer_composite(input: LayerSurfaceVarying) -> @location(0) vec4<f32> {
     }
 
     // Sample the layer texture. The layer was rendered with straight alpha.
-    let sample = textureSampleLevel(t_layer, s_layer, tex_coord, 0.0);
+    var sample = textureSampleLevel(t_layer, s_layer, tex_coord, 0.0);
+    sample.a *= fade_alpha(input.position.y, fade_vector(layer_surface_locals.content_fade));
 
     // Premultiply if the surface uses premultiplied alpha compositing.
     if (globals.premultiplied_alpha != 0u) {

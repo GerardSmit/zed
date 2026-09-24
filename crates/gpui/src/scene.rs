@@ -197,42 +197,47 @@ impl Scene {
             bounds.origin.x = bounds.origin.x + offset.x;
             bounds.origin.y = bounds.origin.y + offset.y;
         }
+        #[inline]
+        fn shift_mask(mask: &mut ContentMask<ScaledPixels>, offset: Point<ScaledPixels>) {
+            shift(&mut mask.bounds, offset);
+            mask.fade.shift(offset.y);
+        }
         for s in &mut self.shadows {
             shift(&mut s.bounds, offset);
-            shift(&mut s.content_mask.bounds, offset);
+            shift_mask(&mut s.content_mask, offset);
         }
         for q in &mut self.quads {
             shift(&mut q.bounds, offset);
-            shift(&mut q.content_mask.bounds, offset);
+            shift_mask(&mut q.content_mask, offset);
         }
         for p in &mut self.paths {
             shift(&mut p.bounds, offset);
-            shift(&mut p.content_mask.bounds, offset);
+            shift_mask(&mut p.content_mask, offset);
             for v in &mut p.vertices {
                 v.xy_position.x = v.xy_position.x + offset.x;
                 v.xy_position.y = v.xy_position.y + offset.y;
-                shift(&mut v.content_mask.bounds, offset);
+                shift_mask(&mut v.content_mask, offset);
             }
         }
         for u in &mut self.underlines {
             shift(&mut u.bounds, offset);
-            shift(&mut u.content_mask.bounds, offset);
+            shift_mask(&mut u.content_mask, offset);
         }
         for s in &mut self.monochrome_sprites {
             shift(&mut s.bounds, offset);
-            shift(&mut s.content_mask.bounds, offset);
+            shift_mask(&mut s.content_mask, offset);
         }
         for s in &mut self.subpixel_sprites {
             shift(&mut s.bounds, offset);
-            shift(&mut s.content_mask.bounds, offset);
+            shift_mask(&mut s.content_mask, offset);
         }
         for s in &mut self.polychrome_sprites {
             shift(&mut s.bounds, offset);
-            shift(&mut s.content_mask.bounds, offset);
+            shift_mask(&mut s.content_mask, offset);
         }
         for s in &mut self.surfaces {
             shift(&mut s.bounds, offset);
-            shift(&mut s.content_mask.bounds, offset);
+            shift_mask(&mut s.content_mask, offset);
         }
     }
 

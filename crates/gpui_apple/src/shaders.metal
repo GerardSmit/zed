@@ -36,6 +36,10 @@ float4 over(float4 below, float4 above);
 float radians(float degrees);
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
   float4 solid_color, float4 color0, float4 color1);
+// The content mask's vertical fade (`gpui::ContentFade`), packed as (top, top_len, bottom,
+// bottom_len) in device pixels, and the alpha it leaves at window height `y`.
+float4 fade_vector(ContentFade_ScaledPixels fade);
+float fade_alpha(float y, float4 fade);
 
 struct GradientColor {
   float4 solid;
@@ -97,9 +101,17 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+float4 quad_fragment_color(QuadFragmentInput input, constant Quad *quads);
+
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
                               [[buffer(QuadInputIndex_Quads)]]) {
+  float4 color = quad_fragment_color(input, quads);
+  color.a *= fade_alpha(input.position.y, fade_vector(quads[input.quad_id].content_mask.fade));
+  return color;
+}
+
+float4 quad_fragment_color(QuadFragmentInput input, constant Quad *quads) {
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
@@ -551,6 +563,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     alpha *= saturate(0.5 - element_distance);
   }
 
+  alpha *= fade_alpha(input.position.y, fade_vector(shadow.content_mask.fade));
   return input.color * float4(1., 1., 1., alpha);
 }
 
@@ -594,6 +607,8 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
   const float WAVE_HEIGHT_RATIO = 0.8;
 
   Underline underline = underlines[input.underline_id];
+  float4 color = input.color;
+  color.a *= fade_alpha(input.position.y, fade_vector(underline.content_mask.fade));
   if (underline.wavy) {
     float half_thickness = underline.thickness * 0.5;
     float2 origin =
@@ -612,9 +627,9 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
     float distance_from_bottom_border = distance_in_pixels + half_thickness;
     float alpha = saturate(
         0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return input.color * float4(1., 1., 1., alpha);
+    return color * float4(1., 1., 1., alpha);
   } else {
-    return input.color;
+    return color;
   }
 }
 
@@ -622,6 +637,7 @@ struct MonochromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;
   float4 color [[flat]];
+  float4 fade [[flat]];
   float4 clip_distance;
 };
 
@@ -629,6 +645,7 @@ struct MonochromeSpriteFragmentInput {
   float4 position [[position]];
   float2 tile_position;
   float4 color [[flat]];
+  float4 fade [[flat]];
   float4 clip_distance;
 };
 
@@ -652,6 +669,7 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
       device_position,
       tile_position,
       color,
+      fade_vector(sprite.content_mask.fade),
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -668,7 +686,7 @@ fragment float4 monochrome_sprite_fragment(
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
   float4 color = input.color;
-  color.a *= sample.a;
+  color.a *= sample.a * fade_alpha(input.position.y, input.fade);
   return color;
 }
 
@@ -728,6 +746,7 @@ fragment float4 polychrome_sprite_fragment(
     color.b = grayscale;
   }
   color.a *= sprite.opacity * saturate(0.5 - distance);
+  color.a *= fade_alpha(input.position.y, fade_vector(sprite.content_mask.fade));
   return color;
 }
 
@@ -808,6 +827,9 @@ fragment float4 path_rasterization_fragment(
     gradient_color.color0,
     gradient_color.color1
   );
+  // Premultiplied, so the fade scales colour and alpha alike; the sprite pass composites the
+  // intermediate as is.
+  alpha *= fade_alpha(input.position.y, fade_vector(v.fade));
   return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
 
@@ -850,12 +872,14 @@ fragment float4 path_sprite_fragment(
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;
+  float4 fade [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
   float4 position [[position]];
   float2 texture_position;
+  float4 fade [[flat]];
 };
 
 vertex SurfaceVertexOutput surface_vertex(
@@ -878,6 +902,7 @@ vertex SurfaceVertexOutput surface_vertex(
   return SurfaceVertexOutput{
       device_position,
       texture_position,
+      fade_vector(surface.content_mask.fade),
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -896,14 +921,33 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  float4 color = ycbcrToRGBTransform * ycbcr;
+  color.a *= fade_alpha(input.position.y, input.fade);
+  return color;
 }
 
 fragment float4 layer_surface_fragment(
     SurfaceFragmentInput input [[stage_in]],
     texture2d<float> layer_texture [[texture(SurfaceInputIndex_YTexture)]]) {
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
-  return layer_texture.sample(texture_sampler, input.texture_position);
+  // A layer texture is premultiplied, so the fade scales the whole sample.
+  return layer_texture.sample(texture_sampler, input.texture_position) *
+         fade_alpha(input.position.y, input.fade);
+}
+
+float4 fade_vector(ContentFade_ScaledPixels fade) {
+  return float4(fade.top, fade.top_len, fade.bottom, fade.bottom_len);
+}
+
+float fade_alpha(float y, float4 fade) {
+  float alpha = 1.0;
+  if (fade.y > 0.0) {
+    alpha *= saturate((y - fade.x) / fade.y);
+  }
+  if (fade.w > 0.0) {
+    alpha *= saturate((fade.z - y) / fade.w);
+  }
+  return alpha;
 }
 
 float4 hsla_to_rgba(Hsla hsla) {
