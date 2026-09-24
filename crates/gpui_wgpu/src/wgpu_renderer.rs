@@ -2,7 +2,8 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, LayerId, PaintSurfaceSource, Path,
+    AtlasTextureId, Background, Bounds, ContentFade, DevicePixels, GpuSpecs, LayerId,
+    PaintSurfaceSource, Path,
     Point, PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
@@ -83,6 +84,8 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    /// The mask's `ContentFade`: top, top length, bottom, bottom length.
+    content_fade: [f32; 4],
 }
 
 /// Uniform block for the layer composite pipeline. `tex_size` is the actual
@@ -95,6 +98,8 @@ struct SurfaceParams {
 struct LayerSurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    /// The mask's `ContentFade`: top, top length, bottom, bottom length.
+    content_fade: [f32; 4],
     tex_size: [f32; 2],
     _pad: [f32; 2],
 }
@@ -136,6 +141,7 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    fade: ContentFade<ScaledPixels>,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -1724,6 +1730,10 @@ impl WgpuRenderer {
             let params = LayerSurfaceParams {
                 bounds: surface.bounds.into(),
                 content_mask: surface.content_mask.bounds.into(),
+                content_fade: {
+                    let fade = surface.content_mask.fade;
+                    [fade.top.0, fade.top_len.0, fade.bottom.0, fade.bottom_len.0]
+                },
                 tex_size: [layer_tex.width as f32, layer_tex.height as f32],
                 _pad: [0.0; 2],
             };
@@ -2228,6 +2238,7 @@ impl WgpuRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                fade: path.content_mask.fade,
             }));
         }
 
@@ -2746,13 +2757,13 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 44 * 4);
+        assert_eq!(std::mem::size_of::<Shadow>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 30 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<Underline>(), 20 * 4);
+        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 28 * 4);
     }
 }

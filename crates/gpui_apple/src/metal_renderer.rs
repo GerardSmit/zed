@@ -7,7 +7,7 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface,
+    AtlasTextureId, Background, Bounds, ContentFade, ContentMask, DevicePixels, PaintSurface,
     PaintSurfaceSource, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -164,6 +164,7 @@ pub struct PathRasterizationVertex {
     pub st_position: Point<f32>,
     pub color: Background,
     pub bounds: Bounds<ScaledPixels>,
+    pub fade: ContentFade<ScaledPixels>,
 }
 
 impl MetalRenderer {
@@ -924,11 +925,15 @@ impl MetalRenderer {
             }
             let mut bounds = path.bounds.intersect(&path.content_mask.bounds);
             bounds.origin = bounds.origin - tile.origin;
+            // The tile is its own space, and the fade is evaluated in it: moved with the vertices.
+            let mut fade = path.content_mask.fade;
+            fade.shift(ScaledPixels(0.) - tile.origin.y);
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
                 xy_position: v.xy_position - tile.origin,
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                fade,
             }));
         }
         let viewport_size = size(

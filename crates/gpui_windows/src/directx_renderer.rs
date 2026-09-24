@@ -106,14 +106,15 @@ struct DirectXRenderPipelines {
     surface_pipeline: PipelineState<SurfaceSprite>,
 }
 
-/// One instance for the surface pipeline; mirrors the HLSL `SurfaceSprite` (two `Bounds` + a
-/// `float2` = 10 floats). `tex_size` is the layer texture's device size for a cached-view-layer
+/// One instance for the surface pipeline; mirrors the HLSL `SurfaceSprite` (two `Bounds`, a
+/// `ContentFade` and a `float2` = 14 floats). `tex_size` is the layer texture's device size for a cached-view-layer
 /// composite (1:1, crisp, alpha-preserving), or `[0, 0]` for a stretched opaque image surface.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct SurfaceSprite {
     bounds: Bounds<ScaledPixels>,
     content_mask: Bounds<ScaledPixels>,
+    content_fade: ContentFade<ScaledPixels>,
     tex_size: [f32; 2],
 }
 
@@ -859,6 +860,7 @@ impl DirectXRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.clipped_bounds(),
+                fade: path.content_mask.fade,
             }));
         }
 
@@ -1065,6 +1067,7 @@ impl DirectXRenderer {
             let instance = SurfaceSprite {
                 bounds: surface.bounds,
                 content_mask: surface.content_mask.bounds,
+                content_fade: surface.content_mask.fade,
                 tex_size: [tex_w as f32, tex_h as f32],
             };
             self.pipelines.surface_pipeline.update_buffer(
@@ -1105,6 +1108,7 @@ impl DirectXRenderer {
             let instance = SurfaceSprite {
                 bounds: surface.bounds,
                 content_mask: surface.bounds,
+                content_fade: ContentFade::default(),
                 tex_size: [0.0, 0.0],
             };
             self.pipelines.surface_pipeline.update_buffer(
@@ -1688,6 +1692,7 @@ struct PathRasterizationSprite {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    fade: ContentFade<ScaledPixels>,
 }
 
 /// One instance for the path sprite pass; mirrors the HLSL `PathSprite`. `tex_size` is the

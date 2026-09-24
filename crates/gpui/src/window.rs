@@ -2088,27 +2088,132 @@ pub struct DispatchEventResult {
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
-/// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
-/// to leave room to support more complex shapes in the future.
+/// rendered. The region is a rectangle, optionally with a soft top and bottom edge ([`ContentFade`]):
+/// inside a fade, content is drawn with its alpha scaled down towards the edge.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// The bounds
     pub bounds: Bounds<P>,
+    /// The vertical fade, if any. The default is none.
+    pub fade: ContentFade<P>,
+}
+
+/// A vertical alpha ramp on a [`ContentMask`], in the same absolute space as its bounds.
+///
+/// Alpha is 0 at `top` and rises to 1 at `top + top_len`; it is 1 at `bottom - bottom_len` and
+/// falls to 0 at `bottom`. A zero length is no fade on that edge. Absolute rather than relative to
+/// the mask's bounds, so a child that clips itself inside the ramp keeps fading by the ramp rather
+/// than by one restarted at its own edge. Every renderer applies it per fragment; hit testing does
+/// not see it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct ContentFade<P: Clone + Debug + Default + PartialEq> {
+    /// Where the top ramp is fully transparent.
+    pub top: P,
+    /// How far below `top` it becomes fully opaque. Zero for no top fade.
+    pub top_len: P,
+    /// Where the bottom ramp is fully transparent.
+    pub bottom: P,
+    /// How far above `bottom` it is still fully opaque. Zero for no bottom fade.
+    pub bottom_len: P,
+}
+
+impl ContentFade<Pixels> {
+    /// A fade over the last `len` of `bounds`' bottom edge.
+    pub fn bottom(bounds: Bounds<Pixels>, len: Pixels) -> Self {
+        Self {
+            bottom: bounds.bottom(),
+            bottom_len: len.max(px(0.)),
+            ..Default::default()
+        }
+    }
+
+    /// Scale the fade's pixel units by the given scaling factor.
+    pub fn scale(&self, factor: f32) -> ContentFade<ScaledPixels> {
+        ContentFade {
+            top: self.top.scale(factor),
+            top_len: self.top_len.scale(factor),
+            bottom: self.bottom.scale(factor),
+            bottom_len: self.bottom_len.scale(factor),
+        }
+    }
+
+    /// Move the fade by `dy`, as its mask's bounds move.
+    pub fn shifted(&self, dy: Pixels) -> Self {
+        Self {
+            top: self.top + dy,
+            bottom: self.bottom + dy,
+            ..*self
+        }
+    }
+
+    /// `self` nested in `outer`: each edge keeps its own ramp if it has one, else the outer's.
+    pub fn within(&self, outer: &Self) -> Self {
+        let (top, top_len) = if self.top_len > px(0.) {
+            (self.top, self.top_len)
+        } else {
+            (outer.top, outer.top_len)
+        };
+        let (bottom, bottom_len) = if self.bottom_len > px(0.) {
+            (self.bottom, self.bottom_len)
+        } else {
+            (outer.bottom, outer.bottom_len)
+        };
+        Self {
+            top,
+            top_len,
+            bottom,
+            bottom_len,
+        }
+    }
+
+    /// The alpha the fade leaves at height `y`: 1 outside both ramps.
+    pub fn alpha_at(&self, y: Pixels) -> f32 {
+        let mut alpha = 1.;
+        if self.top_len > px(0.) {
+            alpha *= ((y - self.top) / self.top_len).clamp(0., 1.);
+        }
+        if self.bottom_len > px(0.) {
+            alpha *= ((self.bottom - y) / self.bottom_len).clamp(0., 1.);
+        }
+        alpha
+    }
+}
+
+impl ContentFade<ScaledPixels> {
+    /// Move the fade by `dy`, as its mask's bounds move.
+    pub fn shift(&mut self, dy: ScaledPixels) {
+        self.top += dy;
+        self.bottom += dy;
+    }
 }
 
 impl ContentMask<Pixels> {
+    /// A rectangular mask with no fade.
+    pub fn new(bounds: Bounds<Pixels>) -> Self {
+        Self {
+            bounds,
+            fade: ContentFade::default(),
+        }
+    }
+
     /// Scale the content mask's pixel units by the given scaling factor.
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
+            fade: self.fade.scale(factor),
         }
     }
 
-    /// Intersect the content mask with the given content mask.
+    /// Intersect the content mask with the given content mask. `self` is the inner mask: a fade
+    /// on `other` survives unless `self` has its own on that edge.
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
-        ContentMask { bounds }
+        ContentMask {
+            bounds,
+            fade: self.fade.within(&other.fade),
+        }
     }
 }
 
@@ -3108,8 +3213,10 @@ impl Window {
 
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
+        let mask = self.content_mask();
         ContentMask {
-            bounds: self.cover_bounds(self.content_mask().bounds),
+            bounds: self.cover_bounds(mask.bounds),
+            fade: mask.fade.scale(self.scale_factor()),
         }
     }
 
@@ -4143,11 +4250,11 @@ impl Window {
         self.content_mask_stack
             .last()
             .cloned()
-            .unwrap_or_else(|| ContentMask {
-                bounds: Bounds {
+            .unwrap_or_else(|| {
+                ContentMask::new(Bounds {
                     origin: Point::default(),
                     size: self.viewport_size,
-                },
+                })
             })
     }
 
@@ -4619,6 +4726,7 @@ impl Window {
                 self.next_frame.scene.insert_primitive(Quad {
                     content_mask: ContentMask {
                         bounds: content_mask_bounds,
+                        ..quad.content_mask
                     },
                     ..quad
                 });
