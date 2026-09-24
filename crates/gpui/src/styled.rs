@@ -752,6 +752,13 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Paints the window's backdrop image under this element's background, aligned with the
+    /// window: the element becomes a pane of glass over it. See [`Window::set_backdrop`].
+    fn backdrop(mut self) -> Self {
+        self.style().backdrop = Some(true);
+        self
+    }
+
     /// Sets the opacity of this element and its children.
     fn opacity(mut self, opacity: f32) -> Self {
         self.style().opacity = Some(opacity);

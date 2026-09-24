@@ -291,6 +291,12 @@ pub struct Style {
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
 
+    /// Paint the window's backdrop image (see [`Window::set_backdrop`]) under this element's
+    /// background, aligned with the window and clipped to the element's corners. With a
+    /// translucent fill on top this is a backdrop blur over a static window background, without
+    /// a render pass: the backdrop is blurred once, not per frame.
+    pub backdrop: bool,
+
     /// The text style of this element
     #[refineable]
     pub text: TextStyleRefinement,
@@ -724,6 +730,10 @@ impl Style {
 
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
 
+        if self.backdrop {
+            window.paint_backdrop(bounds, corner_radii);
+        }
+
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
             let mut border_color = match background_color {
@@ -826,6 +836,7 @@ impl Default for Style {
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
+            backdrop: false,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,

@@ -1296,6 +1296,7 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     background_fill_opacity: f32,
+    backdrop: Option<Arc<RenderImage>>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2009,6 +2010,7 @@ impl Window {
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             background_fill_opacity: 1.0,
+            backdrop: None,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -2730,6 +2732,13 @@ impl Window {
     #[cfg(any(test, feature = "test-support"))]
     pub fn painted_quads(&self) -> Vec<Quad> {
         self.rendered_frame.scene.quads.clone()
+    }
+
+    /// Returns the images (polychrome sprites) in the most recently rendered frame's scene, in
+    /// scaled pixels, like [`Self::painted_quads`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_images(&self) -> Vec<crate::PolychromeSprite> {
+        self.rendered_frame.scene.polychrome_sprites.clone()
     }
 
     /// Set the content size of the window, in the platform's (unzoomed) logical pixels.
@@ -4514,6 +4523,31 @@ impl Window {
     /// remain at their own opacity. A root view can reset this on every render.
     pub fn set_background_fill_opacity(&mut self, opacity: f32) {
         self.background_fill_opacity = opacity.clamp(0.0, 1.0);
+    }
+
+    /// The opacity surface backgrounds are painted at: see [`Self::set_background_fill_opacity`].
+    pub fn background_fill_opacity(&self) -> f32 {
+        self.background_fill_opacity
+    }
+
+    /// Set the image elements styled with `backdrop` paint under their background: cover-fitted
+    /// to the whole window, so each element shows its own slice of one continuous picture. A root
+    /// view sets this on every render, like [`Self::set_background_fill_opacity`]. Changing it
+    /// does not repaint cached views; call [`App::refresh_windows`] after the draw for that.
+    pub fn set_backdrop(&mut self, image: Option<Arc<RenderImage>>) {
+        self.backdrop = image;
+    }
+
+    /// Paint this element's slice of the window backdrop into `bounds`, if one is set.
+    pub fn paint_backdrop(&mut self, bounds: Bounds<Pixels>, corner_radii: Corners<Pixels>) {
+        let Some(image) = self.backdrop.clone() else {
+            return;
+        };
+        let window = Bounds::new(Point::default(), self.viewport_size);
+        let cover = crate::ObjectFit::Cover.get_bounds(window, image.size(0));
+        if let Err(error) = self.paint_image(bounds, cover, corner_radii, image, 0, false) {
+            log::debug!("window backdrop not painted: {error:#}");
+        }
     }
 
     /// Paint a surface fill using the window's background opacity. Custom elements use this for
