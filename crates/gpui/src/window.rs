@@ -1297,6 +1297,7 @@ pub struct Window {
     pub(crate) element_opacity: f32,
     background_fill_opacity: f32,
     backdrop: Option<Arc<RenderImage>>,
+    backdrop_bounds: Option<Bounds<Pixels>>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2011,6 +2012,7 @@ impl Window {
             element_opacity: 1.0,
             background_fill_opacity: 1.0,
             backdrop: None,
+            backdrop_bounds: None,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -4645,14 +4647,23 @@ impl Window {
         self.backdrop = image;
     }
 
+    /// Where the backdrop image is drawn, in window coordinates, instead of cover-fitted to the
+    /// window: for a root view that places its own background image elsewhere, so the backdrop
+    /// stays aligned with it. `None` is cover. Set on every render, like [`Self::set_backdrop`].
+    pub fn set_backdrop_bounds(&mut self, bounds: Option<Bounds<Pixels>>) {
+        self.backdrop_bounds = bounds;
+    }
+
     /// Paint this element's slice of the window backdrop into `bounds`, if one is set.
     pub fn paint_backdrop(&mut self, bounds: Bounds<Pixels>, corner_radii: Corners<Pixels>) {
         let Some(image) = self.backdrop.clone() else {
             return;
         };
-        let window = Bounds::new(Point::default(), self.viewport_size);
-        let cover = crate::ObjectFit::Cover.get_bounds(window, image.size(0));
-        if let Err(error) = self.paint_image(bounds, cover, corner_radii, image, 0, false) {
+        let placed = self.backdrop_bounds.unwrap_or_else(|| {
+            let window = Bounds::new(Point::default(), self.viewport_size);
+            crate::ObjectFit::Cover.get_bounds(window, image.size(0))
+        });
+        if let Err(error) = self.paint_image(bounds, placed, corner_radii, image, 0, false) {
             log::debug!("window backdrop not painted: {error:#}");
         }
     }
