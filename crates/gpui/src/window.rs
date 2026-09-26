@@ -1307,6 +1307,8 @@ pub struct Window {
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
+    /// The hoverable tooltip waiting out its hide delay, which a newly shown tooltip replaces.
+    pub(crate) hiding_tooltip: Option<std::rc::Weak<RefCell<Option<crate::ActiveTooltip>>>>,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -2017,6 +2019,7 @@ impl Window {
             last_text_input_configuration: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            hiding_tooltip: None,
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -3690,7 +3693,7 @@ impl Window {
                 }
             }
 
-            if let Some((anchor, left, below)) = tooltip_request.tooltip.anchor {
+            if let Some((anchor, left, below, source)) = tooltip_request.tooltip.anchor {
                 tooltip_bounds.origin = point(
                     if below {
                         if left {
@@ -3705,6 +3708,31 @@ impl Window {
                     },
                     if below { anchor.y + px(6.) } else { anchor.y },
                 );
+                // No room under the source: sit above it, keeping the same side, rather than be
+                // clamped up over the thing it describes.
+                if below && tooltip_bounds.origin.y + tooltip_size.height > window_bounds.bottom() - px(4.)
+                {
+                    let above = anchor.y - source.height - px(6.) - tooltip_size.height;
+                    if above >= px(4.) {
+                        tooltip_bounds.origin.y = above;
+                    }
+                }
+                // Beside the source with no room on that side: take the other side rather than
+                // be clamped over the source and whatever sits next to it.
+                if !below {
+                    let right = window_bounds.right() - px(4.);
+                    if left && tooltip_bounds.origin.x < px(4.) {
+                        let other = anchor.x + source.width + px(6.);
+                        if other + tooltip_size.width <= right {
+                            tooltip_bounds.origin.x = other;
+                        }
+                    } else if !left && tooltip_bounds.origin.x + tooltip_size.width > right {
+                        let other = anchor.x - source.width - px(6.) - tooltip_size.width;
+                        if other >= px(4.) {
+                            tooltip_bounds.origin.x = other;
+                        }
+                    }
+                }
                 tooltip_bounds.origin.x = tooltip_bounds
                     .origin
                     .x

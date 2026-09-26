@@ -3001,8 +3001,10 @@ pub struct AnyTooltip {
     /// The absolute position of the mouse when the tooltip was deployed.
     pub mouse_position: Point<Pixels>,
 
-    /// Optional source corner: the tooltip sits beside this point with aligned top edges.
-    pub anchor: Option<(Point<Pixels>, bool, bool)>,
+    /// Optional source corner: the tooltip sits beside this point with aligned top edges, or
+    /// under it when the third field is set. The last field is the source's height, so a tooltip
+    /// with no room under its source can sit above it instead of covering it.
+    pub anchor: Option<(Point<Pixels>, bool, bool, crate::Size<Pixels>)>,
 
     /// Given the bounds of the tooltip, checks whether the tooltip should still be visible and
     /// updates its state accordingly. This is needed atop the hovered element's mouse move handler

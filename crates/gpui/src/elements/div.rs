@@ -51,6 +51,9 @@ type StackSafe<T> = T;
 
 const DRAG_THRESHOLD: f64 = 2.;
 const DEFAULT_TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
+
+/// How long a hovered element waits before building its tooltip, asked when the hover starts.
+type ShowDelay = Rc<dyn Fn() -> Duration>;
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
 
 /// The styling information for a given group.
@@ -711,7 +714,15 @@ impl Interactivity {
     /// Set the delay before this element's tooltip is shown.
     /// The imperative API equivalent to [`StatefulInteractiveElement::tooltip_show_delay`].
     pub fn tooltip_show_delay(&mut self, delay: Duration) {
-        self.tooltip_show_delay = Some(delay);
+        self.tooltip_show_delay = Some(Rc::new(move || delay));
+    }
+
+    /// Set the delay before this element's tooltip is shown, asked each time a hover starts
+    /// rather than when the element is painted — for a delay that depends on what happened since,
+    /// such as another tooltip having just been open.
+    /// The imperative API equivalent to [`StatefulInteractiveElement::tooltip_show_delay_with`].
+    pub fn tooltip_show_delay_with(&mut self, delay: impl Fn() -> Duration + 'static) {
+        self.tooltip_show_delay = Some(Rc::new(delay));
     }
 
     /// Block the mouse from all interactions with elements behind this element's hitbox. Typically
@@ -1648,6 +1659,16 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Set the delay before this element's tooltip is shown, asked each time a hover starts.
+    /// The fluent API equivalent to [`Interactivity::tooltip_show_delay_with`].
+    fn tooltip_show_delay_with(mut self, delay: impl Fn() -> Duration + 'static) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().tooltip_show_delay_with(delay);
+        self
+    }
+
     /// Anchor the tooltip beside the source's top-left (true) or top-right (false) corner.
     fn tooltip_at_side(mut self, left: bool) -> Self {
         self.interactivity().tooltip_at_side = Some(left);
@@ -2103,7 +2124,7 @@ pub struct Interactivity {
     pub(crate) drag_listener: Option<DragListener>,
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
-    pub(crate) tooltip_show_delay: Option<Duration>,
+    pub(crate) tooltip_show_delay: Option<ShowDelay>,
     pub(crate) tooltip_at_side: Option<bool>,
     pub(crate) tooltip_below: bool,
     pub(crate) window_control: Option<WindowControlArea>,
@@ -3126,7 +3147,7 @@ impl Interactivity {
                     build_tooltip,
                     check_is_hovered,
                     check_is_hovered_during_prepaint,
-                    self.tooltip_show_delay,
+                    self.tooltip_show_delay.clone(),
                     self.tooltip_at_side.map(|left| {
                         let origin = if self.tooltip_below {
                             if left {
@@ -3139,7 +3160,7 @@ impl Interactivity {
                         } else {
                             hitbox.bounds.top_right()
                         };
-                        (origin, left, self.tooltip_below)
+                        (origin, left, self.tooltip_below, hitbox.bounds.size)
                     }),
                     window,
                 );
@@ -3629,12 +3650,12 @@ pub(crate) fn register_tooltip_mouse_handlers(
     build_tooltip: Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
     check_is_hovered: Rc<dyn Fn(&Window) -> bool>,
     check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> bool>,
-    show_delay: Option<Duration>,
-    anchor: Option<(Point<Pixels>, bool, bool)>,
+    show_delay: Option<ShowDelay>,
+    anchor: Option<(Point<Pixels>, bool, bool, Size<Pixels>)>,
     window: &mut Window,
 ) {
     let current_view = window.current_view();
-    let show_delay = show_delay.unwrap_or(DEFAULT_TOOLTIP_SHOW_DELAY);
+    let show_delay = show_delay.unwrap_or_else(|| Rc::new(|| DEFAULT_TOOLTIP_SHOW_DELAY));
 
     window.on_mouse_event({
         let active_tooltip = active_tooltip.clone();
@@ -3649,7 +3670,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
                 tooltip_id,
                 current_view,
                 phase,
-                show_delay,
+                &show_delay,
                 anchor,
                 window,
                 cx,
@@ -3695,8 +3716,8 @@ fn handle_tooltip_mouse_move(
     tooltip_id: Option<TooltipId>,
     current_view: EntityId,
     phase: DispatchPhase,
-    show_delay: Duration,
-    anchor: Option<(Point<Pixels>, bool, bool)>,
+    show_delay: &ShowDelay,
+    anchor: Option<(Point<Pixels>, bool, bool, Size<Pixels>)>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -3756,6 +3777,7 @@ fn handle_tooltip_mouse_move(
             active_tooltip.borrow_mut().take();
         }
         Action::ScheduleShow => {
+            let show_delay = show_delay();
             let delayed_show_task = window.spawn(cx, {
                 let weak_active_tooltip = Rc::downgrade(active_tooltip);
                 let build_tooltip = build_tooltip.clone();
@@ -3795,6 +3817,20 @@ fn handle_tooltip_mouse_move(
                                     is_hoverable: tooltip_is_hoverable,
                                 }
                             });
+                        // A hoverable tooltip left behind by the last source is only lingering in
+                        // case the pointer was headed into it. The pointer chose this source
+                        // instead, so the old one goes now rather than covering this one.
+                        if new_tooltip.is_some()
+                            && let Some(hiding) =
+                                window.hiding_tooltip.take().and_then(|hiding| hiding.upgrade())
+                            && !Rc::ptr_eq(&hiding, &active_tooltip)
+                            && matches!(
+                                &*hiding.borrow(),
+                                Some(ActiveTooltip::WaitingForHide { .. })
+                            )
+                        {
+                            hiding.borrow_mut().take();
+                        }
                         *active_tooltip.borrow_mut() = new_tooltip;
                         // Cached views must prepaint again to publish the new tooltip request.
                         cx.notify(current_view);
@@ -3861,6 +3897,7 @@ fn handle_tooltip_check_visible_and_update(
         Action::None => {}
         Action::Hide => clear_active_tooltip(active_tooltip, window),
         Action::ScheduleHide(tooltip) => {
+            window.hiding_tooltip = Some(Rc::downgrade(active_tooltip));
             let delayed_hide_task = window.spawn(cx, {
                 let weak_active_tooltip = Rc::downgrade(active_tooltip);
                 async move |cx| {
@@ -4825,6 +4862,92 @@ mod tests {
             .unwrap();
 
         assert!(active_tooltip.borrow().is_none());
+    }
+
+    struct NamedTooltip {
+        name: &'static str,
+        drawn: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Render for NamedTooltip {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.drawn.borrow_mut().push(self.name);
+            div().w(px(5.)).h(px(5.))
+        }
+    }
+
+    struct TwoHoverableSources {
+        drawn: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Render for TwoHoverableSources {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let source = |name: &'static str, drawn: Rc<RefCell<Vec<&'static str>>>| {
+                div()
+                    .id(name)
+                    .w(px(50.))
+                    .h(px(20.))
+                    .tooltip_show_delay(Duration::from_millis(100))
+                    .hoverable_tooltip(move |_, cx| {
+                        let drawn = drawn.clone();
+                        cx.new(|_| NamedTooltip { name, drawn }).into()
+                    })
+            };
+            // "upper" paints first, so a lingering "lower" card would win the frame.
+            div()
+                .size_full()
+                .child(source("upper", self.drawn.clone()))
+                .child(source("lower", self.drawn.clone()))
+        }
+    }
+
+    #[test]
+    fn a_shown_tooltip_replaces_a_hoverable_one_waiting_to_hide() {
+        let mut test_app = TestAppContext::single();
+        let drawn = Rc::new(RefCell::new(Vec::new()));
+        let window = test_app.add_window({
+            let drawn = drawn.clone();
+            move |_, _| TwoHoverableSources { drawn }
+        });
+        let window: crate::AnyWindowHandle = window.into();
+        let mut draw = |test_app: &mut TestAppContext| {
+            test_app.run_until_parked();
+            drawn.borrow_mut().clear();
+            test_app
+                .update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            drawn.borrow().clone()
+        };
+        let move_to = |test_app: &mut TestAppContext, y: f32| {
+            test_app
+                .update_window(window, |_, window, cx| {
+                    window.dispatch_event(
+                        MouseMoveEvent {
+                            position: point(px(40.), px(y)),
+                            modifiers: Default::default(),
+                            pressed_button: None,
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                })
+                .unwrap();
+        };
+
+        draw(&mut test_app);
+        move_to(&mut test_app, 30.);
+        draw(&mut test_app);
+        test_app.dispatcher.advance_clock(Duration::from_millis(100));
+        assert_eq!(draw(&mut test_app), ["lower"]);
+
+        move_to(&mut test_app, 10.);
+        draw(&mut test_app);
+        test_app.dispatcher.advance_clock(Duration::from_millis(100));
+        assert_eq!(
+            draw(&mut test_app),
+            ["upper"],
+            "the card the pointer left covered the one it moved to"
+        );
     }
 
     struct MouseDownOutOwner {
