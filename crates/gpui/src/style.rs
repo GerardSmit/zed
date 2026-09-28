@@ -297,6 +297,12 @@ pub struct Style {
     /// a render pass: the backdrop is blurred once, not per frame.
     pub backdrop: bool,
 
+    /// Blur whatever is painted under this element by this standard deviation before its
+    /// background paints: a live `backdrop-filter: blur()`. Where the renderer cannot
+    /// ([`Window::supports_backdrop_blur`]), the element paints the static [`Self::backdrop`]
+    /// image instead.
+    pub backdrop_blur: Option<Pixels>,
+
     /// The text style of this element
     #[refineable]
     pub text: TextStyleRefinement,
@@ -730,11 +736,22 @@ impl Style {
 
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
 
-        if self.backdrop {
-            window.paint_backdrop(bounds, corner_radii);
+        let background_color = self.background.as_ref().and_then(Fill::color);
+
+        // A fill that hides everything under it makes the blur a per-frame cost nobody sees.
+        let fill_is_opaque = background_color.is_some_and(|color| {
+            color.tag == BackgroundTag::Solid && color.solid.a >= 1.
+        }) && window.background_fill_opacity() >= 1.;
+        match self.backdrop_blur {
+            Some(_) if fill_is_opaque => {}
+            Some(radius) if window.supports_backdrop_blur() => {
+                window.paint_backdrop_blur(bounds, corner_radii, radius);
+            }
+            Some(_) => window.paint_backdrop(bounds, corner_radii),
+            None if self.backdrop => window.paint_backdrop(bounds, corner_radii),
+            None => {}
         }
 
-        let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
             let mut border_color = match background_color {
                 Some(color) => match color.tag {
@@ -837,6 +854,7 @@ impl Default for Style {
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
             backdrop: false,
+            backdrop_blur: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,

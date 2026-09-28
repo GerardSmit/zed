@@ -833,6 +833,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn mouse_position(&self) -> Point<Pixels>;
+    /// Whether a platform-generated touch fling is still active. Finger lift still
+    /// dispatches `Ended`; scroll routing retains its target until momentum ends.
+    fn has_scroll_momentum(&self) -> bool {
+        false
+    }
     fn modifiers(&self) -> Modifiers;
     fn capslock(&self) -> Capslock;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
@@ -879,6 +884,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
+    /// Whether the renderer draws [`crate::PaintSurfaceSource::BackdropBlur`] surfaces.
+    fn supports_backdrop_blur(&self) -> bool {
+        false
+    }
 
     // macOS specific methods
     fn get_title(&self) -> String {

@@ -384,6 +384,11 @@ pub struct SystemWindowTabController {
 
 impl Global for SystemWindowTabController {}
 
+/// The handler [`App::on_ui_fault`] registered.
+struct UiFaultHandler(Rc<dyn Fn(AnyWindowHandle, SharedString, &mut App)>);
+
+impl Global for UiFaultHandler {}
+
 impl SystemWindowTabController {
     /// Create a new instance of the window tab controller.
     pub fn new() -> Self {
@@ -2380,6 +2385,33 @@ impl App {
         );
         activate();
         subscription
+    }
+
+    /// Register the one handler for faults gpui recovered from instead of
+    /// panicking: an element tree that broke an invariant (a duplicate
+    /// accessibility id, say). The frame is drawn with the offending part
+    /// discarded, and `handler` is called after the frame with the window and a
+    /// message suitable for a bug report. Each distinct fault is reported once.
+    pub fn on_ui_fault(
+        &mut self,
+        handler: impl Fn(AnyWindowHandle, SharedString, &mut App) + 'static,
+    ) {
+        self.set_global(UiFaultHandler(Rc::new(handler)));
+    }
+
+    pub(crate) fn report_ui_faults(&mut self, window: AnyWindowHandle, faults: Vec<SharedString>) {
+        let Some(handler) = self
+            .try_global::<UiFaultHandler>()
+            .map(|handler| Rc::clone(&handler.0))
+        else {
+            return;
+        };
+        // Deferred: the faults are found mid-draw, and the handler updates views.
+        self.defer(move |cx| {
+            for fault in faults {
+                handler(window, fault, cx);
+            }
+        });
     }
 
     /// Register a callback to be invoked when a window is closed

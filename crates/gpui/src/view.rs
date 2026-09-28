@@ -335,6 +335,9 @@ struct ViewElementState {
     /// rendered. `None` means never rendered. A content-unchanged frame at the same scale composites
     /// the existing texture instead of re-rendering (the resize fast path).
     layer_scale: Option<f32>,
+    /// Rendered under [`Window::with_uncached_views`]: its ranges point into a layer's sub-scene,
+    /// so the next frame must render it again rather than replay them.
+    uncached: bool,
 }
 
 struct ViewElementCacheKey {
@@ -431,8 +434,11 @@ impl<V: View> Element for ViewElement<V> {
                         let content_mask = window.content_mask();
                         let text_style = window.text_style();
                         let scale = window.scale_factor();
-                        let view_dirty =
-                            window.dirty_views.contains(&entity_id) || window.refreshing;
+                        let uncached = window.uncached_views > 0;
+                        let view_dirty = window.dirty_views.contains(&entity_id)
+                            || window.refreshing
+                            || uncached
+                            || element_state.as_ref().is_some_and(|state| state.uncached);
 
                         // The Metal backend does not yet provide a stable cached-layer compositor.
                         // Rendering these views inline on macOS is the correctness fallback: it costs
@@ -473,6 +479,7 @@ impl<V: View> Element for ViewElement<V> {
                                 return (None, element_state);
                             }
                         } else if !self.is_layer
+                            && !view_dirty
                             && let Some(mut element_state) = element_state
                             && element_state.cache_key.bounds == bounds
                             && element_state.cache_key.content_mask == content_mask
@@ -519,6 +526,7 @@ impl<V: View> Element for ViewElement<V> {
                                     text_style,
                                 },
                                 layer_scale: if self.is_layer { Some(scale) } else { None },
+                                uncached,
                             },
                         )
                     },

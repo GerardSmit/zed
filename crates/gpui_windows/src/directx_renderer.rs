@@ -437,7 +437,6 @@ impl DirectXRenderer {
             .iter()
             .filter_map(|surface| match &surface.source {
                 PaintSurfaceSource::Layer(id) => Some(id.0),
-                #[cfg(target_os = "macos")]
                 _ => None,
             })
             .collect();
@@ -1049,7 +1048,7 @@ impl DirectXRenderer {
         for surface in surfaces {
             let layer_id = match &surface.source {
                 PaintSurfaceSource::Layer(layer_id) => *layer_id,
-                #[cfg(target_os = "macos")]
+                // DirectX does not read its target back; `Style` falls back to the static backdrop.
                 _ => continue,
             };
             let Some((srv, tex_w, tex_h)) = self
@@ -1068,7 +1067,12 @@ impl DirectXRenderer {
                 bounds: surface.bounds,
                 content_mask: surface.content_mask.bounds,
                 content_fade: surface.content_mask.fade,
-                tex_size: [tex_w as f32, tex_h as f32],
+                // A stretched composite samples the whole texture across its bounds.
+                tex_size: if surface.stretch {
+                    [surface.bounds.size.width.0, surface.bounds.size.height.0]
+                } else {
+                    [tex_w as f32, tex_h as f32]
+                },
             };
             self.pipelines.surface_pipeline.update_buffer(
                 &devices.device,

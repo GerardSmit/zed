@@ -1486,3 +1486,116 @@ fn fs_layer_composite(input: LayerSurfaceVarying) -> @location(0) vec4<f32> {
     }
     return sample;
 }
+
+// --- backdrop blur --- //
+//
+// A live `backdrop-filter: blur()`. The renderer copies `region` of the frame (the element's
+// visible bounds grown by three standard deviations) into `t_backdrop`, then runs three passes
+// into two textures at 1/`downscale` resolution: a box downsample, and a separable Gaussian along
+// `direction`. The composite draws the result through the element's rounded corners, content
+// mask and fade. Every read is clamped to `region`, because the rest of the copy is stale.
+
+struct BackdropParams {
+    bounds: Bounds,
+    content_mask: Bounds,
+    content_fade: ContentFade,
+    corner_radii: Corners,
+    region: Bounds,
+    direction: vec2<f32>,
+    sigma: f32,
+    downscale: f32,
+    blur_size: vec2<f32>,
+    opacity: f32,
+    _pad: f32,
+}
+
+@group(1) @binding(0) var<uniform> backdrop: BackdropParams;
+@group(1) @binding(1) var t_backdrop: texture_2d<f32>;
+@group(1) @binding(2) var s_backdrop: sampler;
+
+// One triangle over the whole target; the scissor limits it to the region.
+@vertex
+fn vs_backdrop_pass(@builtin(vertex_index) vertex_id: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2<f32>(f32((vertex_id << 1u) & 2u), f32(vertex_id & 2u));
+    return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+
+fn backdrop_low_region() -> vec4<f32> {
+    let low_origin = backdrop.region.origin / backdrop.downscale;
+    let low_size = backdrop.region.size / backdrop.downscale;
+    return vec4<f32>(low_origin + 0.5, low_origin + low_size - 0.5);
+}
+
+@fragment
+fn fs_backdrop_downsample(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let d = backdrop.downscale;
+    let texture_size = vec2<f32>(textureDimensions(t_backdrop, 0));
+    let lo = backdrop.region.origin + 1.0;
+    let hi = backdrop.region.origin + backdrop.region.size - 1.0;
+    // `position` is a low-resolution texel centre; it covers `d`×`d` full-resolution texels, and
+    // each bilinear tap at a 2×2 block's shared corner averages four of them.
+    let block_origin = (position.xy - 0.5) * d;
+    let taps = u32(d * 0.5);
+    var sum = vec4<f32>(0.0);
+    for (var j = 0u; j < taps; j++) {
+        for (var i = 0u; i < taps; i++) {
+            let at = block_origin + vec2<f32>(f32(2u * i + 1u), f32(2u * j + 1u));
+            let uv = clamp(at, lo, hi) / texture_size;
+            sum += textureSampleLevel(t_backdrop, s_backdrop, uv, 0.0);
+        }
+    }
+    return sum / f32(taps * taps);
+}
+
+@fragment
+fn fs_backdrop_blur(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let texture_size = vec2<f32>(textureDimensions(t_backdrop, 0));
+    let region = backdrop_low_region();
+    let sigma = max(backdrop.sigma, 0.5);
+    let taps = min(i32(ceil(sigma * 3.0)), 32);
+    var sum = textureSampleLevel(t_backdrop, s_backdrop, position.xy / texture_size, 0.0);
+    var total = 1.0;
+    for (var k = 1; k <= taps; k++) {
+        let weight = exp(-f32(k * k) / (2.0 * sigma * sigma));
+        let offset = backdrop.direction * f32(k);
+        let ahead = clamp(position.xy + offset, region.xy, region.zw) / texture_size;
+        let behind = clamp(position.xy - offset, region.xy, region.zw) / texture_size;
+        sum += (textureSampleLevel(t_backdrop, s_backdrop, ahead, 0.0)
+            + textureSampleLevel(t_backdrop, s_backdrop, behind, 0.0)) * weight;
+        total += 2.0 * weight;
+    }
+    return sum / total;
+}
+
+struct BackdropVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_backdrop_composite(@builtin(vertex_index) vertex_id: u32) -> BackdropVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    var out = BackdropVarying();
+    out.position = to_device_position(unit_vertex, backdrop.bounds);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, backdrop.bounds, backdrop.content_mask);
+    return out;
+}
+
+@fragment
+fn fs_backdrop_composite(input: BackdropVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    let region = backdrop_low_region();
+    let low = clamp(input.position.xy / backdrop.downscale, region.xy, region.zw);
+    let blurred = textureSampleLevel(t_backdrop, s_backdrop, low / backdrop.blur_size, 0.0);
+    let distance = quad_sdf(input.position.xy, backdrop.bounds, backdrop.corner_radii);
+    let coverage = saturate(0.5 - distance)
+        * fade_alpha(input.position.y, fade_vector(backdrop.content_fade))
+        * backdrop.opacity;
+    // The copy holds the target's own encoding: premultiplied when the target is.
+    if (globals.premultiplied_alpha != 0u) {
+        return blurred * coverage;
+    }
+    return vec4<f32>(blurred.rgb, blurred.a * coverage);
+}

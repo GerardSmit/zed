@@ -2,7 +2,7 @@ use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow, TextShadow,
+    Pixels, SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow, TextShadow,
     TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
@@ -756,6 +756,13 @@ pub trait Styled: Sized {
     /// window: the element becomes a pane of glass over it. See [`Window::set_backdrop`].
     fn backdrop(mut self) -> Self {
         self.style().backdrop = Some(true);
+        self
+    }
+
+    /// Blurs whatever is painted under this element by `radius` (a standard deviation) before its
+    /// background paints. Falls back to [`Styled::backdrop`] where the renderer cannot blur live.
+    fn backdrop_blur(mut self, radius: Pixels) -> Self {
+        self.style().backdrop_blur = Some(radius);
         self
     }
 

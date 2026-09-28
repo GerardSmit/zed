@@ -506,8 +506,8 @@ impl TouchGestureRecognizer {
     /// Advances post-fling momentum by one frame, returning the scroll step
     /// to dispatch, or `None` when no momentum is in progress. The final step
     /// carries [`TouchPhase::Ended`] to close the synthetic scroll stream.
-    pub(crate) fn tick_momentum(&mut self) -> Option<RecognizedTouchGesture> {
-        self.tick_momentum_at(Instant::now())
+    pub(crate) fn tick_momentum(&mut self, now: Instant) -> Option<RecognizedTouchGesture> {
+        self.tick_momentum_at(now)
     }
 
     fn tick_momentum_at(&mut self, now: Instant) -> Option<RecognizedTouchGesture> {

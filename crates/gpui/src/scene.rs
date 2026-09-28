@@ -892,9 +892,24 @@ pub enum PaintSurfaceSource {
     /// A cached render layer (a view rendered to an offscreen GPU texture). The platform renderer
     /// looks the texture up by id from the frame's layer set and draws it stretched to `bounds`.
     Layer(LayerId),
+    /// Whatever the frame holds under `bounds` at this point in the draw order, blurred. See
+    /// [`crate::Window::paint_backdrop_blur`]. Renderers that cannot read their own target back
+    /// skip it.
+    BackdropBlur(BackdropBlur),
     /// A platform pixel buffer (e.g. a decoded video frame). macOS only.
     #[cfg(target_os = "macos")]
     Image(core_video::pixel_buffer::CVPixelBuffer),
+}
+
+/// A live backdrop blur: the Gaussian standard deviation and the shape it is clipped to.
+#[derive(Clone, Copy, Debug)]
+pub struct BackdropBlur {
+    /// Standard deviation of the blur, in device pixels (CSS `blur()` semantics).
+    pub radius: ScaledPixels,
+    /// Corner radii of the blurred shape, in device pixels.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// The element opacity the blur was painted at.
+    pub opacity: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -904,6 +919,10 @@ pub struct PaintSurface {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub source: PaintSurfaceSource,
+    /// Sample a layer texture stretched over `bounds` instead of 1:1 from its top-left: the
+    /// composite of [`crate::Window::capture_layer_scaled`], which draws a subtree smaller or
+    /// larger than it was laid out.
+    pub stretch: bool,
 }
 
 impl From<PaintSurface> for Primitive {

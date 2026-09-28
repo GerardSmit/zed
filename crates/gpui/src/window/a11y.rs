@@ -228,14 +228,10 @@ impl A11y {
     pub(crate) fn set_focus(&mut self, node_id: NodeId) {
         // A focused node must have been registered as focusable this frame.
         if !self.focus_ids.contains_key(&node_id) {
-            if cfg!(debug_assertions) {
-                panic!("set_focus called for a node that was not registered with set_focusable");
-            } else {
-                log::warn!(
-                    "a11y: set_focus called for a node that was not registered with \
-                     set_focusable ({node_id:?})"
-                );
-            }
+            self.nodes.fault(format!(
+                "a11y: set_focus called for a node that was not registered with \
+                 set_focusable ({node_id:?})"
+            ));
         }
         if self.nodes.has_node(node_id) {
             // The focused element is properly exposed; reset the dedup so a
@@ -255,11 +251,9 @@ impl A11y {
         // The active descendant must be a descendant of the focused container,
         // not the focused node itself.
         if self.nodes.node_is_focused(node_id) {
-            if cfg!(debug_assertions) {
-                panic!("set_active_descendant called on the focused node");
-            } else {
-                log::warn!("a11y: set_active_descendant called on the focused node ({node_id:?})");
-            }
+            self.nodes.fault(format!(
+                "a11y: set_active_descendant called on the focused node ({node_id:?})"
+            ));
             return;
         }
         if self.nodes.has_node(node_id) && self.nodes.focus_is_ancestor_of_current() {
@@ -288,6 +282,11 @@ impl A11y {
         #[cfg(debug_assertions)]
         self.debug.capture_node_info(&self.nodes.node_info);
         update
+    }
+
+    /// Faults the elements caused since the last call, for [`crate::App::on_ui_fault`].
+    pub(crate) fn take_faults(&mut self) -> Vec<SharedString> {
+        self.nodes.take_faults()
     }
 
     pub(crate) fn debug_tree_json(&self) -> Option<String> {
@@ -379,6 +378,11 @@ pub(crate) struct A11yNodeBuilder {
     /// pattern, which allows a focused container to act as if a descendant is
     /// focused.
     active_descendant: Option<NodeId>,
+    /// Faults already reported. Kept across frames so a fault that recurs
+    /// every frame is reported once, not on every frame.
+    reported_faults: FxHashSet<String>,
+    /// Faults reported since the window last took them.
+    pending_faults: Vec<SharedString>,
     #[cfg(debug_assertions)]
     node_info: FxHashMap<NodeId, debug::NodeDebugInfo>,
 }
@@ -392,6 +396,8 @@ impl A11yNodeBuilder {
             seen_ids: FxHashSet::default(),
             focus: None,
             active_descendant: None,
+            reported_faults: FxHashSet::default(),
+            pending_faults: Vec::new(),
             #[cfg(debug_assertions)]
             node_info: FxHashMap::default(),
         }
@@ -405,17 +411,65 @@ impl A11yNodeBuilder {
 
     #[must_use]
     fn can_push(&mut self, id: NodeId) -> bool {
-        debug_assert!(!self.ids_stack.is_empty(), "node pushed before push_root");
+        if self.ids_stack.is_empty() {
+            self.fault(format!("a11y: node {id:?} pushed before push_root; discarding it"));
+            return false;
+        }
 
         if !self.seen_ids.insert(id) {
-            debug_assert!(
-                false,
-                "Duplicate a11y node id: {id:?}. In a release build, this node would be silently discarded from the a11y tree."
-            );
+            self.report_duplicate(id);
             return false;
         }
 
         true
+    }
+
+    /// Record a bug in the elements that built this frame. It is logged and
+    /// queued for [`crate::App::on_ui_fault`], never a panic: a wrong a11y
+    /// tree is not worth losing the user's work over.
+    pub(crate) fn fault(&mut self, message: String) {
+        const MAX_REPORTED: usize = 256;
+        const MAX_PENDING: usize = 16;
+        if self.reported_faults.contains(&message) {
+            return;
+        }
+        if self.reported_faults.len() >= MAX_REPORTED {
+            self.reported_faults.clear();
+        }
+        log::error!("{message}");
+        self.reported_faults.insert(message.clone());
+        if self.pending_faults.len() < MAX_PENDING {
+            self.pending_faults.push(message.into());
+        }
+    }
+
+    pub(crate) fn take_faults(&mut self) -> Vec<SharedString> {
+        std::mem::take(&mut self.pending_faults)
+    }
+
+    /// The second node with an id is discarded; in debug builds the message
+    /// names the first node's creator.
+    fn report_duplicate(&mut self, id: NodeId) {
+        #[cfg(debug_assertions)]
+        let first = self
+            .node_info
+            .get(&id)
+            .map(|info| {
+                format!(
+                    "; first created by view {:?}, element {:?} at {}",
+                    info.view,
+                    info.element_id,
+                    info.source_location
+                        .map(|location| location.to_string())
+                        .unwrap_or_else(|| "an unknown location".into())
+                )
+            })
+            .unwrap_or_default();
+        #[cfg(not(debug_assertions))]
+        let first = "";
+        self.fault(format!(
+            "a11y: duplicate node id {id:?}; discarding the second node from the a11y tree{first}"
+        ));
     }
 
     /// Push a new node onto the stack. It becomes a child of the current
@@ -459,7 +513,10 @@ impl A11yNodeBuilder {
     /// Pop the current node off the stack and finalize it into the all_nodes
     /// list.
     pub(crate) fn pop(&mut self) {
-        debug_assert!(self.ids_stack.len() > 1, "pop would remove the root node");
+        if self.ids_stack.len() <= 1 {
+            self.fault("a11y: pop would remove the root node; ignoring it".into());
+            return;
+        }
 
         if let (Some(id), Some(node)) = (self.ids_stack.pop(), self.nodes_stack.pop()) {
             self.all_nodes.push((id, node));
@@ -511,43 +568,31 @@ impl A11yNodeBuilder {
             .active_descendant
             .is_some_and(|existing| existing != id)
         {
-            if cfg!(debug_assertions) {
-                panic!("active descendant claimed by multiple nodes in one frame");
-            } else {
-                log::warn!(
-                    "a11y: multiple nodes claimed the active descendant this frame; \
-                     using last-wins ({id:?})"
-                );
-            }
+            self.fault(format!(
+                "a11y: multiple nodes claimed the active descendant this frame; \
+                 using last-wins ({id:?})"
+            ));
         }
         self.active_descendant = Some(id);
     }
 
     pub(crate) fn set_focus(&mut self, id: NodeId) {
         if self.focus.is_some() {
-            if cfg!(debug_assertions) {
-                panic!("set_focus called more than once in a single frame");
-            } else {
-                log::warn!(
-                    "a11y: set_focus called more than once in a single frame; \
-                     using last-wins ({id:?})"
-                );
-            }
+            self.fault(format!(
+                "a11y: set_focus called more than once in a single frame; \
+                 using last-wins ({id:?})"
+            ));
         }
         self.focus = Some(id);
     }
 
     fn finalize(&mut self) -> TreeUpdate {
-        // Stack should contain only the root node
-        debug_assert_eq!(self.ids_stack.len(), 1);
-        debug_assert_eq!(self.ids_stack[0], ROOT_NODE_ID);
-
         if self.ids_stack.len() != 1 {
-            log::error!(
+            self.fault(format!(
                 "a11y: Stack imbalance at end of frame: expected 1 (root), got {}. \
                  Some elements may have pushed without popping.",
                 self.ids_stack.len()
-            );
+            ));
         }
 
         // Pop remaining nodes (should just be the root).
@@ -560,12 +605,10 @@ impl A11yNodeBuilder {
         let focus = match self.active_descendant {
             Some(id) if self.has_node(id) => id,
             Some(id) => {
-                if cfg!(debug_assertions) {
-                    panic!("active_descendant set to {id:?}, which is not in the tree");
-                } else {
-                    log::warn!("active_descendant set to {id:?}, which is not in the tree");
-                    self.focus.unwrap_or(ROOT_NODE_ID)
-                }
+                self.fault(format!(
+                    "a11y: active_descendant set to {id:?}, which is not in the tree"
+                ));
+                self.focus.unwrap_or(ROOT_NODE_ID)
             }
 
             _ => self.focus.unwrap_or(ROOT_NODE_ID),
@@ -779,51 +822,40 @@ mod tests {
         builder.pop();
     }
 
-    // The double-claim guard panics only in debug builds; in release it falls
-    // back to last-wins with a warning.
+    // A double claim is a bug in the elements, not a reason to crash: the
+    // last claim wins.
     #[test]
-    #[cfg_attr(
-        debug_assertions,
-        should_panic(expected = "active descendant claimed by multiple nodes")
-    )]
-    fn multiple_active_descendant_claims_panic_in_debug() {
+    fn multiple_active_descendant_claims_last_wins() {
         let mut builder = new_builder();
         builder.set_active_descendant(NodeId(1));
         builder.set_active_descendant(NodeId(2));
+        assert_eq!(builder.active_descendant, Some(NodeId(2)));
     }
 
-    // Setting focus twice in one frame means two elements both claimed window
-    // focus; that panics in debug and falls back to last-wins in release.
+    // Two elements both claimed window focus; the last one wins.
     #[test]
-    #[cfg_attr(
-        debug_assertions,
-        should_panic(expected = "set_focus called more than once")
-    )]
-    fn setting_focus_twice_panics_in_debug() {
+    fn setting_focus_twice_last_wins() {
         let mut builder = new_builder();
         builder.set_focus(NodeId(1));
         builder.set_focus(NodeId(2));
+        assert_eq!(builder.focus, Some(NodeId(2)));
     }
 
-    // Focusing a node that was never registered as focusable is a bug: panic in
-    // debug, warn in release.
+    // Focusing a node that was never registered as focusable is logged, and the
+    // node is still focused.
     #[test]
-    #[cfg_attr(
-        debug_assertions,
-        should_panic(expected = "was not registered with set_focusable")
-    )]
     fn set_focus_without_set_focusable() {
         let mut a11y = new_a11y();
         let node = NodeId(1);
         assert!(a11y.nodes.push(node, test_node()));
         // set_focusable was never called for `node`.
         a11y.set_focus(node);
+        assert_eq!(a11y.nodes.focus, Some(node));
     }
 
-    // The focused node cannot also be its own active descendant: panic in
-    // debug, warn in release.
+    // The focused node cannot also be its own active descendant; the claim is
+    // ignored.
     #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "on the focused node"))]
     fn set_active_descendant_on_focused_node() {
         let mut a11y = new_a11y();
         let node = NodeId(1);
@@ -831,16 +863,12 @@ mod tests {
         a11y.set_focusable(node, FocusId::default());
         a11y.set_focus(node);
         a11y.set_active_descendant(node);
+        assert_eq!(a11y.nodes.active_descendant, None);
     }
 
     // Two sibling children of a focused container both claim the active
-    // descendant (both pass the focus gate). The second claim is a bug: panic
-    // in debug, last-wins + warn in release.
+    // descendant (both pass the focus gate); the last claim wins.
     #[test]
-    #[cfg_attr(
-        debug_assertions,
-        should_panic(expected = "active descendant claimed by multiple nodes")
-    )]
     fn two_siblings_claiming_active_descendant() {
         let mut a11y = new_a11y();
         let container = NodeId(1);
@@ -860,6 +888,47 @@ mod tests {
         a11y.nodes.pop(); // second
 
         a11y.nodes.pop(); // container
+        assert_eq!(a11y.nodes.active_descendant, Some(second));
+    }
+
+    // A second node with an id already in the tree is discarded, and the frame
+    // carries on.
+    #[test]
+    fn duplicate_node_id_is_discarded() {
+        let mut builder = new_builder();
+        let node = NodeId(1);
+        assert!(builder.push(node, test_node()));
+        builder.pop();
+        assert!(!builder.push(node, test_node()));
+        assert!(!builder.push_leaf(node, test_node()));
+        let update = builder.finalize();
+        assert_eq!(update.nodes.iter().filter(|(id, _)| *id == node).count(), 1);
+    }
+
+    // A fault that recurs every frame is queued for the app once.
+    #[test]
+    fn a_recurring_fault_is_reported_once() {
+        let mut builder = new_builder();
+        let node = NodeId(1);
+        for _ in 0..3 {
+            builder.begin_frame(None);
+            assert!(builder.push_leaf(node, test_node()));
+            assert!(!builder.push_leaf(node, test_node()));
+            builder.finalize();
+        }
+        let faults = builder.take_faults();
+        assert_eq!(faults.len(), 1, "{faults:?}");
+        assert!(faults[0].contains("duplicate node id"), "{faults:?}");
+        assert!(builder.take_faults().is_empty());
+    }
+
+    // Unbalanced pops never remove the root.
+    #[test]
+    fn popping_the_root_is_ignored() {
+        let mut builder = new_builder();
+        builder.pop();
+        let update = builder.finalize();
+        assert!(update.nodes.iter().any(|(id, _)| *id == ROOT_NODE_ID));
     }
 
     // Node A is focused; node C (a child of the unfocused node B) claims the

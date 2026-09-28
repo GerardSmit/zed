@@ -261,6 +261,7 @@ pub(crate) unsafe fn platform_input_from_native(
                         TouchPhase::Started
                     }
                     NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
+                    NSEventPhase::NSEventPhaseCancelled => TouchPhase::Cancelled,
                     _ => TouchPhase::Moved,
                 };
 

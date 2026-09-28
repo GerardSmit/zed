@@ -27,7 +27,7 @@ use crate::{
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
-use crate::interactive::TouchEvent;
+use crate::interactive::{MouseDownEvent, ScrollWheelEvent, TouchEvent, TouchPhase};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
@@ -810,6 +810,15 @@ impl HitboxId {
     /// `is_hovered` should be used. See the documentation of `Hitbox::is_hovered` for details about
     /// this distinction.
     pub fn should_handle_scroll(self, window: &Window) -> bool {
+        if window.dispatching_scroll
+            && let Some(capture) = &window.scroll_capture
+        {
+            return window
+                .rendered_frame
+                .hitbox_keys
+                .get(&self)
+                .is_some_and(|key| capture.contains(key));
+        }
         window.mouse_hit_test.ids.contains(&self)
     }
 
@@ -966,6 +975,14 @@ pub(crate) struct DeferredDraw {
     paint_range: Range<PaintIndex>,
 }
 
+// Hitbox IDs identify a painted frame, not an element across redraws. The ordinal
+// separates anonymous hitboxes inside the same element's ID scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScrollTargetKey {
+    element: GlobalElementId,
+    ordinal: usize,
+}
+
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
@@ -975,6 +992,8 @@ pub(crate) struct Frame {
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
+    hitbox_keys: FxHashMap<HitboxId, ScrollTargetKey>,
+    hitbox_key_counts: FxHashMap<GlobalElementId, usize>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -1022,6 +1041,8 @@ impl Frame {
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
+            hitbox_keys: FxHashMap::default(),
+            hitbox_key_counts: FxHashMap::default(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
@@ -1050,6 +1071,8 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
+        self.hitbox_keys.clear();
+        self.hitbox_key_counts.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
@@ -1342,7 +1365,11 @@ pub struct Window {
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
     touch_gesture_tick_scheduled: bool,
+    scroll_capture: Option<Vec<ScrollTargetKey>>,
+    dispatching_scroll: bool,
     pub(crate) refreshing: bool,
+    /// Nesting depth of [`Window::with_uncached_views`].
+    pub(crate) uncached_views: usize,
     /// Set by the app while the user is interactively resizing the *layout* (dragging a dock/panel
     /// divider) — as opposed to the OS window (`PlatformWindow::is_in_resize_loop`). Layer views
     /// read it to cull (composite their cached texture) during the drag instead of re-rendering,
@@ -2047,12 +2074,15 @@ impl Window {
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
             last_input_modality: InputModality::Mouse,
             touch_gesture_tick_scheduled: false,
+            scroll_capture: None,
+            dispatching_scroll: false,
             touch_gestures: TouchGestureRecognizer::new(
                 cx.platform
                     .gestures()
                     .map_or_else(GestureTuning::default, |gestures| gestures.tuning()),
             ),
             refreshing: false,
+            uncached_views: 0,
             resizing_layout: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
@@ -3644,6 +3674,11 @@ impl Window {
                 self.platform_window.a11y_tree_update(tree_update);
             }
         }
+
+        let faults = self.a11y.take_faults();
+        if !faults.is_empty() {
+            cx.report_ui_faults(self.handle, faults);
+        }
     }
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
@@ -3895,6 +3930,19 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        for hitbox in
+            &self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
+        {
+            if let Some(key) = self.rendered_frame.hitbox_keys.get(&hitbox.id) {
+                let count = self
+                    .next_frame
+                    .hitbox_key_counts
+                    .entry(key.element.clone())
+                    .or_default();
+                *count = (*count).max(key.ordinal + 1);
+                self.next_frame.hitbox_keys.insert(hitbox.id, key.clone());
+            }
+        }
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -4185,7 +4233,13 @@ impl Window {
         let index = self.prepaint_index();
         let result = f(self);
         if result.is_err() {
-            self.next_frame.hitboxes.truncate(index.hitboxes_index);
+            for hitbox in self.next_frame.hitboxes.drain(index.hitboxes_index..).rev() {
+                if let Some(key) = self.next_frame.hitbox_keys.remove(&hitbox.id) {
+                    self.next_frame
+                        .hitbox_key_counts
+                        .insert(key.element, key.ordinal);
+                }
+            }
             self.next_frame
                 .tooltip_requests
                 .truncate(index.tooltips_index);
@@ -4694,6 +4748,45 @@ impl Window {
         if let Err(error) = self.paint_image(bounds, placed, corner_radii, image, 0, false) {
             log::debug!("window backdrop not painted: {error:#}");
         }
+    }
+
+    /// Whether this window's renderer can blur what is painted under an element
+    /// ([`Self::paint_backdrop_blur`]). Where it cannot, the blur surface is skipped.
+    pub fn supports_backdrop_blur(&self) -> bool {
+        self.platform_window.supports_backdrop_blur()
+    }
+
+    /// Blur whatever has been painted under `bounds` so far this frame, clipped to the corners
+    /// and the current content mask: a CSS `backdrop-filter: blur(radius)`. Paint the element's
+    /// translucent fill after it. A no-op on renderers without [`Self::supports_backdrop_blur`].
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        radius: Pixels,
+    ) {
+        use crate::{BackdropBlur, PaintSurface, PaintSurfaceSource};
+
+        self.invalidator.debug_assert_paint();
+
+        let opacity = self.element_opacity();
+        if radius <= Pixels::ZERO || opacity <= 0. {
+            return;
+        }
+        let scale_factor = self.scale_factor();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            source: PaintSurfaceSource::BackdropBlur(BackdropBlur {
+                radius: radius.scale(scale_factor),
+                corner_radii: corner_radii.scale(scale_factor),
+                opacity,
+            }),
+            stretch: false,
+        });
     }
 
     /// Paint a surface fill using the window's background opacity. Custom elements use this for
@@ -5304,6 +5397,7 @@ impl Window {
             bounds,
             content_mask,
             source: PaintSurfaceSource::Layer(layer_id),
+            stretch: false,
         });
     }
 
@@ -5322,13 +5416,68 @@ impl Window {
         _size: Size<DevicePixels>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        self.capture_layer_into(layer_id, bounds, None, f)
+    }
+
+    /// Paint a subtree laid out at `bounds` into its own offscreen texture, and composite that
+    /// texture stretched over `display` — the subtree drawn scaled (and moved) without laying it
+    /// out again. `f` paints as it would inline, at `bounds`; its hitboxes stay there too, so a
+    /// caller that shows the result somewhere else owns what input does in the meantime.
+    ///
+    /// Inside `f` the content mask is `bounds` alone: the texture is the subtree's own space, and
+    /// the parent's mask applies to the composite instead.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn capture_layer_scaled<R>(
+        &mut self,
+        layer_id: crate::LayerId,
+        bounds: Bounds<Pixels>,
+        display: Bounds<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let mask = ContentMask {
+            bounds,
+            ..ContentMask::default()
+        };
+        self.with_uncached_views(|window| {
+            window.capture_layer_into(layer_id, bounds, Some(display), |window| {
+                let parent = std::mem::replace(&mut window.content_mask_stack, vec![mask]);
+                let result = f(window);
+                window.content_mask_stack = parent;
+                result
+            })
+        })
+    }
+
+    /// Run `f` with every cached view in it rendering afresh rather than replaying its last
+    /// frame, and remembering not to replay this one either.
+    ///
+    /// A cached view records where its paint went as indices into the frame's scene. Inside
+    /// [`Self::capture_layer_scaled`] that is the layer's own sub-scene, so replaying those indices
+    /// against the main scene — or the main scene's against the layer — draws the wrong primitives
+    /// or panics out of range. [`Self::capture_layer_scaled`] does this for its paint; an element
+    /// that captures wraps its prepaint in it too.
+    pub fn with_uncached_views<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.uncached_views += 1;
+        let result = f(self);
+        self.uncached_views -= 1;
+        result
+    }
+
+    fn capture_layer_into<R>(
+        &mut self,
+        layer_id: crate::LayerId,
+        bounds: Bounds<Pixels>,
+        display: Option<Bounds<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         use crate::{PaintSurface, PaintSurfaceSource, Scene, SceneLayer};
         self.invalidator.debug_assert_paint();
         let parent_scene = std::mem::replace(&mut self.next_frame.scene, Scene::default());
         let result = f(self);
         let mut layer_scene = std::mem::replace(&mut self.next_frame.scene, parent_scene);
-        let composite_bounds = self.snap_bounds(bounds);
-        let origin = composite_bounds.origin;
+        let layer_bounds = self.snap_bounds(bounds);
+        let origin = layer_bounds.origin;
         layer_scene.translate(point(
             crate::ScaledPixels(-origin.x.0),
             crate::ScaledPixels(-origin.y.0),
@@ -5339,8 +5488,8 @@ impl Window {
         // tex_size differs from the snapped composite bounds the texture is scaled (blurry, wrong
         // size). Snapping both to the same integer device size makes it a crisp 1:1 sample.
         let size = Size {
-            width: DevicePixels(composite_bounds.size.width.0 as i32),
-            height: DevicePixels(composite_bounds.size.height.0 as i32),
+            width: DevicePixels(layer_bounds.size.width.0 as i32),
+            height: DevicePixels(layer_bounds.size.height.0 as i32),
         };
         self.next_frame.scene.layers.push(SceneLayer {
             id: layer_id,
@@ -5351,9 +5500,10 @@ impl Window {
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
-            bounds: composite_bounds,
+            bounds: display.map_or(layer_bounds, |display| self.snap_bounds(display)),
             content_mask,
             source: PaintSurfaceSource::Layer(layer_id),
+            stretch: display.is_some(),
         });
         result
     }
@@ -5374,6 +5524,7 @@ impl Window {
             bounds,
             content_mask,
             source: PaintSurfaceSource::Image(image_buffer),
+            stretch: false,
         });
     }
 
@@ -5510,6 +5661,20 @@ impl Window {
             content_mask,
             behavior,
         };
+        let element = GlobalElementId(Arc::from(&*self.element_id_stack));
+        let ordinal = self
+            .next_frame
+            .hitbox_key_counts
+            .entry(element.clone())
+            .or_default();
+        self.next_frame.hitbox_keys.insert(
+            id,
+            ScrollTargetKey {
+                element,
+                ordinal: *ordinal,
+            },
+        );
+        *ordinal += 1;
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
     }
@@ -6097,7 +6262,10 @@ impl Window {
             {
                 window.dispatch_recognized_touch_gesture(gesture, cx);
             }
-            if let Some(gesture) = window.touch_gestures.tick_momentum() {
+            if let Some(gesture) = window
+                .touch_gestures
+                .tick_momentum(cx.background_executor.now())
+            {
                 window.dispatch_recognized_touch_gesture(gesture, cx);
             }
             if window.touch_gestures.has_momentum() || window.touch_gestures.has_pending_hold() {
@@ -6120,6 +6288,22 @@ impl Window {
             return;
         }
 
+        if event.is::<MouseDownEvent>() {
+            self.scroll_capture = None;
+        }
+        let scroll_phase = event
+            .downcast_ref::<ScrollWheelEvent>()
+            .map(|event| event.touch_phase);
+        self.dispatching_scroll = scroll_phase.is_some();
+        if scroll_phase == Some(TouchPhase::Started) {
+            self.scroll_capture = Some(
+                self.mouse_hit_test
+                    .ids
+                    .iter()
+                    .filter_map(|id| self.rendered_frame.hitbox_keys.get(id).cloned())
+                    .collect(),
+            );
+        }
         let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
 
         // Capture phase, events bubble from back to front. Handlers for this phase are used for
@@ -6144,6 +6328,16 @@ impl Window {
         }
 
         self.rendered_frame.mouse_listeners = mouse_listeners;
+        self.dispatching_scroll = false;
+        // Finger-driven controls need Ended at lift-off, even when the scroll
+        // recipient must stay captured for a subsequent momentum stream.
+        if scroll_phase == Some(TouchPhase::Cancelled)
+            || (scroll_phase == Some(TouchPhase::Ended)
+                && !self.touch_gestures.has_momentum()
+                && !self.platform_window.has_scroll_momentum())
+        {
+            self.scroll_capture = None;
+        }
 
         if cx.has_active_drag() {
             if event.is::<MouseMoveEvent>() {
