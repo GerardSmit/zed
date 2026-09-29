@@ -12,7 +12,7 @@ use windows::Win32::{
             SetClipboardData,
         },
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
-        Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT},
+        Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT},
     },
     UI::Shell::{DragQueryFileW, HDROP},
 };
@@ -23,6 +23,7 @@ use gpui::{
 };
 
 const DRAGDROP_GET_FILES_COUNT: u32 = 0xFFFFFFFF;
+const MAX_CLIPBOARD_DIB_BYTES: u32 = 256 * 1024 * 1024;
 
 static CLIPBOARD_HASH_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("GPUI internal text hash")));
@@ -203,27 +204,81 @@ fn write_image(item: &Image) -> Result<()> {
         set_clipboard_bytes(item.bytes(), format)?;
     }
 
-    // Also provide a PNG copy for broad compatibility.
-    // SVG can't be rasterized by the image crate, so skip it.
-    if item.format != ImageFormat::Svg && native_format != Some(*CLIPBOARD_PNG_FORMAT) {
-        if let Some(png_bytes) = convert_to_png(item.bytes(), item.format) {
-            set_clipboard_bytes(&png_bytes, *CLIPBOARD_PNG_FORMAT)?;
+    if item.format == ImageFormat::Svg {
+        return Ok(());
+    }
+    let Some(image_format) = gpui_to_image_format(item.format) else {
+        return Ok(());
+    };
+    let Some(image) = image::load_from_memory_with_format(item.bytes(), image_format)
+        .map_err(|error| log::warn!("Failed to decode image for clipboard formats: {error}"))
+        .ok()
+    else {
+        return Ok(());
+    };
+
+    if native_format != Some(*CLIPBOARD_PNG_FORMAT) {
+        let mut png_bytes = Vec::new();
+        match image.write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        ) {
+            Ok(()) => set_clipboard_bytes(&png_bytes, *CLIPBOARD_PNG_FORMAT)?,
+            Err(error) => log::warn!("Failed to encode PNG for clipboard: {error}"),
         }
+    }
+
+    // PNG is a registered format. Standard DIB formats also reach applications that do not accept it.
+    if let Some(dibv5) = convert_image_to_dib(&image, true) {
+        set_clipboard_bytes(&dibv5, CF_DIBV5.0 as u32)?;
+    } else {
+        log::warn!("Unable to encode clipboard DIBV5 (image size or memory limit)");
+    }
+    if let Some(dib) = convert_image_to_dib(&image, false) {
+        set_clipboard_bytes(&dib, CF_DIB.0 as u32)?;
+    } else {
+        log::warn!("Unable to encode clipboard DIB (image size or memory limit)");
     }
     Ok(())
 }
 
-fn convert_to_png(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
-    let img_format = gpui_to_image_format(format)?;
-    let image = image::load_from_memory_with_format(bytes, img_format)
-        .map_err(|e| log::warn!("Failed to decode image for PNG conversion: {e}"))
+fn convert_image_to_dib(image: &image::DynamicImage, v5: bool) -> Option<Vec<u8>> {
+    use image::GenericImageView;
+
+    let (width, height) = image.dimensions();
+    let width_i32 = i32::try_from(width).ok()?;
+    let height_i32 = i32::try_from(height).ok()?;
+    let pixels_size = width.checked_mul(height)?.checked_mul(4)?;
+    if pixels_size > MAX_CLIPBOARD_DIB_BYTES {
+        return None;
+    }
+    let header_size = if v5 { 124usize } else { 40usize };
+    let mut dib = Vec::new();
+    dib.try_reserve_exact(header_size.checked_add(pixels_size as usize)?)
         .ok()?;
-    let mut buf = Vec::new();
-    image
-        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-        .map_err(|e| log::warn!("Failed to encode PNG: {e}"))
-        .ok()?;
-    Some(buf)
+    dib.resize(header_size, 0);
+    dib[0..4].copy_from_slice(&(header_size as u32).to_le_bytes());
+    dib[4..8].copy_from_slice(&width_i32.to_le_bytes());
+    dib[8..12].copy_from_slice(&height_i32.to_le_bytes());
+    dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+    dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+    dib[16..20].copy_from_slice(&(if v5 { 3u32 } else { 0u32 }).to_le_bytes());
+    dib[20..24].copy_from_slice(&pixels_size.to_le_bytes());
+    if v5 {
+        dib[40..44].copy_from_slice(&0x00ff0000u32.to_le_bytes());
+        dib[44..48].copy_from_slice(&0x0000ff00u32.to_le_bytes());
+        dib[48..52].copy_from_slice(&0x000000ffu32.to_le_bytes());
+        dib[52..56].copy_from_slice(&0xff000000u32.to_le_bytes());
+        dib[56..60].copy_from_slice(&0x73524742u32.to_le_bytes()); // LCS_sRGB
+    }
+    // A positive DIB height requires bottom-up scanlines.
+    for row in (0..height).rev() {
+        for column in 0..width {
+            let [red, green, blue, alpha] = image.get_pixel(column, row).0;
+            dib.extend_from_slice(&[blue, green, red, alpha]);
+        }
+    }
+    Some(dib)
 }
 
 fn read_string() -> Option<ClipboardEntry> {

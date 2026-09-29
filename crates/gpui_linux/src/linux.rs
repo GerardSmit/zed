@@ -24,6 +24,16 @@ pub(crate) use wayland::*;
 #[cfg(feature = "x11")]
 pub(crate) use x11::*;
 
+#[cfg(any(feature = "wayland", feature = "x11"))]
+fn has_text_clipboard_entry(item: &gpui::ClipboardItem) -> bool {
+    item.entries().iter().any(|entry| {
+        matches!(
+            entry,
+            gpui::ClipboardEntry::String(_) | gpui::ClipboardEntry::ExternalPaths(_)
+        )
+    })
+}
+
 use std::rc::Rc;
 
 /// Returns the default platform implementation for the current OS.

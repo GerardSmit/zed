@@ -11,7 +11,7 @@ use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
 
 use crate::linux::{
-    WaylandClientStatePtr,
+    WaylandClientStatePtr, has_text_clipboard_entry,
     platform::{PIPE_READ_TIMEOUT, read_fd_with_timeout},
 };
 use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
@@ -24,6 +24,44 @@ pub(crate) const FILE_LIST_MIME_TYPE: &str = "text/uri-list";
 /// Text mime types that we'll accept from other programs.
 pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "UTF8_STRING"];
 
+fn set_nonblocking(fd: &impl AsRawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+fn offered_mime_types(item: &ClipboardItem) -> impl Iterator<Item = &'static str> + '_ {
+    let has_text = has_text_clipboard_entry(item);
+    TEXT_MIME_TYPES
+        .into_iter()
+        .filter(move |_| has_text)
+        .chain(ImageFormat::iter().filter_map(|format| {
+            item.entries()
+                .iter()
+                .any(
+                    |entry| matches!(entry, ClipboardEntry::Image(image) if image.format == format),
+                )
+                .then_some(format.mime_type())
+        }))
+}
+
+fn bytes_for_mime_type(item: &ClipboardItem, mime_type: &str) -> Option<Vec<u8>> {
+    if TEXT_MIME_TYPES.contains(&mime_type) {
+        return has_text_clipboard_entry(item)
+            .then(|| item.text().unwrap_or_default().into_bytes());
+    }
+
+    item.entries().iter().find_map(|entry| match entry {
+        ClipboardEntry::Image(image) if image.format.mime_type() == mime_type => {
+            Some(image.bytes.clone())
+        }
+        _ => None,
+    })
+}
 pub(crate) struct Clipboard {
     connection: Connection,
     loop_handle: LoopHandle<'static, WaylandClientStatePtr>,
@@ -166,6 +204,16 @@ impl Clipboard {
         self.primary_contents = Some(item);
     }
 
+    /// MIME types backed by the current clipboard item, including any image formats.
+    pub fn mime_types(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.contents.iter().flat_map(offered_mime_types)
+    }
+
+    /// MIME types backed by the current primary-selection item.
+    pub fn primary_mime_types(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.primary_contents.iter().flat_map(offered_mime_types)
+    }
+
     pub fn set_offer(&mut self, data_offer: Option<DataOffer<WlDataOffer>>) {
         self.cached_read = None;
         self.current_offer = data_offer;
@@ -180,19 +228,23 @@ impl Clipboard {
         self.self_mime.clone()
     }
 
-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+    pub fn send(&self, mime_type: String, fd: OwnedFd) {
+        if let Some(bytes) = self
+            .contents
+            .as_ref()
+            .and_then(|item| bytes_for_mime_type(item, &mime_type))
+        {
+            self.send_bytes(fd, bytes);
         }
     }
 
-    pub fn send_primary(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self
+    pub fn send_primary(&self, mime_type: String, fd: OwnedFd) {
+        if let Some(bytes) = self
             .primary_contents
             .as_ref()
-            .and_then(|contents| contents.text())
+            .and_then(|item| bytes_for_mime_type(item, &mime_type))
         {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+            self.send_bytes(fd, bytes);
         }
     }
 
@@ -233,31 +285,120 @@ impl Clipboard {
     }
 
     pub fn send_bytes(&self, fd: OwnedFd, bytes: Vec<u8>) {
+        if let Err(error) = set_nonblocking(&fd) {
+            log::error!("Cannot send Wayland clipboard data without nonblocking pipe: {error}");
+            return;
+        }
         let mut written = 0;
-        self.loop_handle
-            .insert_source(
-                calloop::generic::Generic::new(
-                    File::from(fd),
-                    calloop::Interest::WRITE,
-                    calloop::Mode::Level,
-                ),
-                move |_, file, _| {
-                    let file = unsafe { file.get_mut() };
-                    loop {
-                        match file.write(&bytes[written..]) {
-                            Ok(n) if written + n == bytes.len() => {
-                                written += n;
-                                break Ok(PostAction::Remove);
-                            }
-                            Ok(n) => written += n,
-                            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                                break Ok(PostAction::Continue);
-                            }
-                            Err(_) => break Ok(PostAction::Remove),
+        if let Err(error) = self.loop_handle.insert_source(
+            calloop::generic::Generic::new(
+                File::from(fd),
+                calloop::Interest::WRITE,
+                calloop::Mode::Level,
+            ),
+            move |_, file, _| {
+                let file = unsafe { file.get_mut() };
+                loop {
+                    match file.write(&bytes[written..]) {
+                        Ok(n) if written + n == bytes.len() => {
+                            written += n;
+                            break Ok(PostAction::Remove);
                         }
+                        Ok(0) => break Ok(PostAction::Remove),
+                        Ok(n) => written += n,
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            break Ok(PostAction::Continue);
+                        }
+                        Err(_) => break Ok(PostAction::Remove),
                     }
-                },
-            )
-            .unwrap();
+                }
+            },
+        ) {
+            log::error!("Cannot register Wayland clipboard pipe: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_writer_pipe_is_nonblocking() {
+        let pipe = Pipe::new().expect("create clipboard test pipe");
+        set_nonblocking(&pipe.write).expect("mark clipboard pipe nonblocking");
+        let flags = unsafe { libc::fcntl(pipe.write.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn image_mime_type_offered_with_original_bytes_and_no_false_text() {
+        let bytes = b"\x89PNG\r\n\x1a\nimage-body".to_vec();
+        let image = Image {
+            format: ImageFormat::Png,
+            bytes: bytes.clone(),
+            id: 1,
+        };
+        let item = ClipboardItem::new_image(&image);
+
+        assert_eq!(
+            offered_mime_types(&item).collect::<Vec<_>>(),
+            vec!["image/png"]
+        );
+        assert_eq!(bytes_for_mime_type(&item, "image/png"), Some(bytes));
+        assert_eq!(bytes_for_mime_type(&item, "text/plain"), None);
+        assert_eq!(bytes_for_mime_type(&item, "image/jpeg"), None);
+    }
+
+    #[test]
+    fn mixed_item_keeps_text_and_advertises_only_its_image_formats() {
+        let jpeg = b"\xff\xd8\xff\xe0jpeg-body".to_vec();
+        let image = Image {
+            format: ImageFormat::Jpeg,
+            bytes: jpeg.clone(),
+            id: 2,
+        };
+        let mut item = ClipboardItem::new_string_with_metadata("hello".into(), "metadata".into());
+        item.entries.push(ClipboardEntry::Image(image));
+
+        assert_eq!(
+            offered_mime_types(&item).collect::<Vec<_>>(),
+            vec![
+                "text/plain;charset=utf-8",
+                "UTF8_STRING",
+                "text/plain",
+                "image/jpeg"
+            ]
+        );
+        assert_eq!(
+            bytes_for_mime_type(&item, "UTF8_STRING"),
+            Some(b"hello".to_vec())
+        );
+        assert_eq!(bytes_for_mime_type(&item, "image/jpeg"), Some(jpeg));
+    }
+    #[test]
+    fn empty_text_and_file_paths_keep_text_targets() {
+        let empty = ClipboardItem::new_string(String::new());
+        assert_eq!(
+            offered_mime_types(&empty).collect::<Vec<_>>(),
+            TEXT_MIME_TYPES
+        );
+        assert_eq!(bytes_for_mime_type(&empty, "text/plain"), Some(Vec::new()));
+
+        let paths = ClipboardItem {
+            entries: vec![ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                [std::path::PathBuf::from("/tmp/example.png")]
+                    .into_iter()
+                    .collect(),
+            ))],
+        };
+        assert_eq!(
+            offered_mime_types(&paths).collect::<Vec<_>>(),
+            TEXT_MIME_TYPES
+        );
+        assert_eq!(
+            bytes_for_mime_type(&paths, "text/plain"),
+            Some(b"/tmp/example.png".to_vec())
+        );
     }
 }

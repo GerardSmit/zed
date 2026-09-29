@@ -19,7 +19,6 @@
 // https://freedesktop.org/wiki/ClipboardManager/
 
 use std::{
-    borrow::Cow,
     cell::RefCell,
     collections::{HashMap, hash_map::Entry},
     sync::{
@@ -38,16 +37,16 @@ use x11rb::{
     protocol::{
         Event,
         xproto::{
-            Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, Property,
-            PropertyNotifyEvent, SELECTION_NOTIFY_EVENT, SelectionNotifyEvent,
-            SelectionRequestEvent, Time, WindowClass,
+            Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateWindowAux,
+            EventMask, PropMode, Property, PropertyNotifyEvent, SELECTION_NOTIFY_EVENT,
+            SelectionNotifyEvent, SelectionRequestEvent, Time, Window, WindowClass,
         },
     },
     rust_connection::RustConnection,
     wrapper::ConnectionExt as _,
 };
 
-use gpui::{ClipboardItem, Image, ImageFormat, hash};
+use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
 use strum::IntoEnumIterator;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -103,6 +102,54 @@ thread_local! {
 // `SelectionNotify`. Multiple seconds long.
 const LONG_TIMEOUT_DUR: Duration = Duration::from_millis(4000);
 const SHORT_TIMEOUT_DUR: Duration = Duration::from_millis(10);
+const INCR_CHUNK_SIZE: usize = 64 * 1024;
+const MAX_PENDING_INCR_TRANSFERS: usize = 4;
+const MAX_INCR_BYTES: usize = 32 * 1024 * 1024;
+const MAX_MANAGER_INCR_HANDOVER: Duration = Duration::from_secs(10);
+
+fn manager_handover_timeout(data: &[ClipboardData]) -> Duration {
+    if data
+        .iter()
+        .any(|entry| entry.bytes.len() > INCR_CHUNK_SIZE && entry.bytes.len() <= MAX_INCR_BYTES)
+    {
+        MAX_MANAGER_INCR_HANDOVER
+    } else {
+        Duration::from_millis(100)
+    }
+}
+
+fn within_incr_limits(bytes: usize, pending: usize) -> bool {
+    bytes <= MAX_INCR_BYTES && pending < MAX_PENDING_INCR_TRANSFERS
+}
+
+struct PendingTransfer {
+    bytes: Vec<u8>,
+    format: Atom,
+    offset: usize,
+    last_progress: Instant,
+}
+
+impl PendingTransfer {
+    fn new(bytes: Vec<u8>, format: Atom) -> Self {
+        Self {
+            bytes,
+            format,
+            offset: 0,
+            last_progress: Instant::now(),
+        }
+    }
+
+    fn next_chunk(&mut self) -> (&[u8], bool) {
+        let start = self.offset;
+        self.offset = (start + INCR_CHUNK_SIZE).min(self.bytes.len());
+        self.last_progress = Instant::now();
+        (&self.bytes[start..self.offset], start == self.bytes.len())
+    }
+
+    fn expired(&self) -> bool {
+        self.last_progress.elapsed() > LONG_TIMEOUT_DUR
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum ManagerHandoverState {
@@ -665,23 +712,35 @@ impl Inner {
         Ok(false)
     }
 
-    fn handle_selection_request(&self, event: SelectionRequestEvent) -> Result<()> {
+    fn handle_selection_request(
+        &self,
+        event: SelectionRequestEvent,
+        pending: &mut HashMap<(Window, Atom), PendingTransfer>,
+    ) -> Result<bool> {
         let selection = match self.kind_of(event.selection) {
             Some(kind) => kind,
             None => {
                 log::warn!(
                     "Received a selection request to a selection other than the CLIPBOARD, PRIMARY or SECONDARY. This is unexpected."
                 );
-                return Ok(());
+                return Ok(false);
             }
         };
 
+        // ICCCM uses the requested target as the property when the requestor supplies NONE.
+        let requested_property = if event.property == NONE {
+            event.target
+        } else {
+            event.property
+        };
         let success;
-        // we are asked for a list of supported conversion targets
-        if event.target == self.atoms.TARGETS {
+        // A requestor cannot reuse a property while an INCR transfer is active.
+        if pending.contains_key(&(event.requestor, requested_property)) {
+            success = false;
+        } else if event.target == self.atoms.TARGETS {
             log::trace!(
                 "Handling TARGETS, dst property is {}",
-                self.atom_name(event.property)
+                self.atom_name(requested_property)
             );
             let mut targets = Vec::with_capacity(10);
             targets.push(self.atoms.TARGETS);
@@ -703,7 +762,7 @@ impl Inner {
                 .change_property32(
                     PropMode::REPLACE,
                     event.requestor,
-                    event.property,
+                    requested_property,
                     // TODO: change to `AtomEnum::ATOM`
                     self.atoms.ATOM,
                     &targets,
@@ -715,19 +774,50 @@ impl Inner {
             log::trace!("Handling request for (probably) the clipboard contents.");
             let data = self.selection_of(selection).data.read();
             if let Some(data_list) = &*data {
-                success = match data_list.iter().find(|d| d.format == event.target) {
+                success = match data_list.iter().find(|data| data.format == event.target) {
+                    Some(data) if data.bytes.len() > INCR_CHUNK_SIZE => {
+                        let key = (event.requestor, requested_property);
+                        if !within_incr_limits(data.bytes.len(), pending.len()) {
+                            log::warn!(
+                                "X11 clipboard INCR transfer exceeds the size or concurrency limit"
+                            );
+                            false
+                        } else {
+                            self.server
+                                .conn
+                                .change_window_attributes(
+                                    event.requestor,
+                                    &ChangeWindowAttributesAux::new().event_mask(
+                                        EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY,
+                                    ),
+                                )
+                                .map_err(into_unknown)?;
+                            self.server
+                                .conn
+                                .change_property32(
+                                    PropMode::REPLACE,
+                                    event.requestor,
+                                    requested_property,
+                                    self.atoms.INCR,
+                                    &[data.bytes.len() as u32],
+                                )
+                                .map_err(into_unknown)?;
+                            pending
+                                .insert(key, PendingTransfer::new(data.bytes.clone(), data.format));
+                            true
+                        }
+                    }
                     Some(data) => {
                         self.server
                             .conn
                             .change_property8(
                                 PropMode::REPLACE,
                                 event.requestor,
-                                event.property,
+                                requested_property,
                                 event.target,
                                 &data.bytes,
                             )
                             .map_err(into_unknown)?;
-                        self.server.conn.flush().map_err(into_unknown)?;
                         true
                     }
                     None => false,
@@ -740,11 +830,7 @@ impl Inner {
             }
         }
         // on failure we notify the requester of it
-        let property = if success {
-            event.property
-        } else {
-            AtomEnum::NONE.into()
-        };
+        let property = if success { requested_property } else { NONE };
         // tell the requestor that we finished sending data
         self.server
             .conn
@@ -764,7 +850,53 @@ impl Inner {
             )
             .map_err(into_unknown)?;
 
-        self.server.conn.flush().map_err(into_unknown)
+        self.server.conn.flush().map_err(into_unknown)?;
+        Ok(success
+            && event.target != self.atoms.TARGETS
+            && !pending.contains_key(&(event.requestor, requested_property)))
+    }
+
+    fn stop_listening_if_done(
+        &self,
+        requestor: Window,
+        pending: &HashMap<(Window, Atom), PendingTransfer>,
+    ) {
+        if !pending.keys().any(|(window, _)| *window == requestor) {
+            if let Err(error) = self.server.conn.change_window_attributes(
+                requestor,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::NO_EVENT),
+            ) {
+                log::debug!("X11 clipboard could not stop watching requestor: {error}");
+            } else if let Err(error) = self.server.conn.flush() {
+                log::debug!("X11 clipboard could not flush requestor cleanup: {error}");
+            }
+        }
+    }
+
+    fn send_incremental_chunk(
+        &self,
+        event: PropertyNotifyEvent,
+        pending: &mut HashMap<(Window, Atom), PendingTransfer>,
+    ) -> Result<bool> {
+        if event.state != Property::DELETE {
+            return Ok(false);
+        }
+        let key = (event.window, event.atom);
+        let Some(transfer) = pending.get_mut(&key) else {
+            return Ok(false);
+        };
+        let format = transfer.format;
+        let (chunk, finished) = transfer.next_chunk();
+        self.server
+            .conn
+            .change_property8(PropMode::REPLACE, event.window, event.atom, format, chunk)
+            .map_err(into_unknown)?;
+        self.server.conn.flush().map_err(into_unknown)?;
+        if finished {
+            pending.remove(&key);
+            self.stop_listening_if_done(event.window, pending);
+        }
+        Ok(finished)
     }
 
     fn ask_clipboard_manager_to_request_our_data(&self) -> Result<()> {
@@ -778,15 +910,13 @@ impl Inner {
             // We are not owning the clipboard, nothing to do.
             return Ok(());
         }
-        if self
-            .selection_of(ClipboardKind::Clipboard)
-            .data
-            .read()
-            .is_none()
-        {
-            // If we don't have any data, there's nothing to do.
-            return Ok(());
-        }
+        let max_handover_duration = {
+            let data = self.selection_of(ClipboardKind::Clipboard).data.read();
+            let Some(data) = data.as_ref() else {
+                return Ok(());
+            };
+            manager_handover_timeout(data)
+        };
 
         // It's important that we lock the state before sending the request
         // because we don't want the request server thread to lock the state
@@ -807,7 +937,6 @@ impl Inner {
         self.server.conn.flush().map_err(into_unknown)?;
 
         *handover_state = ManagerHandoverState::InProgress;
-        let max_handover_duration = Duration::from_millis(100);
 
         // Note that we are using a parking_lot condvar here, which doesn't wake up
         // spuriously
@@ -850,13 +979,36 @@ fn serve_requests(context: Arc<Inner>) -> Result<(), Box<dyn std::error::Error>>
 
     let mut written = false;
     let mut notified = false;
+    let mut pending: HashMap<(Window, Atom), PendingTransfer> = HashMap::new();
 
     loop {
-        match context.server.conn.wait_for_event().map_err(into_unknown)? {
-            Event::DestroyNotify(_) => {
-                // This window is being destroyed.
-                log::trace!("Clipboard server window is being destroyed x_x");
-                return Ok(());
+        if !pending.is_empty() {
+            let expired: Vec<_> = pending
+                .iter()
+                .filter_map(|(&(window, atom), transfer)| {
+                    transfer.expired().then_some((window, atom))
+                })
+                .collect();
+            for (window, atom) in expired {
+                pending.remove(&(window, atom));
+                context.stop_listening_if_done(window, &pending);
+            }
+        }
+        let event = if pending.is_empty() {
+            context.server.conn.wait_for_event().map_err(into_unknown)?
+        } else if let Some(event) = context.server.conn.poll_for_event().map_err(into_unknown)? {
+            event
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        };
+        match event {
+            Event::DestroyNotify(event) => {
+                if event.window == context.server.win_id {
+                    log::trace!("Clipboard server window is being destroyed x_x");
+                    return Ok(());
+                }
+                pending.retain(|(window, _), _| *window != event.window);
             }
             Event::SelectionClear(event) => {
                 // TODO: check if this works
@@ -885,8 +1037,8 @@ fn serve_requests(context: Arc<Inner>) -> Result<(), Box<dyn std::error::Error>>
                     context.atom_name(event.target),
                 );
                 // Someone is requesting the clipboard content from us.
-                context
-                    .handle_selection_request(event)
+                let completed = context
+                    .handle_selection_request(event, &mut pending)
                     .map_err(into_unknown)?;
 
                 // if we are in the progress of saving to the clipboard manager
@@ -895,10 +1047,24 @@ fn serve_requests(context: Arc<Inner>) -> Result<(), Box<dyn std::error::Error>>
                 if *handover_state == ManagerHandoverState::InProgress {
                     // Only set written, when the actual contents were written,
                     // not just a response to what TARGETS we have.
-                    if event.target != context.atoms.TARGETS {
+                    if completed {
                         log::trace!("The contents were written to the clipboard manager.");
                         written = true;
                         // if we have written and notified, make sure to notify that we are done
+                        if notified {
+                            handover_finished(&context, handover_state);
+                        }
+                    }
+                }
+            }
+            Event::PropertyNotify(event) => {
+                let completed = context
+                    .send_incremental_chunk(event, &mut pending)
+                    .map_err(into_unknown)?;
+                if completed {
+                    let handover_state = context.handover_state.lock();
+                    if *handover_state == ManagerHandoverState::InProgress {
+                        written = true;
                         if notified {
                             handover_finished(&context, handover_state);
                         }
@@ -945,6 +1111,38 @@ fn serve_requests(context: Arc<Inner>) -> Result<(), Box<dyn std::error::Error>>
     }
 }
 
+fn data_for_item(
+    item: &ClipboardItem,
+    text_format: Atom,
+    image_format_atom: impl Fn(ImageFormat) -> Atom,
+) -> Vec<ClipboardData> {
+    let mut data = Vec::new();
+    if crate::linux::has_text_clipboard_entry(item) {
+        data.push(ClipboardData {
+            bytes: item.text().unwrap_or_default().into_bytes(),
+            format: text_format,
+        });
+    }
+    for format in ImageFormat::iter() {
+        if let Some(image) = item.entries().iter().find_map(|entry| match entry {
+            ClipboardEntry::Image(image) if image.format == format => Some(image),
+            _ => None,
+        }) {
+            data.push(ClipboardData {
+                bytes: image.bytes.clone(),
+                format: image_format_atom(format),
+            });
+        }
+    }
+    if data.is_empty() {
+        data.push(ClipboardData {
+            bytes: Vec::new(),
+            format: text_format,
+        });
+    }
+    data
+}
+
 pub(crate) struct Clipboard {
     inner: Arc<Inner>,
 }
@@ -977,19 +1175,6 @@ impl Clipboard {
         Ok(Self { inner: ctx })
     }
 
-    pub(crate) fn set_text(
-        &self,
-        message: Cow<'_, str>,
-        selection: ClipboardKind,
-        wait: WaitConfig,
-    ) -> Result<()> {
-        let data = vec![ClipboardData {
-            bytes: message.into_owned().into_bytes(),
-            format: self.inner.atoms.UTF8_STRING,
-        }];
-        self.inner.write(data, selection, wait)
-    }
-
     fn image_format_atom(&self, format: ImageFormat) -> Atom {
         match format {
             ImageFormat::Png => self.inner.atoms.PNG__MIME,
@@ -1004,18 +1189,16 @@ impl Clipboard {
         }
     }
 
-    #[allow(unused)]
-    pub(crate) fn set_image(
+    /// Own the selection with text and each distinct encoded image format from `item`.
+    pub(crate) fn set_item(
         &self,
-        image: Image,
+        item: &ClipboardItem,
         selection: ClipboardKind,
         wait: WaitConfig,
     ) -> Result<()> {
-        let format = self.image_format_atom(image.format);
-        let data = vec![ClipboardData {
-            bytes: image.bytes,
-            format: self.inner.atoms.PNG__MIME,
-        }];
+        let data = data_for_item(item, self.inner.atoms.UTF8_STRING, |format| {
+            self.image_format_atom(format)
+        });
         self.inner.write(data, selection, wait)
     }
 
@@ -1251,5 +1434,147 @@ impl Error {
         Error::Unknown {
             description: message.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_targets_use_actual_formats_and_original_bytes() {
+        let png = b"\x89PNG\r\n\x1a\nimage-body".to_vec();
+        let jpeg = b"\xff\xd8\xff\xe0jpeg-body".to_vec();
+        let item = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::Image(gpui::Image {
+                    format: ImageFormat::Png,
+                    bytes: png.clone(),
+                    id: 1,
+                }),
+                ClipboardEntry::Image(gpui::Image {
+                    format: ImageFormat::Jpeg,
+                    bytes: jpeg.clone(),
+                    id: 2,
+                }),
+            ],
+        };
+
+        let data = data_for_item(&item, 1, |format| match format {
+            ImageFormat::Png => 2,
+            ImageFormat::Jpeg => 3,
+            _ => 4,
+        });
+        assert_eq!(data.len(), 2);
+        assert_eq!(
+            (data[0].format, data[0].bytes.as_slice()),
+            (2, png.as_slice())
+        );
+        assert_eq!(
+            (data[1].format, data[1].bytes.as_slice()),
+            (3, jpeg.as_slice())
+        );
+    }
+
+    #[test]
+    fn mixed_text_and_image_keep_both_targets_without_format_aliasing() {
+        let jpeg = b"\xff\xd8\xff\xe0jpeg-body".to_vec();
+        let mut item = ClipboardItem::new_string_with_metadata("hello".into(), "metadata".into());
+        item.entries.push(ClipboardEntry::Image(gpui::Image {
+            format: ImageFormat::Jpeg,
+            bytes: jpeg.clone(),
+            id: 2,
+        }));
+
+        let data = data_for_item(
+            &item,
+            1,
+            |format| if format == ImageFormat::Jpeg { 3 } else { 4 },
+        );
+        assert_eq!(data.len(), 2);
+        assert_eq!(
+            (data[0].format, data[0].bytes.as_slice()),
+            (1, b"hello".as_slice())
+        );
+        assert_eq!(
+            (data[1].format, data[1].bytes.as_slice()),
+            (3, jpeg.as_slice())
+        );
+    }
+    #[test]
+    fn empty_text_and_file_paths_keep_text_targets() {
+        let empty = data_for_item(&ClipboardItem::new_string(String::new()), 1, |_| 2);
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].format, 1);
+        assert!(empty[0].bytes.is_empty());
+
+        let paths = ClipboardItem {
+            entries: vec![ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                [std::path::PathBuf::from("/tmp/example.png")]
+                    .into_iter()
+                    .collect(),
+            ))],
+        };
+        let data = data_for_item(&paths, 1, |_| 2);
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].format, 1);
+        assert_eq!(data[0].bytes.as_slice(), b"/tmp/example.png");
+    }
+
+    #[test]
+    fn incremental_transfer_preserves_large_image_and_ends_with_empty_chunk() {
+        let bytes: Vec<u8> = (0..INCR_CHUNK_SIZE * 2 + 7)
+            .map(|index| index as u8)
+            .collect();
+        let mut transfer = PendingTransfer::new(bytes.clone(), 42);
+        assert_eq!(transfer.format, 42);
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            let (chunk, done) = transfer.next_chunk();
+            assert!(!done);
+            assert!(!chunk.is_empty());
+            received.extend_from_slice(chunk);
+        }
+        let (end, done) = transfer.next_chunk();
+        assert!(done);
+        assert!(end.is_empty());
+        assert_eq!(received, bytes);
+    }
+
+    #[test]
+    fn incremental_transfer_exact_chunk_boundary_still_sends_terminator() {
+        let mut transfer = PendingTransfer::new(vec![9; INCR_CHUNK_SIZE], 2);
+        let (first, done) = transfer.next_chunk();
+        assert_eq!(first.len(), INCR_CHUNK_SIZE);
+        assert!(!done);
+        let (last, done) = transfer.next_chunk();
+        assert!(last.is_empty());
+        assert!(done);
+    }
+
+    #[test]
+    fn incremental_transfers_bound_memory_and_expire_stalled_requestors() {
+        assert!(within_incr_limits(
+            MAX_INCR_BYTES,
+            MAX_PENDING_INCR_TRANSFERS - 1
+        ));
+        assert!(!within_incr_limits(MAX_INCR_BYTES + 1, 0));
+        assert!(!within_incr_limits(1024, MAX_PENDING_INCR_TRANSFERS));
+        let mut transfer = PendingTransfer::new(vec![0; INCR_CHUNK_SIZE + 1], 2);
+        transfer.last_progress = Instant::now() - LONG_TIMEOUT_DUR - Duration::from_millis(1);
+        assert!(transfer.expired());
+    }
+    #[test]
+    fn manager_waits_for_incremental_image_but_not_plain_text() {
+        let mut item = ClipboardData {
+            bytes: b"text".to_vec(),
+            format: 1,
+        };
+        assert_eq!(
+            manager_handover_timeout(&[item.clone()]),
+            Duration::from_millis(100)
+        );
+        item.bytes.resize(INCR_CHUNK_SIZE + 1, 7);
+        assert_eq!(manager_handover_timeout(&[item]), MAX_MANAGER_INCR_HANDOVER);
     }
 }
