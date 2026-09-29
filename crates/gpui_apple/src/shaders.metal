@@ -16,9 +16,9 @@ fragment float4 retained_frame_clear(constant float4 &color [[buffer(0)]]) {
     return color;
 }
 
-fragment float4 retained_frame_present(RetainedFrameVertex vertex [[stage_in]],
+fragment float4 retained_frame_present(RetainedFrameVertex input [[stage_in]],
                                       texture2d<float, access::read> frame [[texture(0)]]) {
-    return frame.read(uint2(vertex.position.xy));
+    return frame.read(uint2(input.position.xy));
 }
 
 float4 hsla_to_rgba(Hsla hsla);
