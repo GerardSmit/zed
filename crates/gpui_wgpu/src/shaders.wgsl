@@ -96,6 +96,24 @@ struct GammaParams {
 @group(2) @binding(0) var t_sprite: texture_2d<f32>;
 @group(2) @binding(1) var s_sprite: sampler;
 
+@group(0) @binding(0) var t_frame: texture_2d<f32>;
+
+@vertex
+fn vs_frame(@builtin(vertex_index) vertex_id: u32) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(f32(vertex_id % 2u) * 2.0 - 1.0,
+                     1.0 - f32(vertex_id / 2u) * 2.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs_frame(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureLoad(t_frame, vec2<i32>(position.xy), 0);
+}
+
+@fragment
+fn fs_clear_frame() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0);
+}
+
 const M_PI_F: f32 = 3.1415926;
 const GRAYSCALE_FACTORS: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
 
@@ -1158,6 +1176,7 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
 
 struct PathSprite {
     bounds: Bounds,
+    texture_bounds: Bounds,
 }
 
 
@@ -1172,9 +1191,8 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     let sprite = load_path_sprite(instance_id);
     // Don't apply content mask because it was already accounted for when rasterizing the path.
     let device_position = to_device_position(unit_vertex, sprite.bounds);
-    // For screen-space intermediate texture, convert screen position to texture coordinates
     let screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    let texture_coords = screen_position / globals.viewport_size;
+    let texture_coords = (screen_position - sprite.texture_bounds.origin) / sprite.texture_bounds.size;
 
     var out = PathVarying();
     out.position = device_position;
@@ -1422,7 +1440,7 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 // unit_vertex=(0,0)..(1,1) maps exactly onto the portion of the texture that
 // corresponds to the layer's bounds, clamped so fragments outside the texture
 // area are discarded (matching DirectX's culling behaviour). The texture
-// carries straight alpha from the layer render pass, so we keep alpha as-is.
+// carries premultiplied pixels from the layer render pass.
 
 struct LayerSurfaceParams {
     bounds: Bounds,
@@ -1476,15 +1494,8 @@ fn fs_layer_composite(input: LayerSurfaceVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    // Sample the layer texture. The layer was rendered with straight alpha.
-    var sample = textureSampleLevel(t_layer, s_layer, tex_coord, 0.0);
-    sample.a *= fade_alpha(input.position.y, fade_vector(layer_surface_locals.content_fade));
-
-    // Premultiply if the surface uses premultiplied alpha compositing.
-    if (globals.premultiplied_alpha != 0u) {
-        return vec4<f32>(sample.rgb * sample.a, sample.a);
-    }
-    return sample;
+    let sample = textureSampleLevel(t_layer, s_layer, tex_coord, 0.0);
+    return sample * fade_alpha(input.position.y, fade_vector(layer_surface_locals.content_fade));
 }
 
 // --- backdrop blur --- //

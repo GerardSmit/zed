@@ -74,6 +74,19 @@ impl WgpuAtlas {
         lock.flush_uploads();
     }
 
+    pub(crate) fn texture_bind_group(
+        &self,
+        id: AtlasTextureId,
+        create: impl FnOnce(&wgpu::TextureView) -> wgpu::BindGroup,
+    ) -> wgpu::BindGroup {
+        let lock = self.0.lock();
+        let texture = &lock.storage[id];
+        texture
+            .bind_group
+            .get_or_init(|| create(&texture.view))
+            .clone()
+    }
+
     pub fn get_texture_info(&self, id: AtlasTextureId) -> WgpuTextureInfo {
         let lock = self.0.lock();
         let texture = &lock.storage[id];
@@ -228,6 +241,7 @@ impl WgpuAtlasState {
             texture,
             view,
             live_atlas_keys: 0,
+            bind_group: Default::default(),
         };
 
         if let Some(ix) = index {
@@ -344,6 +358,7 @@ impl ops::Index<AtlasTextureId> for WgpuAtlasStorage {
 }
 
 struct WgpuAtlasTexture {
+    bind_group: std::sync::OnceLock<wgpu::BindGroup>,
     id: AtlasTextureId,
     allocator: BucketedAtlasAllocator,
     texture: wgpu::Texture,
@@ -460,6 +475,68 @@ mod tests {
             .expect("tile should be created");
         atlas.remove(&key);
         atlas.before_frame();
+        Ok(())
+    }
+
+    #[test]
+    fn cached_binding_is_recreated_when_an_atlas_slot_is_reused() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device.clone(), queue, wgpu::TextureFormat::Bgra8Unorm);
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let builds = std::cell::Cell::new(0);
+        let binding = |view: &wgpu::TextureView| {
+            builds.set(builds.get() + 1);
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                }],
+            })
+        };
+        let key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(1),
+            frame_index: 0,
+        });
+        let insert = || {
+            atlas
+                .get_or_insert_with(&key, &mut || {
+                    Ok(Some((
+                        gpui::size(DevicePixels(1), DevicePixels(1)),
+                        Cow::Owned(vec![0, 0, 0, 255]),
+                    )))
+                })
+                .map(|tile| tile.unwrap().texture_id)
+        };
+        let first = insert()?;
+        let old_binding = atlas.texture_bind_group(first, binding);
+        atlas.texture_bind_group(first, binding);
+        assert_eq!(builds.get(), 1);
+        atlas.remove(&key);
+        let second = insert()?;
+        assert_eq!(first, second);
+        atlas.texture_bind_group(second, binding);
+        assert_eq!(builds.get(), 2);
+        // Keeping the old GPU binding alive must not associate it with the replacement texture.
+        drop(old_binding);
+        atlas.clear();
+        let third = insert()?;
+        assert_eq!(second, third);
+        atlas.texture_bind_group(third, binding);
+        assert_eq!(builds.get(), 3);
         Ok(())
     }
 

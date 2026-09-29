@@ -15,6 +15,10 @@ use std::{
     slice,
 };
 
+#[path = "scene_damage.rs"]
+mod damage;
+pub use damage::{SceneDamage, SceneDamageRegions};
+
 #[allow(non_camel_case_types, unused)]
 #[expect(missing_docs)]
 pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
@@ -39,6 +43,8 @@ impl From<bool> for PaddedBool32 {
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
+    /// Pixels changed since the last presentation. Fresh render targets must still redraw fully.
+    pub damage: SceneDamage,
     rounded_clips: Vec<Vec<Bounds<ScaledPixels>>>,
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
@@ -46,6 +52,8 @@ pub struct Scene {
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
+    // Upload staging alternates between targets with and without paths. Keep a bounded spare pool.
+    staged_path_pool: Vec<Path<ScaledPixels>>,
     pub underlines: Vec<Underline>,
     pub monochrome_sprites: Vec<MonochromeSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
@@ -65,10 +73,10 @@ pub struct SceneLayer {
     /// Device-pixel size of the offscreen texture (the layered view's bounds at the current scale).
     pub size: Size<DevicePixels>,
     /// When true the texture must be (re)rendered from `scene` this frame (content changed / first
-    /// paint / scale changed). When false the existing texture is reused and only re-composited —
-    /// this is the resize fast path, and `scene` is empty.
+    /// paint / scale changed). Otherwise reuse the existing texture unless its GPU contents were
+    /// lost. The last scene snapshot is retained for recovery.
     pub needs_render: bool,
-    /// The layer's primitives in layer-local coordinates, present only when `needs_render`.
+    /// The layer's last painted primitives in layer-local coordinates, also retained during reuse.
     pub scene: Option<Box<Scene>>,
 }
 
@@ -83,6 +91,7 @@ impl Scene {
     }
 
     pub fn clear(&mut self) {
+        self.damage = SceneDamage::Full;
         self.rounded_clips.clear();
         self.paint_operations.clear();
         self.primitive_bounds.clear();
@@ -645,7 +654,7 @@ impl PrimitiveBatch {
     }
 }
 
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct Quad {
@@ -665,7 +674,7 @@ impl From<Quad> for Primitive {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct Underline {
@@ -684,7 +693,7 @@ impl From<Underline> for Primitive {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct Shadow {
@@ -821,7 +830,7 @@ impl Default for TransformationMatrix {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct MonochromeSprite {
@@ -840,7 +849,7 @@ impl From<MonochromeSprite> for Primitive {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct SubpixelSprite {
@@ -859,7 +868,7 @@ impl From<SubpixelSprite> for Primitive {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct PolychromeSprite {
@@ -936,7 +945,7 @@ impl From<PaintSurface> for Primitive {
 pub struct PathId(pub usize);
 
 /// A line made up of a series of vertices and control points.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[expect(missing_docs)]
 pub struct Path<P: Clone + Debug + Default + PartialEq> {
     pub id: PathId,
@@ -1080,7 +1089,7 @@ impl From<Path<ScaledPixels>> for Primitive {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct PathVertex<P: Clone + Debug + Default + PartialEq> {

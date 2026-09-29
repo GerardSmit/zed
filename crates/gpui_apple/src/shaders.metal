@@ -3,6 +3,24 @@
 
 using namespace metal;
 
+struct RetainedFrameVertex {
+    float4 position [[position]];
+};
+
+vertex RetainedFrameVertex retained_frame_vertex(uint vertex_id [[vertex_id]]) {
+    float2 position = float2((vertex_id << 1) & 2, vertex_id & 2);
+    return {float4(position * 2.0 - 1.0, 0.0, 1.0)};
+}
+
+fragment float4 retained_frame_clear(constant float4 &color [[buffer(0)]]) {
+    return color;
+}
+
+fragment float4 retained_frame_present(RetainedFrameVertex vertex [[stage_in]],
+                                      texture2d<float, access::read> frame [[texture(0)]]) {
+    return frame.read(uint2(vertex.position.xy));
+}
+
 float4 hsla_to_rgba(Hsla hsla);
 float3 srgb_to_linear(float3 color);
 float3 linear_to_srgb(float3 color);

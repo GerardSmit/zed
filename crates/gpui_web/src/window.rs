@@ -58,6 +58,8 @@ pub(crate) struct WebWindowInner {
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
+    /// A browser paste may arrive after its shortcut's keyup events.
+    pub(crate) paste_plain: Cell<Option<bool>>,
     /// Set while `sync_virtual_keyboard` blur/focus-cycles the hidden input.
     /// The cycle is a keyboard-visibility hint, not a real activity change;
     /// letting the focus/blur listeners report it would re-enter GPUI
@@ -229,6 +231,7 @@ impl WebWindow {
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
+            paste_plain: Cell::new(None),
             suppress_focus_status_events: Cell::new(false),
             visual_viewport_probe: Cell::new((0.0, 0.0)),
             gesture_start_visual_viewport_height: Cell::new(0.0),
@@ -927,11 +930,11 @@ impl PlatformWindow for WebWindow {
                 state.renderer.device_lost(),
             )
         };
-        let retry = self.inner.frame_retry.borrow_mut().record(
-            presented,
-            needs_redraw,
-            device_lost,
-        );
+        let retry =
+            self.inner
+                .frame_retry
+                .borrow_mut()
+                .record(presented, needs_redraw, device_lost);
         if retry {
             self.inner.wake_frame_loop();
         } else if !presented && !device_lost {

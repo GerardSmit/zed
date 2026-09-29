@@ -609,6 +609,16 @@ impl FocusHandle {
         self.id.is_focused(window)
     }
 
+    /// Whether this handle occurs in the last rendered frame, including replayed cached views.
+    /// This tests presentation membership, not keyboard focus or occlusion by another window.
+    pub fn is_rendered(&self, window: &Window) -> bool {
+        window
+            .rendered_frame
+            .dispatch_tree
+            .focusable_node_id(self.id)
+            .is_some()
+    }
+
     /// Obtains whether the element associated with this handle contains the focused
     /// element or is itself focused.
     pub fn contains_focused(&self, window: &Window, cx: &App) -> bool {
@@ -3397,6 +3407,12 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        self.next_frame
+            .scene
+            .reuse_layers(&mut self.rendered_frame.scene, self.needs_present.get());
+        self.next_frame
+            .scene
+            .update_damage(&self.rendered_frame.scene, self.needs_present.get());
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -3496,6 +3512,7 @@ impl Window {
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
         self.platform_window.draw(&self.rendered_frame.scene);
+        self.rendered_frame.scene.clear_damage();
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3745,7 +3762,9 @@ impl Window {
                 );
                 // No room under the source: sit above it, keeping the same side, rather than be
                 // clamped up over the thing it describes.
-                if below && tooltip_bounds.origin.y + tooltip_size.height > window_bounds.bottom() - px(4.)
+                if below
+                    && tooltip_bounds.origin.y + tooltip_size.height
+                        > window_bounds.bottom() - px(4.)
                 {
                     let above = anchor.y - source.height - px(6.) - tooltip_size.height;
                     if above >= px(4.) {
@@ -4141,8 +4160,14 @@ impl Window {
         let top_radius = radii.top_left.0.max(radii.top_right.0);
         let bottom_radius = radii.bottom_left.0.max(radii.bottom_right.0);
         let inset = |radius: f32, distance: f32| {
-            if distance >= radius || radius <= 0. { 0. }
-            else { radius - (radius * radius - (radius - distance).powi(2)).max(0.).sqrt() }
+            if distance >= radius || radius <= 0. {
+                0.
+            } else {
+                radius
+                    - (radius * radius - (radius - distance).powi(2))
+                        .max(0.)
+                        .sqrt()
+            }
         };
         let mut bands = Vec::new();
         let mut y = visible.top().0;
@@ -4152,15 +4177,21 @@ impl Window {
             let next = if y >= middle_top && y < middle_bottom {
                 middle_bottom.min(visible.bottom().0)
             } else {
-                (y.floor() + 1.).min(visible.bottom().0).min(
-                    if y < middle_top { middle_top } else { visible.bottom().0 }
-                )
+                (y.floor() + 1.)
+                    .min(visible.bottom().0)
+                    .min(if y < middle_top {
+                        middle_top
+                    } else {
+                        visible.bottom().0
+                    })
             };
             let sample = (y + next) * 0.5;
             let from_top = sample - bounds.top().0;
             let from_bottom = bounds.bottom().0 - sample;
-            let left = inset(radii.top_left.0, from_top).max(inset(radii.bottom_left.0, from_bottom));
-            let right = inset(radii.top_right.0, from_top).max(inset(radii.bottom_right.0, from_bottom));
+            let left =
+                inset(radii.top_left.0, from_top).max(inset(radii.bottom_left.0, from_bottom));
+            let right =
+                inset(radii.top_right.0, from_top).max(inset(radii.bottom_right.0, from_bottom));
             bands.push(Bounds::from_corners(
                 point(ScaledPixels(bounds.left().0 + left), ScaledPixels(y)),
                 point(ScaledPixels(bounds.right().0 - right), ScaledPixels(next)),
@@ -4331,15 +4362,12 @@ impl Window {
     /// Obtain the current content mask. This method should only be called during element drawing.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
         self.invalidator.debug_assert_paint_or_prepaint();
-        self.content_mask_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(|| {
-                ContentMask::new(Bounds {
-                    origin: Point::default(),
-                    size: self.viewport_size,
-                })
+        self.content_mask_stack.last().cloned().unwrap_or_else(|| {
+            ContentMask::new(Bounds {
+                origin: Point::default(),
+                size: self.viewport_size,
             })
+        })
     }
 
     /// Provide elements in the called function with a new namespace in which their identifiers must be unique.
@@ -8314,6 +8342,130 @@ mod tests {
 
         assert!(test_window.simulate_scheduled_frame());
         assert!(callback_ran.get());
+    }
+
+    #[gpui::test]
+    fn pending_animation_callbacks_share_one_render(cx: &mut TestAppContext) {
+        struct AnimatedView {
+            positions: [u32; 2],
+            rendered: Rc<RefCell<Vec<[u32; 2]>>>,
+        }
+
+        impl Render for AnimatedView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.rendered.borrow_mut().push(self.positions);
+                div()
+            }
+        }
+
+        fn animate(view: crate::Entity<AnimatedView>, index: usize, window: &Window) {
+            window.on_next_frame(move |window, cx| {
+                let continuing = view.update(cx, |view, cx| {
+                    view.positions[index] += 1;
+                    cx.notify();
+                    view.positions[index] < 3
+                });
+                if continuing {
+                    animate(view, index, window);
+                }
+            });
+        }
+
+        let rendered = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let rendered = rendered.clone();
+            move |_, _| AnimatedView {
+                positions: [0, 0],
+                rendered,
+            }
+        });
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        rendered.borrow_mut().clear();
+
+        window
+            .update(cx, |_, window, cx| {
+                window.active.set(true);
+                for index in 0..2 {
+                    animate(cx.entity(), index, window);
+                }
+            })
+            .unwrap();
+        assert!(rendered.borrow().is_empty());
+
+        let expected = [[1, 1], [2, 2], [3, 3]];
+        for count in 1..=expected.len() {
+            test_window.simulate_frame_request(RequestFrameOptions::default());
+            assert_eq!(rendered.borrow().as_slice(), &expected[..count]);
+        }
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(rendered.borrow().as_slice(), &expected);
+    }
+
+    #[gpui::test]
+    fn rendered_focus_membership_survives_cached_replay(cx: &mut TestAppContext) {
+        struct Child {
+            focus: FocusHandle,
+            renders: Rc<Cell<usize>>,
+        }
+        impl Render for Child {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders.set(self.renders.get() + 1);
+                div().track_focus(&self.focus).size_full()
+            }
+        }
+        struct Parent {
+            child: crate::Entity<Child>,
+            shown: bool,
+        }
+        impl Render for Parent {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let mut root = div().size_full();
+                if self.shown {
+                    root = root.child(
+                        self.child
+                            .clone()
+                            .cached(crate::StyleRefinement::default().size_full()),
+                    );
+                }
+                root
+            }
+        }
+        let renders = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let renders = renders.clone();
+            move |_, cx| Parent {
+                child: cx.new(|cx| Child {
+                    focus: cx.focus_handle(),
+                    renders,
+                }),
+                shown: true,
+            }
+        });
+        let platform = cx.test_window(window.into());
+        platform.simulate_frame_request(RequestFrameOptions::default());
+        let count = renders.get();
+        window
+            .update(cx, |view, window, cx| {
+                assert!(view.child.read(cx).focus.is_rendered(window));
+                window.request_redraw();
+            })
+            .unwrap();
+        platform.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(renders.get(), count, "cached contents should be replayed");
+        window
+            .update(cx, |view, window, cx| {
+                assert!(view.child.read(cx).focus.is_rendered(window));
+                view.shown = false;
+                cx.notify();
+            })
+            .unwrap();
+        platform.simulate_frame_request(RequestFrameOptions::default());
+        window
+            .update(cx, |view, window, cx| {
+                assert!(!view.child.read(cx).focus.is_rendered(window));
+            })
+            .unwrap();
     }
 
     struct RootView {

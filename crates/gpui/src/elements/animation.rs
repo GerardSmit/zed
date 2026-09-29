@@ -25,6 +25,8 @@ pub struct Animation {
     /// The maximum number of times per second this animation re-renders.
     /// When `None`, the animation re-renders on every frame.
     pub max_fps: Option<f32>,
+    /// Whether animation frames are needed only while its bounds intersect the clip.
+    pub paint_only: bool,
 }
 
 impl Animation {
@@ -37,6 +39,7 @@ impl Animation {
             synced: false,
             easing: Rc::new(linear),
             max_fps: None,
+            paint_only: false,
         }
     }
 
@@ -70,6 +73,13 @@ impl Animation {
         self.max_fps = Some(max_fps);
         self
     }
+
+    /// Stop requesting frames while fully clipped, retaining the animation's clock.
+    /// Only use for animations that change paint within fixed bounds, never layout or position.
+    pub fn paint_only(mut self) -> Self {
+        self.paint_only = true;
+        self
+    }
 }
 
 /// An extension trait for adding the animation wrapper to both Elements and Components
@@ -95,6 +105,7 @@ pub trait AnimationExt {
             element: Some(self),
             animator: Box::new(move |this, _, value| animator(this, value)),
             animations: smallvec::smallvec![animation],
+            frame_request: None,
         }
     }
 
@@ -113,6 +124,7 @@ pub trait AnimationExt {
             element: Some(self),
             animator: Box::new(animator),
             animations: animations.into(),
+            frame_request: None,
         }
     }
 
@@ -163,6 +175,7 @@ pub struct AnimationElement<E> {
     element: Option<E>,
     animations: SmallVec<[Animation; 1]>,
     animator: Box<dyn Fn(E, usize, f32) -> E + 'static>,
+    frame_request: Option<(Option<f32>, Rc<Cell<bool>>)>,
 }
 
 /// A GPUI element driven by a stateful spring.
@@ -237,6 +250,31 @@ struct AnimationState {
     /// Whether a throttled re-render (see [`Animation::with_max_fps`]) is
     /// already scheduled, so overlapping renders don't stack extra timers.
     delayed_frame_pending: Rc<Cell<bool>>,
+}
+
+fn request_animation_frame(
+    max_fps: Option<f32>,
+    delayed_frame_pending: &Rc<Cell<bool>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match max_fps {
+        Some(max_fps) if max_fps.is_finite() && max_fps > 0.0 => {
+            if !delayed_frame_pending.replace(true) {
+                let delayed_frame_pending = delayed_frame_pending.clone();
+                let view = window.current_view();
+                let interval = Duration::from_secs_f32(1.0 / max_fps);
+                window
+                    .spawn(cx, async move |cx| {
+                        cx.background_executor().timer(interval).await;
+                        delayed_frame_pending.set(false);
+                        cx.update(move |_, cx| cx.notify(view)).ok();
+                    })
+                    .detach();
+            }
+        }
+        _ => window.request_animation_frame(),
+    }
 }
 
 struct SpringElementState {
@@ -449,23 +487,17 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
             let mut element = (self.animator)(element, animation_ix, delta).into_any_element();
 
             if !done {
-                match self.animations[animation_ix].max_fps {
-                    Some(max_fps) if max_fps.is_finite() && max_fps > 0.0 => {
-                        if !state.delayed_frame_pending.get() {
-                            state.delayed_frame_pending.set(true);
-                            let delayed_frame_pending = state.delayed_frame_pending.clone();
-                            let view = window.current_view();
-                            let interval = Duration::from_secs_f32(1.0 / max_fps);
-                            window
-                                .spawn(cx, async move |cx| {
-                                    cx.background_executor().timer(interval).await;
-                                    delayed_frame_pending.set(false);
-                                    cx.update(move |_, cx| cx.notify(view)).ok();
-                                })
-                                .detach();
-                        }
-                    }
-                    _ => window.request_animation_frame(),
+                let animation = &self.animations[animation_ix];
+                if animation.paint_only {
+                    self.frame_request =
+                        Some((animation.max_fps, state.delayed_frame_pending.clone()));
+                } else {
+                    request_animation_frame(
+                        animation.max_fps,
+                        &state.delayed_frame_pending,
+                        window,
+                        cx,
+                    );
                 }
             }
 
@@ -477,11 +509,16 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: crate::Bounds<crate::Pixels>,
+        bounds: crate::Bounds<crate::Pixels>,
         element: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        if bounds.intersects(&window.content_mask().bounds)
+            && let Some((max_fps, pending)) = self.frame_request.take()
+        {
+            request_animation_frame(max_fps, &pending, window, cx);
+        }
         element.prepaint(window, cx);
     }
 
@@ -928,6 +965,85 @@ mod tests {
             assert_eq!(simulate_next_frame(&window, cx), 1);
             assert_eq!(rendered_deltas.borrow().len(), expected_frames);
         }
+    }
+
+    struct ClippedAnimationTestView {
+        clipped: bool,
+        paint_only: bool,
+        deltas: Rc<RefCell<Vec<f32>>>,
+    }
+
+    impl Render for ClippedAnimationTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let deltas = self.deltas.clone();
+            let mut animation = Animation::new(Duration::from_secs(1)).repeat_synced();
+            if self.paint_only {
+                animation = animation.paint_only();
+            }
+            div().size_full().overflow_hidden().child(
+                div()
+                    .absolute()
+                    .left(px(if self.clipped { 200. } else { 0. }))
+                    .size(px(20.))
+                    .with_animation("clipped-pulse", animation, move |element, delta| {
+                        deltas.borrow_mut().push(delta);
+                        element.opacity(delta)
+                    }),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn paint_only_animation_parks_when_clipped_and_resumes_current_phase(cx: &mut TestAppContext) {
+        let deltas = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.open_window(size(px(100.), px(100.)), {
+            let deltas = deltas.clone();
+            move |_, _| ClippedAnimationTestView {
+                clipped: true,
+                paint_only: true,
+                deltas,
+            }
+        });
+        cx.run_until_parked();
+        assert_eq!(simulate_next_frame(&window, cx), 0);
+        cx.executor().advance_clock(Duration::from_millis(250));
+        assert_eq!(simulate_next_frame(&window, cx), 0);
+        assert_eq!(deltas.borrow().len(), 1);
+
+        window
+            .update(cx, |view, _, cx| {
+                view.clipped = false;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(*deltas.borrow().last().unwrap(), 0.25);
+        for _ in 0..3 {
+            assert_eq!(
+                simulate_next_frame(&window, cx),
+                1,
+                "visible pulses retain every frame"
+            );
+        }
+        window
+            .update(cx, |view, _, cx| {
+                view.clipped = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        simulate_next_frame(&window, cx); // A callback queued before clipping may already be pending.
+        assert_eq!(simulate_next_frame(&window, cx), 0);
+
+        // Layout/position animations retain their existing scheduling even when clipped.
+        window
+            .update(cx, |view, _, cx| {
+                view.paint_only = false;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(simulate_next_frame(&window, cx), 1);
     }
 
     #[gpui::test]

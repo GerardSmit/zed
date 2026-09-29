@@ -196,6 +196,7 @@ impl WebWindowInner {
         self.listen("pointerdown", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             event.prevent_default();
+            this.paste_plain.set(None);
 
             let pointer_type = event.pointer_type();
             let position = pointer_position_in_element(&event);
@@ -656,6 +657,10 @@ impl WebWindowInner {
                 return;
             }
 
+            let paste_shortcut = key == "v" && (modifiers.control || modifiers.platform);
+            this.paste_plain
+                .set(paste_shortcut.then_some(modifiers.shift));
+
             let is_held = event.repeat();
             let key_char = compute_key_char(&event, &key, &modifiers);
 
@@ -984,6 +989,20 @@ impl WebWindowInner {
                 .get_data("text/plain")
                 .ok()
                 .filter(|text| !text.is_empty());
+            let html = clipboard_data
+                .get_data("text/html")
+                .ok()
+                .filter(|html| !html.is_empty());
+            let plain = this.paste_plain.take().unwrap_or(false);
+            let text = (text.is_some() || html.is_some()).then(|| ClipboardString {
+                text: text.unwrap_or_default(),
+                // Browser-owned paste shortcuts can bypass an application's key action.
+                metadata: if plain {
+                    Some("text/plain".into())
+                } else {
+                    html.map(|html| format!("text/html\n{html}"))
+                },
+            });
 
             // File handles must be collected synchronously: the browser
             // clears `clipboardData`'s item list once this handler returns,
@@ -1013,7 +1032,9 @@ impl WebWindowInner {
             if image_files.is_empty() {
                 if let Some(text) = text {
                     this.with_input_handler(|handler| {
-                        handler.paste(ClipboardItem::new_string(text));
+                        handler.paste(ClipboardItem {
+                            entries: vec![ClipboardEntry::String(text)],
+                        });
                     });
                 }
                 return;
@@ -1023,7 +1044,7 @@ impl WebWindowInner {
             wasm_bindgen_futures::spawn_local(async move {
                 let mut entries = Vec::new();
                 if let Some(text) = text {
-                    entries.push(ClipboardEntry::String(ClipboardString::new(text)));
+                    entries.push(ClipboardEntry::String(text));
                 }
                 for (format, file) in image_files {
                     match crate::platform::read_blob_bytes(&file).await {

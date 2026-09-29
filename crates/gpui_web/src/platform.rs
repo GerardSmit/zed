@@ -297,7 +297,7 @@ impl Platform for WebPlatform {
                 Err(error) => {
                     window_lifecycle.set(WebWindowLifecycle::Unavailable);
                     log::error!("Failed to initialize browser graphics: {error:#}");
-                    show_graphics_unavailable_message(&browser_window, &error);
+                    show_graphics_unavailable_message(&browser_window);
                 }
             }
         });
@@ -581,18 +581,21 @@ impl Platform for WebPlatform {
             let mut saw_unsupported_type = false;
             for item in js_sys::Array::from(&items).iter() {
                 let item: web_sys::ClipboardItem = item.unchecked_into();
+                let mut text = None;
+                let mut html = None;
                 for mime_type in item.types().iter() {
                     let Some(mime_type) = mime_type.as_string() else {
                         continue;
                     };
-                    // Only fetch blobs for types we can convert; copies from
-                    // other web apps routinely carry `text/html` and
-                    // `web application/...` custom formats whose `getType`
-                    // fetches would be wasted or rejected.
-                    if mime_type == "text/plain" {
+                    // Custom `web application/...` formats cannot be converted.
+                    if mime_type == "text/plain" || mime_type == "text/html" {
                         match read_clipboard_item_text(&item, &mime_type).await {
-                            Ok(text) if !text.is_empty() => {
-                                entries.push(ClipboardEntry::String(ClipboardString::new(text)));
+                            Ok(value) if !value.is_empty() => {
+                                if mime_type == "text/html" {
+                                    html = Some(value);
+                                } else {
+                                    text = Some(value);
+                                }
                             }
                             Ok(_) => {}
                             Err(error) => log_clipboard_entry_error(&mime_type, &error),
@@ -608,6 +611,12 @@ impl Platform for WebPlatform {
                     } else {
                         saw_unsupported_type = true;
                     }
+                }
+                if text.is_some() || html.is_some() {
+                    entries.push(ClipboardEntry::String(ClipboardString {
+                        text: text.unwrap_or_default(),
+                        metadata: html.map(|html| format!("text/html\n{html}")),
+                    }));
                 }
             }
             if !entries.is_empty() {
@@ -682,10 +691,11 @@ fn exec_command_copy(window: &web_sys::Window, text: &str) -> bool {
     let previously_focused = document
         .active_element()
         .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok());
-    let Ok(textarea) = document
-        .create_element("textarea")
-        .and_then(|element| element.dyn_into::<web_sys::HtmlTextAreaElement>().map_err(Into::into))
-    else {
+    let Ok(textarea) = document.create_element("textarea").and_then(|element| {
+        element
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .map_err(Into::into)
+    }) else {
         return false;
     };
     textarea.set_value(text);
@@ -813,7 +823,7 @@ fn cursor_restore_listeners(
     handles
 }
 
-fn show_graphics_unavailable_message(browser_window: &web_sys::Window, error: &anyhow::Error) {
+fn show_graphics_unavailable_message(browser_window: &web_sys::Window) {
     let Some(document) = browser_window.document() else {
         return;
     };
@@ -823,9 +833,16 @@ fn show_graphics_unavailable_message(browser_window: &web_sys::Window, error: &a
     let Ok(message) = document.create_element("p") else {
         return;
     };
-    message.set_text_content(Some(&format!(
-        "Failed to initialize browser graphics: {error}"
-    )));
+    message.set_attribute("role", "alert").ok();
+    message
+        .set_attribute(
+            "style",
+            "color: CanvasText; background: Canvas; padding: 1rem; font: 1rem/1.5 system-ui;",
+        )
+        .ok();
+    message.set_text_content(Some(
+        "Browser graphics are unavailable. Reload this page, enable hardware acceleration in your browser settings, or try another browser with WebGPU or WebGL2 support.",
+    ));
     body.append_child(&message).ok();
 }
 

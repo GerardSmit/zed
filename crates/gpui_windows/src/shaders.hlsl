@@ -1002,6 +1002,7 @@ struct PathRasterizationSprite {
     Background color;
     Bounds bounds;
     ContentFade fade;
+    float2 target_origin;
 };
 
 StructuredBuffer<PathRasterizationSprite> path_rasterization_sprites: register(t1);
@@ -1023,7 +1024,7 @@ PathVertexOutput path_rasterization_vertex(uint vertex_id: SV_VertexID) {
     PathRasterizationSprite sprite = path_rasterization_sprites[vertex_id];
 
     PathVertexOutput output;
-    output.position = to_device_position_impl(sprite.xy_position);
+    output.position = to_device_position_impl(sprite.xy_position - sprite.target_origin);
     output.st_position = sprite.st_position;
     output.vertex_id = vertex_id;
     output.clip_distance = distance_from_clip_rect_impl(sprite.xy_position, sprite.bounds);
@@ -1052,11 +1053,12 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
     GradientColor gradient = prepare_gradient_color(
         background.tag, background.color_space, background.solid, background.colors);
 
-    float4 color = gradient_color(background, input.position.xy, bounds,
+    float2 target_position = input.position.xy + sprite.target_origin;
+    float4 color = gradient_color(background, target_position, bounds,
         gradient.solid, gradient.color0, gradient.color1);
     // Premultiplied, so the fade scales colour and alpha alike. The intermediate texture is in
-    // window space, so the fade is evaluated here and the sprite pass composites it as is.
-    alpha *= fade_alpha(input.position.y, fade_vector(sprite.fade));
+    // target space, so preserve the original coordinates when rasterizing into a damage tile.
+    alpha *= fade_alpha(target_position.y, fade_vector(sprite.fade));
     return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
 
@@ -1068,9 +1070,8 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
 
 struct PathSprite {
     Bounds bounds;
-    // Size of the path intermediate texture in device pixels. It can be larger than the viewport:
-    // a cached layer pass rasterizes into the top-left of a texture sized for the largest target.
     float2 tex_size;
+    float2 texture_origin;
 };
 
 struct PathSpriteVertexOutput {
@@ -1088,7 +1089,7 @@ PathSpriteVertexOutput path_sprite_vertex(uint vertex_id: SV_VertexID, uint spri
     float4 device_position = to_device_position(unit_vertex, sprite.bounds);
 
     float2 screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    float2 texture_coords = screen_position / sprite.tex_size;
+    float2 texture_coords = (screen_position - sprite.texture_origin) / sprite.tex_size;
 
     PathSpriteVertexOutput output;
     output.position = device_position;

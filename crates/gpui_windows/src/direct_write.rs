@@ -1104,6 +1104,15 @@ impl DirectWriteState {
         };
 
         let device_context = &gpu_state.device_context;
+        // Window damage scissors share this immediate context; glyph textures need their full area.
+        unsafe {
+            device_context.RSSetScissorRects(Some(&[RECT {
+                left: 0,
+                top: 0,
+                right: bitmap_size.width.0,
+                bottom: bitmap_size.height.0,
+            }]))
+        };
         unsafe { device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) };
         unsafe { device_context.VSSetShader(&gpu_state.vertex_shader, None) };
         unsafe { device_context.PSSetShader(&gpu_state.pixel_shader, None) };
@@ -2031,6 +2040,7 @@ mod tests {
                 is_emoji: true,
                 subpixel_rendering: false,
                 dilation: 0,
+                blur: 0,
             };
             let raster_bounds = text_system.glyph_raster_bounds(&params)?;
             if raster_bounds.size.width.0 == 0 || raster_bounds.size.height.0 == 0 {

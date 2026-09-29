@@ -8,7 +8,8 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentFade, ContentMask, DevicePixels, PaintSurface,
-    PaintSurfaceSource, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    PaintSurfaceSource, Path, Point, PrimitiveBatch, ScaledPixels, Scene, SceneDamage, Size, point,
+    size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -26,8 +27,17 @@ use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
 use std::{
-    cell::Cell, collections::HashMap, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice,
-    sync::Arc,
+    cell::Cell,
+    collections::HashMap,
+    ffi::c_void,
+    mem,
+    mem::MaybeUninit,
+    ops::Range,
+    ptr, slice,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 // Exported to metal
@@ -133,6 +143,14 @@ pub struct MetalRenderer {
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
     layer_surfaces_pipeline_state: metal::RenderPipelineState,
+    frame_clear_pipeline_state: metal::RenderPipelineState,
+    frame_present_pipeline_state: metal::RenderPipelineState,
+    retained_frame: Option<metal::Texture>,
+    retained_frame_valid: bool,
+    staging_scene: Scene,
+    #[cfg(any(test, feature = "test-support"))]
+    primitive_upload_bytes: usize,
+    frame_failed: Arc<AtomicBool>,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -156,6 +174,7 @@ struct CachedLayerTexture {
     texture: metal::Texture,
     width: u64,
     height: u64,
+    valid: bool,
 }
 
 #[repr(C)]
@@ -303,6 +322,7 @@ impl MetalRenderer {
             "shadow_vertex",
             "shadow_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
         let quads_pipeline_state = build_pipeline_state(
             &device,
@@ -311,6 +331,7 @@ impl MetalRenderer {
             "quad_vertex",
             "quad_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
         let underlines_pipeline_state = build_pipeline_state(
             &device,
@@ -319,6 +340,7 @@ impl MetalRenderer {
             "underline_vertex",
             "underline_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
         let monochrome_sprites_pipeline_state = build_pipeline_state(
             &device,
@@ -327,6 +349,7 @@ impl MetalRenderer {
             "monochrome_sprite_vertex",
             "monochrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
         let polychrome_sprites_pipeline_state = build_pipeline_state(
             &device,
@@ -335,6 +358,7 @@ impl MetalRenderer {
             "polychrome_sprite_vertex",
             "polychrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
         let surfaces_pipeline_state = build_pipeline_state(
             &device,
@@ -343,6 +367,7 @@ impl MetalRenderer {
             "surface_vertex",
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
         let layer_surfaces_pipeline_state = build_pipeline_state(
             &device,
@@ -351,7 +376,31 @@ impl MetalRenderer {
             "surface_vertex",
             "layer_surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         );
+
+        let frame_pipeline = |label, fragment| {
+            let descriptor = metal::RenderPipelineDescriptor::new();
+            descriptor.set_label(label);
+            let vertex = library
+                .get_function("retained_frame_vertex", None)
+                .expect("missing retained frame vertex shader");
+            let fragment = library
+                .get_function(fragment, None)
+                .expect("missing retained frame fragment shader");
+            descriptor.set_vertex_function(Some(&vertex));
+            descriptor.set_fragment_function(Some(&fragment));
+            let attachment = descriptor.color_attachments().object_at(0).unwrap();
+            attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            // Clearing transparent damage and presenting premultiplied pixels must overwrite.
+            attachment.set_blending_enabled(false);
+            device
+                .new_render_pipeline_state(&descriptor)
+                .expect("could not create retained frame pipeline")
+        };
+        let frame_clear_pipeline_state = frame_pipeline("frame clear", "retained_frame_clear");
+        let frame_present_pipeline_state =
+            frame_pipeline("frame present", "retained_frame_present");
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -376,6 +425,14 @@ impl MetalRenderer {
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
             layer_surfaces_pipeline_state,
+            frame_clear_pipeline_state,
+            frame_present_pipeline_state,
+            retained_frame: None,
+            retained_frame_valid: false,
+            staging_scene: Scene::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            primitive_upload_bytes: 0,
+            frame_failed: Arc::new(AtomicBool::new(false)),
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -411,6 +468,11 @@ impl MetalRenderer {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn primitive_upload_bytes(&self) -> usize {
+        self.primitive_upload_bytes
+    }
+
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
         &self.sprite_atlas
     }
@@ -423,6 +485,13 @@ impl MetalRenderer {
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
+        if self.retained_frame.as_ref().is_some_and(|texture| {
+            texture.width() != size.width.0.max(0) as u64
+                || texture.height() != size.height.0.max(0) as u64
+        }) {
+            self.retained_frame = None;
+            self.retained_frame_valid = false;
+        }
         if let Some(layer) = &self.layer {
             let ns_size = NSSize {
                 width: size.width.0 as f64,
@@ -442,8 +511,6 @@ impl MetalRenderer {
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
         if size.width.0 <= 0 || size.height.0 <= 0 {
-            self.path_intermediate_texture = None;
-            self.path_intermediate_msaa_texture = None;
             return;
         }
 
@@ -485,6 +552,9 @@ impl MetalRenderer {
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
+        if self.opaque == transparent {
+            self.retained_frame_valid = false;
+        }
         self.opaque = !transparent;
         if let Some(layer) = &self.layer {
             layer.set_opaque(!transparent);
@@ -531,18 +601,22 @@ impl MetalRenderer {
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
+            self.retained_frame_valid = false;
             return;
         };
 
         self.display_buffering
             .observe_wait(acquisition_start, acquisition_start.elapsed());
-        let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
-            Ok(command_buffer) => command_buffer,
+        let (command_buffer, frame) = match self.render_retained_frame(scene, viewport_size) {
+            Ok(frame) => frame,
             Err(error) => {
                 log::error!("failed to render: {error:#}");
                 return;
             }
         };
+
+        // CAMetalLayer drawables rotate; only our own texture retains the preceding frame.
+        self.present_retained_frame(&command_buffer, &frame, drawable.texture(), viewport_size);
 
         if self.presents_with_transaction {
             command_buffer.commit();
@@ -554,18 +628,102 @@ impl MetalRenderer {
         }
     }
 
+    fn present_retained_frame(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        frame: &metal::TextureRef,
+        target: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+    ) {
+        let encoder = new_command_encoder_for_texture(
+            command_buffer,
+            target,
+            viewport_size,
+            Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
+        );
+        encoder.set_render_pipeline_state(&self.frame_present_pipeline_state);
+        encoder.set_fragment_texture(0, Some(frame));
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+        encoder.end_encoding();
+    }
+
+    fn render_retained_frame(
+        &mut self,
+        scene: &Scene,
+        viewport_size: Size<DevicePixels>,
+    ) -> Result<(metal::CommandBuffer, metal::Texture)> {
+        anyhow::ensure!(
+            viewport_size.width.0 > 0 && viewport_size.height.0 > 0,
+            "invalid retained frame size: {viewport_size:?}"
+        );
+        if self.retained_frame.as_ref().is_none_or(|texture| {
+            texture.width() != viewport_size.width.0 as u64
+                || texture.height() != viewport_size.height.0 as u64
+        }) {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(viewport_size.width.0 as u64);
+            descriptor.set_height(viewport_size.height.0 as u64);
+            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            descriptor.set_usage(
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            self.retained_frame = Some(self.device.new_texture(&descriptor));
+            self.retained_frame_valid = false;
+        }
+        if self.frame_failed.swap(false, Ordering::AcqRel) {
+            self.retained_frame_valid = false;
+            for layer in self.cached_layers.values_mut() {
+                layer.valid = false;
+            }
+        }
+        let damage = if self.retained_frame_valid {
+            scene.damage
+        } else {
+            SceneDamage::Full
+        };
+        self.retained_frame_valid = false;
+        let frame = self
+            .retained_frame
+            .as_ref()
+            .expect("retained frame was allocated")
+            .clone();
+        let command_buffer =
+            self.render_frame(scene, &frame, viewport_size, damage, self.opaque)?;
+        self.retained_frame_valid = true;
+        Ok((command_buffer, frame))
+    }
+
     fn render_frame(
         &mut self,
         scene: &Scene,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
+        damage: SceneDamage,
+        opaque: bool,
     ) -> Result<metal::CommandBuffer> {
-        let mut writer = InstanceBufferWriter::new(
-            &self.device,
-            &self.instance_buffer_pool,
-            self.is_unified_memory,
-        );
-        let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
+        self.render_scene_layers(scene)?;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.primitive_upload_bytes = 0;
+        }
+        if damage.pixel_bounds(viewport_size).is_none() {
+            return Ok(self.command_queue.new_command_buffer().to_owned());
+        }
+        let mut staged = std::mem::take(&mut self.staging_scene);
+        let scene = if matches!(damage, SceneDamage::Full) {
+            scene
+        } else {
+            scene.copy_primitives_for_damage(damage, &mut staged);
+            &staged
+        };
+        let result = (|| {
+            let mut writer = InstanceBufferWriter::new(
+                &self.device,
+                &self.instance_buffer_pool,
+                self.is_unified_memory,
+            );
+            let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
             format!(
                 "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
                 scene.paths.len(),
@@ -577,25 +735,39 @@ impl MetalRenderer {
                 scene.surfaces.len(),
             )
         })?;
-        let command_buffer = self.draw_primitives_to_texture(
-            scene,
-            &instance_bindings,
-            &mut writer,
-            texture,
-            viewport_size,
-        )?;
-
-        let instance_buffer_pool = self.instance_buffer_pool.clone();
-        let instance_buffer = Cell::new(Some(writer.finish()));
-        let block = ConcreteBlock::new(move |_| {
-            if let Some(instance_buffer) = instance_buffer.take() {
-                instance_buffer_pool.lock().release(instance_buffer);
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                self.primitive_upload_bytes = writer.offset;
             }
-        });
-        let block = block.copy();
-        command_buffer.add_completed_handler(&block);
+            let command_buffer = self.draw_primitives_to_texture(
+                scene,
+                &instance_bindings,
+                &mut writer,
+                texture,
+                viewport_size,
+                damage,
+                opaque,
+            )?;
 
-        Ok(command_buffer)
+            let instance_buffer_pool = self.instance_buffer_pool.clone();
+            let instance_buffer = Cell::new(Some(writer.finish()));
+            let frame_failed = self.frame_failed.clone();
+            let block = ConcreteBlock::new(move |buffer: &metal::CommandBufferRef| {
+                if buffer.status() == metal::MTLCommandBufferStatus::Error {
+                    frame_failed.store(true, Ordering::Release);
+                    log::error!("Metal frame failed; invalidating retained pixels");
+                }
+                if let Some(instance_buffer) = instance_buffer.take() {
+                    instance_buffer_pool.lock().release(instance_buffer);
+                }
+            });
+            let block = block.copy();
+            command_buffer.add_completed_handler(&block);
+
+            Ok(command_buffer)
+        })();
+        self.staging_scene = staged;
+        result
     }
 
     /// Renders the scene to a texture and returns the pixel data as an RGBA image.
@@ -619,7 +791,13 @@ impl MetalRenderer {
             .next_drawable()
             .ok_or_else(|| anyhow::anyhow!("Failed to get drawable for render_to_image"))?;
 
-        let command_buffer = self.render_frame(scene, drawable.texture(), viewport_size)?;
+        let command_buffer = self.render_frame(
+            scene,
+            drawable.texture(),
+            viewport_size,
+            SceneDamage::Full,
+            self.opaque,
+        )?;
 
         // Commit and wait for completion without presenting
         command_buffer.commit();
@@ -638,6 +816,26 @@ impl MetalRenderer {
         scene: &Scene,
         size: Size<DevicePixels>,
     ) -> Result<RgbaImage> {
+        self.render_scene_image(scene, size, false)
+    }
+
+    /// Exercise the window's retained rendering and presentation path without a drawable.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn render_retained_scene_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<RgbaImage> {
+        self.render_scene_image(scene, size, true)
+    }
+
+    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+    fn render_scene_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        retained: bool,
+    ) -> Result<RgbaImage> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             anyhow::bail!("Invalid size for render_scene_to_image: {:?}", size);
         }
@@ -652,7 +850,13 @@ impl MetalRenderer {
         texture_descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
         let target_texture = self.device.new_texture(&texture_descriptor);
 
-        let command_buffer = self.render_frame(scene, &target_texture, size)?;
+        let command_buffer = if retained {
+            let (command_buffer, frame) = self.render_retained_frame(scene, size)?;
+            self.present_retained_frame(&command_buffer, &frame, &target_texture, size);
+            command_buffer
+        } else {
+            self.render_frame(scene, &target_texture, size, SceneDamage::Full, self.opaque)?
+        };
 
         // On discrete GPUs (non-unified memory), Managed textures require an
         // explicit blit synchronize before the CPU can read back the rendered
@@ -666,6 +870,11 @@ impl MetalRenderer {
         // Commit and wait for completion
         command_buffer.commit();
         command_buffer.wait_until_completed();
+
+        anyhow::ensure!(
+            command_buffer.status() == metal::MTLCommandBufferStatus::Completed,
+            "Metal image rendering failed"
+        );
 
         read_texture_to_image(&target_texture)
     }
@@ -702,7 +911,8 @@ impl MetalRenderer {
             .clone()
             .expect("just ensured the render target exists");
 
-        let command_buffer = self.render_frame(scene, &target_texture, size)?;
+        let command_buffer =
+            self.render_frame(scene, &target_texture, size, SceneDamage::Full, self.opaque)?;
 
         // Commit without waiting, mirroring presentation to a real window where
         // the CPU doesn't block on the GPU.
@@ -717,118 +927,160 @@ impl MetalRenderer {
         writer: &mut InstanceBufferWriter,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
+        damage: SceneDamage,
+        opaque: bool,
     ) -> Result<metal::CommandBuffer> {
-        self.render_scene_layers(scene)?;
-        let scratch_size = visible_path_bounds(&scene.paths, viewport_size).map_or(
-            size(DevicePixels(0), DevicePixels(0)),
-            |bounds| {
-                size(
-                    DevicePixels(
-                        ((bounds.right().0.ceil() - bounds.origin.x.0.floor()) as i32)
-                            .min(PATH_TILE_SIZE),
-                    ),
-                    DevicePixels(
-                        ((bounds.bottom().0.ceil() - bounds.origin.y.0.floor()) as i32)
-                            .min(PATH_TILE_SIZE),
-                    ),
-                )
-            },
-        );
-        self.update_path_intermediate_textures(scratch_size);
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
-        let alpha = if self.opaque { 1. } else { 0. };
+        let alpha = if opaque { 1. } else { 0. };
 
-        let mut command_encoder = new_command_encoder_for_texture(
-            command_buffer,
-            texture,
-            viewport_size,
-            Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
-        );
+        for damage_bounds in damage.pixel_rects(viewport_size) {
+            let region =
+                SceneDamage::Partial(damage_bounds.map(|pixel| ScaledPixels(pixel.0 as f32)));
+            let path_bounds = scene
+                .path_bounds_for_damage(region, 0..scene.paths.len())
+                .and_then(|bounds| SceneDamage::Partial(bounds).pixel_bounds(viewport_size));
+            let extent = |value: f32| {
+                let pixels = (value as i32).min(PATH_TILE_SIZE);
+                // Small animation changes should not allocate a differently sized texture each frame.
+                let pixels = if !matches!(damage, SceneDamage::Full) {
+                    ((pixels + 63) / 64) * 64
+                } else {
+                    pixels
+                };
+                DevicePixels(pixels.min(PATH_TILE_SIZE))
+            };
+            let scratch_size =
+                path_bounds.map_or(size(DevicePixels(0), DevicePixels(0)), |bounds| {
+                    size(
+                        extent(bounds.size.width.0 as f32),
+                        extent(bounds.size.height.0 as f32),
+                    )
+                });
+            self.update_path_intermediate_textures(scratch_size);
+            let scissor = metal::MTLScissorRect {
+                x: damage_bounds.origin.x.0 as u64,
+                y: damage_bounds.origin.y.0 as u64,
+                width: damage_bounds.size.width.0 as u64,
+                height: damage_bounds.size.height.0 as u64,
+            };
 
-        for batch in scene.batches() {
-            match batch {
-                PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
-                }
-                PrimitiveBatch::Quads(range) => {
-                    self.draw_quads(range, instance_bindings, viewport_size, command_encoder)
-                }
-                PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    let Some(bounds) = visible_path_bounds(paths, viewport_size) else {
-                        continue;
-                    };
-                    let left = bounds.origin.x.0.floor() as i32;
-                    let top = bounds.origin.y.0.floor() as i32;
-                    let right = bounds.right().0.ceil() as i32;
-                    let bottom = bounds.bottom().0.ceil() as i32;
-                    for y in (top..bottom).step_by(PATH_TILE_SIZE as usize) {
-                        for x in (left..right).step_by(PATH_TILE_SIZE as usize) {
-                            let tile = Bounds::new(
-                                point(ScaledPixels(x as f32), ScaledPixels(y as f32)),
-                                size(
-                                    ScaledPixels((right - x).min(PATH_TILE_SIZE) as f32),
-                                    ScaledPixels((bottom - y).min(PATH_TILE_SIZE) as f32),
-                                ),
-                            );
-                            if !paths
-                                .iter()
-                                .any(|path| nonempty_bounds(path.clipped_bounds().intersect(&tile)))
-                            {
-                                continue;
-                            }
-                            command_encoder.end_encoding();
-                            self.draw_paths_to_intermediate(paths, writer, tile, command_buffer)?;
-                            command_encoder = new_command_encoder_for_texture(
-                                command_buffer,
-                                texture,
-                                viewport_size,
-                                None,
-                            );
-                            if let Err(error) = self.draw_paths_from_intermediate(
-                                tile,
-                                writer,
-                                viewport_size,
-                                command_encoder,
-                            ) {
+            let mut command_encoder = new_command_encoder_for_texture(
+                command_buffer,
+                texture,
+                viewport_size,
+                matches!(damage, SceneDamage::Full)
+                    .then(|| metal::MTLClearColor::new(0., 0., 0., alpha)),
+            );
+            command_encoder.set_scissor_rect(scissor);
+            if !matches!(damage, SceneDamage::Full) {
+                command_encoder.set_render_pipeline_state(&self.frame_clear_pipeline_state);
+                let clear_color = [0f32, 0., 0., alpha as f32];
+                command_encoder.set_fragment_bytes(
+                    0,
+                    mem::size_of_val(&clear_color) as u64,
+                    clear_color.as_ptr().cast(),
+                );
+                command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+            }
+
+            for batch in scene.batches_for_damage(region) {
+                match batch {
+                    PrimitiveBatch::Shadows(range) => {
+                        self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
+                    }
+                    PrimitiveBatch::Quads(range) => {
+                        self.draw_quads(range, instance_bindings, viewport_size, command_encoder)
+                    }
+                    PrimitiveBatch::Paths(range) => {
+                        let Some(bounds) = scene
+                            .path_bounds_for_damage(region, range.clone())
+                            .and_then(|bounds| {
+                                SceneDamage::Partial(bounds).pixel_bounds(viewport_size)
+                            })
+                        else {
+                            continue;
+                        };
+                        let paths = &scene.paths[range];
+                        let left = bounds.origin.x.0;
+                        let top = bounds.origin.y.0;
+                        let right = bounds.right().0;
+                        let bottom = bounds.bottom().0;
+                        for y in (top..bottom).step_by(PATH_TILE_SIZE as usize) {
+                            for x in (left..right).step_by(PATH_TILE_SIZE as usize) {
+                                let tile = Bounds::new(
+                                    point(ScaledPixels(x as f32), ScaledPixels(y as f32)),
+                                    size(
+                                        ScaledPixels((right - x).min(PATH_TILE_SIZE) as f32),
+                                        ScaledPixels((bottom - y).min(PATH_TILE_SIZE) as f32),
+                                    ),
+                                );
+                                if !paths.iter().any(|path| {
+                                    nonempty_bounds(path.clipped_bounds().intersect(&tile))
+                                }) {
+                                    continue;
+                                }
                                 command_encoder.end_encoding();
-                                return Err(error);
+                                self.draw_paths_to_intermediate(
+                                    paths,
+                                    writer,
+                                    tile,
+                                    command_buffer,
+                                )?;
+                                command_encoder = new_command_encoder_for_texture(
+                                    command_buffer,
+                                    texture,
+                                    viewport_size,
+                                    None,
+                                );
+                                command_encoder.set_scissor_rect(scissor);
+                                if let Err(error) = self.draw_paths_from_intermediate(
+                                    tile,
+                                    writer,
+                                    viewport_size,
+                                    command_encoder,
+                                ) {
+                                    command_encoder.end_encoding();
+                                    return Err(error);
+                                }
                             }
                         }
                     }
-                }
-                PrimitiveBatch::Underlines(range) => {
-                    self.draw_underlines(range, instance_bindings, viewport_size, command_encoder)
-                }
-                PrimitiveBatch::MonochromeSprites { texture_id, range } => self
-                    .draw_monochrome_sprites(
-                        texture_id,
+                    PrimitiveBatch::Underlines(range) => self.draw_underlines(
                         range,
                         instance_bindings,
                         viewport_size,
                         command_encoder,
                     ),
-                PrimitiveBatch::PolychromeSprites { texture_id, range } => self
-                    .draw_polychrome_sprites(
-                        texture_id,
-                        range,
+                    PrimitiveBatch::MonochromeSprites { texture_id, range } => self
+                        .draw_monochrome_sprites(
+                            texture_id,
+                            range,
+                            instance_bindings,
+                            viewport_size,
+                            command_encoder,
+                        ),
+                    PrimitiveBatch::PolychromeSprites { texture_id, range } => self
+                        .draw_polychrome_sprites(
+                            texture_id,
+                            range,
+                            instance_bindings,
+                            viewport_size,
+                            command_encoder,
+                        ),
+                    PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
+                        &scene.surfaces[range.clone()],
+                        range.start,
                         instance_bindings,
                         viewport_size,
                         command_encoder,
                     ),
-                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
-                    &scene.surfaces[range.clone()],
-                    range.start,
-                    instance_bindings,
-                    viewport_size,
-                    command_encoder,
-                ),
-                PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                    PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                }
             }
-        }
 
-        command_encoder.end_encoding();
+            command_encoder.end_encoding();
+        }
 
         Ok(command_buffer.to_owned())
     }
@@ -849,11 +1101,8 @@ impl MetalRenderer {
 
     /// Render dirty cached view layers before the main pass composites them.
     ///
-    /// Each layer gets its own instance buffer and command buffer. Waiting here is conservative
-    /// but correct: the main pass samples the layer texture and reuses the shared path
-    /// intermediate texture, neither of which may still be written by an in-flight layer pass.
-    /// Cached layers redraw only when their view is dirty; the resize fast path merely
-    /// composites the retained texture and does not wait.
+    /// Commands on the shared queue execute in order; completion handlers retain each layer's
+    /// instance buffer until the GPU finishes and invalidate cached pixels on failure.
     fn render_scene_layers(&mut self, scene: &Scene) -> Result<()> {
         for layer in &scene.layers {
             if layer.size.width.0 <= 0 || layer.size.height.0 <= 0 {
@@ -880,11 +1129,19 @@ impl MetalRenderer {
                         texture: self.device.new_texture(&descriptor),
                         width,
                         height,
+                        valid: false,
                     },
                 );
             }
 
-            if !layer.needs_render && !recreate {
+            let valid = self
+                .cached_layers
+                .get(&layer.id.0)
+                .is_some_and(|layer| layer.valid);
+            if !layer.needs_render && valid {
+                if let Some(scene) = layer.scene.as_deref() {
+                    self.render_scene_layers(scene)?;
+                }
                 continue;
             }
             let Some(layer_scene) = layer.scene.as_deref() else {
@@ -896,9 +1153,23 @@ impl MetalRenderer {
                 .expect("the layer texture was ensured above")
                 .texture
                 .clone();
-            let command_buffer = self.render_frame(layer_scene, &texture, layer.size)?;
+            let damage = if valid {
+                layer_scene.damage
+            } else {
+                SceneDamage::Full
+            };
+            let command_buffer =
+                match self.render_frame(layer_scene, &texture, layer.size, damage, false) {
+                    Ok(command_buffer) => command_buffer,
+                    Err(error) => {
+                        self.cached_layers.remove(&layer.id.0);
+                        return Err(error);
+                    }
+                };
             command_buffer.commit();
-            command_buffer.wait_until_completed();
+            if let Some(layer) = self.cached_layers.get_mut(&layer.id.0) {
+                layer.valid = true;
+            }
         }
         Ok(())
     }
@@ -1466,6 +1737,7 @@ fn build_pipeline_state(
     vertex_fn_name: &str,
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
+    premultiplied: bool,
 ) -> metal::RenderPipelineState {
     let vertex_fn = library
         .get_function(vertex_fn_name, None)
@@ -1483,10 +1755,14 @@ fn build_pipeline_state(
     color_attachment.set_blending_enabled(true);
     color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
     color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
-    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+    color_attachment.set_source_rgb_blend_factor(if premultiplied {
+        metal::MTLBlendFactor::One
+    } else {
+        metal::MTLBlendFactor::SourceAlpha
+    });
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -1520,7 +1796,7 @@ fn build_path_sprite_pipeline_state(
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -1821,22 +2097,4 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
 fn nonempty_bounds(bounds: Bounds<ScaledPixels>) -> bool {
     bounds.size.width.0 > 0. && bounds.size.height.0 > 0.
-}
-
-fn visible_path_bounds(
-    paths: &[Path<ScaledPixels>],
-    viewport: Size<DevicePixels>,
-) -> Option<Bounds<ScaledPixels>> {
-    let viewport = Bounds::new(
-        point(ScaledPixels(0.), ScaledPixels(0.)),
-        size(
-            ScaledPixels(viewport.width.0 as f32),
-            ScaledPixels(viewport.height.0 as f32),
-        ),
-    );
-    paths
-        .iter()
-        .map(|path| path.clipped_bounds().intersect(&viewport))
-        .filter(|bounds| nonempty_bounds(*bounds))
-        .reduce(|a, b| a.union(&b))
 }
