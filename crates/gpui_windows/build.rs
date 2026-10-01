@@ -1,11 +1,60 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
+    // The target rather than `cfg!(target_os)`, which is this script's host: a build for Windows
+    // from another host needs the translated shaders too.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    #[cfg_attr(
+        not(all(target_os = "windows", not(debug_assertions))),
+        allow(unused_variables)
+    )]
+    let wgsl_shaders = wgsl_translation::translate_wgsl_shaders();
+
     #[cfg(target_os = "windows")]
     {
         // Compile HLSL shaders
         #[cfg(not(debug_assertions))]
-        compile_shaders();
+        compile_shaders(&wgsl_shaders);
+    }
+}
+
+mod wgsl_translation {
+    use std::{env, fs, path::PathBuf, process};
+
+    use gpui_shader_build::{SHAPES, Target, Translation, translate};
+
+    pub struct WgslShaders {
+        pub source_path: PathBuf,
+        pub translation: Translation,
+    }
+
+    /// Writes the HLSL translation of the primitives drawn from `gpui_wgpu`'s WGSL, and the Rust
+    /// constants the renderer binds them with, to `OUT_DIR`.
+    pub fn translate_wgsl_shaders() -> WgslShaders {
+        for path in gpui_shader_build::wgsl_source_paths() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+        let translation = match translate(Target::Direct3D11, &[SHAPES]) {
+            Ok(translation) => translation,
+            Err(error) => {
+                println!("cargo::error=WGSL shader translation failed:\n{error}");
+                process::exit(1);
+            }
+        };
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+        let source_path = out_dir.join("wgsl_shaders.hlsl");
+        fs::write(&source_path, &translation.source).unwrap();
+        fs::write(
+            out_dir.join("wgsl_shaders.rs"),
+            translation.rust_constants(),
+        )
+        .unwrap();
+        WgslShaders {
+            source_path,
+            translation,
+        }
     }
 }
 
@@ -18,7 +67,9 @@ mod shader_compilation {
         process::{self, Command},
     };
 
-    pub fn compile_shaders() {
+    use crate::wgsl_translation::WgslShaders;
+
+    pub fn compile_shaders(wgsl_shaders: &WgslShaders) {
         let shader_path =
             PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/shaders.hlsl");
         let out_dir = std::env::var("OUT_DIR").unwrap();
@@ -66,6 +117,26 @@ mod shader_compilation {
                 shader_path.to_str().unwrap(),
                 &rust_binding_path,
             );
+        }
+
+        let wgsl_shader_path = wgsl_shaders.source_path.to_str().unwrap();
+        for primitive in &wgsl_shaders.translation.primitives {
+            for (entry_point, target, stage) in [
+                (&primitive.vertex_entry_point, "vs_5_0", "VERTEX"),
+                (&primitive.fragment_entry_point, "ps_5_0", "FRAGMENT"),
+            ] {
+                let output_file = format!("{out_dir}/{entry_point}.h");
+                let const_name = format!("{}_{stage}_BYTES", primitive.primitive.name);
+                compile_shader_impl(
+                    &fxc_path,
+                    entry_point,
+                    &output_file,
+                    &const_name,
+                    wgsl_shader_path,
+                    target,
+                );
+                generate_rust_binding(&const_name, &output_file, &rust_binding_path);
+            }
         }
     }
 

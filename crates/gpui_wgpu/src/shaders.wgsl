@@ -1104,6 +1104,273 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     return blend_color(input.color, alpha);
 }
 
+// --- shapes --- //
+
+// `gpui::Shape`. Every `vec4` sits on a 16-byte boundary, matching the Rust layout.
+struct Shape {
+    order: u32,
+    outline: u32,
+    material: u32,
+    flags: u32,
+    bounds: Bounds,
+    content_mask: Bounds,
+    content_fade: ContentFade,
+    params: vec4<f32>,
+    transform: vec4<f32>,
+    placement: vec4<f32>,
+    lighting: vec4<f32>,
+    colors: array<Hsla, 4>,
+}
+
+const SHAPE_MIRROR: u32 = 1u;
+const SHAPE_SHADOW_HALO: u32 = 2u;
+
+struct ShapeVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) shape_id: u32,
+    //TODO: use `clip_distance` once Naga supports it
+    @location(1) clip_distances: vec4<f32>,
+    @location(2) @interpolate(flat) primary: vec4<f32>,
+    @location(3) @interpolate(flat) secondary: vec4<f32>,
+    @location(4) @interpolate(flat) deep: vec4<f32>,
+    @location(5) @interpolate(flat) rim: vec4<f32>,
+}
+
+@vertex
+fn vs_shape(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> ShapeVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let shape = load_shape(instance_id);
+
+    var out = ShapeVarying();
+    out.position = to_device_position(unit_vertex, shape.bounds);
+    out.shape_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, shape.bounds, shape.content_mask);
+    out.primary = hsla_to_rgba(shape.colors[0]);
+    out.secondary = hsla_to_rgba(shape.colors[1]);
+    out.deep = hsla_to_rgba(shape.colors[2]);
+    out.rim = hsla_to_rgba(shape.colors[3]);
+    return out;
+}
+
+fn shape_dot2(v: vec2<f32>) -> f32 {
+    return dot(v, v);
+}
+
+// Turns +x toward +y: clockwise on screen.
+fn shape_rotate(v: vec2<f32>, angle: f32) -> vec2<f32> {
+    let c = cos(angle);
+    let s = sin(angle);
+    return vec2<f32>(c * v.x - s * v.y, s * v.x + c * v.y);
+}
+
+// The angle of `q` from straight up. The tiny bias keeps `atan2(0, 0)` defined at the centre.
+fn shape_angle_from_up(q: vec2<f32>) -> f32 {
+    return atan2(q.x, -q.y - 1e-7);
+}
+
+fn shape_polar(q: vec2<f32>, lobes: f32, inner: f32, sharpness: f32) -> f32 {
+    // Lifting the swing before the power rounds the bottom of each notch, so the outline turns
+    // smoothly through it even when `sharpness` is below one. Without it the outline's slope jumps
+    // there, and so does every distance estimated from it.
+    let lift = 0.04;
+    let swing = max(0.5 + 0.5 * cos(lobes * shape_angle_from_up(q)), 0.0) + lift;
+    let low = pow(lift, sharpness);
+    let profile = (pow(swing, sharpness) - low) / (pow(1.0 + lift, sharpness) - low);
+    let radius = inner + (1.0 - inner) * profile;
+    let reach = length(q);
+    // Inside, dividing by the radius keeps the field smooth at the centre, where the angle changes
+    // fastest. Outside, subtracting it keeps the angle's pull from growing with the distance, which
+    // would streak halos out past the flanks.
+    return select(reach - radius, reach / radius - 1.0, reach < radius);
+}
+
+// Inigo Quilez's regular polygon, turned so a vertex points up, shrunk by the rounding so the
+// rounded corners stay inside the unit circle.
+fn shape_polygon(q: vec2<f32>, sides: f32, rounding: f32) -> f32 {
+    let half_sector = M_PI_F / sides;
+    let corner = vec2<f32>(cos(half_sector), sin(half_sector));
+    let angle = shape_angle_from_up(q);
+    let sector = 2.0 * half_sector;
+    let folded = angle - sector * floor(angle / sector) - half_sector;
+    var point = length(q) * vec2<f32>(cos(folded), abs(sin(folded)));
+    let radius = 1.0 - rounding;
+    point -= radius * corner;
+    point.y += clamp(-point.y, 0.0, radius * corner.y);
+    return length(point) * sign(point.x) - rounding;
+}
+
+fn shape_superellipse(q: vec2<f32>, exponent: f32) -> f32 {
+    let magnitude = abs(q) + vec2<f32>(1e-6);
+    // Normalising by the larger axis keeps the powers finite far from the outline.
+    let largest = max(magnitude.x, magnitude.y);
+    let ratio = magnitude / largest;
+    return largest * pow(pow(ratio.x, exponent) + pow(ratio.y, exponent), 1.0 / exponent) - 1.0;
+}
+
+// Inigo Quilez's heart, whose point sits at the origin with the lobes above it, flipped to point
+// down and fitted to the unit circle.
+fn shape_heart(q: vec2<f32>, rounding: f32) -> f32 {
+    var h = vec2<f32>(q.x, -q.y) * 0.56 * (1.0 + rounding) + vec2<f32>(0.0, 0.56);
+    h.x = abs(h.x);
+    var distance: f32;
+    if (h.y + h.x > 1.0) {
+        distance = sqrt(shape_dot2(h - vec2<f32>(0.25, 0.75))) - sqrt(2.0) / 4.0;
+    } else {
+        distance = sqrt(min(shape_dot2(h - vec2<f32>(0.0, 1.0)),
+                            shape_dot2(h - vec2<f32>(0.5 * max(h.x + h.y, 0.0)))))
+            * sign(h.x - h.y);
+    }
+    return distance / 0.56 - rounding;
+}
+
+fn shape_capsule(q: vec2<f32>, half_length: f32) -> f32 {
+    let along = q.y - clamp(q.y, -half_length, half_length);
+    return length(vec2<f32>(q.x, along)) - 1.0;
+}
+
+// Inigo Quilez's uneven capsule, turned to point up: the unit circle and a circle of radius `tip`
+// `reach` above it, joined by their common tangents. A point circle that fits inside the unit
+// circle leaves just the circle.
+fn shape_drop(q: vec2<f32>, reach: f32, tip: f32) -> f32 {
+    let slope = (1.0 - tip) / max(reach, 1e-4);
+    if (slope >= 1.0) {
+        return length(q) - 1.0;
+    }
+    let rise = sqrt(1.0 - slope * slope);
+    let p = vec2<f32>(abs(q.x), -q.y);
+    let along = dot(p, vec2<f32>(-slope, rise));
+    if (along < 0.0) {
+        return length(p) - 1.0;
+    }
+    if (along > rise * reach) {
+        return length(p - vec2<f32>(0.0, reach)) - tip;
+    }
+    return dot(p, vec2<f32>(rise, slope)) - 1.0;
+}
+
+// The outline's field at a bounds-space point: negative inside, zero on the outline. It is not a
+// distance; callers divide by its gradient's length.
+fn shape_field(shape: Shape, point: vec2<f32>) -> f32 {
+    var mirrored = point;
+    if ((shape.flags & SHAPE_MIRROR) != 0u) {
+        mirrored.x = abs(mirrored.x);
+    }
+    let offset = mirrored - shape.placement.xy;
+    var q = vec2<f32>(
+        shape.transform.x * offset.x + shape.transform.y * offset.y,
+        shape.transform.z * offset.x + shape.transform.w * offset.y,
+    );
+    let warp = shape.placement.z;
+    if (warp > 0.0) {
+        let phase = shape.placement.w;
+        q += warp * vec2<f32>(
+            sin(2.3 * q.y + phase) + 0.5 * sin(3.1 * q.x - 2.0 * phase + 1.0),
+            cos(2.1 * q.x - phase) + 0.5 * sin(2.9 * q.y + 2.0 * phase + 2.0),
+        );
+    }
+
+    let params = shape.params;
+    var value: f32;
+    switch (shape.outline) {
+        case 1u: { value = shape_polar(q, params.x, params.y, params.z); }
+        case 2u: { value = shape_polygon(q, params.x, params.y); }
+        case 3u: { value = shape_superellipse(q, params.x); }
+        case 4u: { value = shape_heart(q, params.x); }
+        case 5u: { value = shape_capsule(q, params.x); }
+        case 6u: { value = shape_drop(q, params.x, params.y); }
+        default: { value = length(q) - 1.0; }
+    }
+    return value;
+}
+
+@fragment
+fn fs_shape(input: ShapeVarying) -> @location(0) vec4<f32> {
+    // Alpha clip first, since we don't have `clip_distance`.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let shape = load_shape(input.shape_id);
+    let half_extent = max(0.5 * min(shape.bounds.size.x, shape.bounds.size.y), 1e-3);
+    let center = shape.bounds.origin + 0.5 * shape.bounds.size;
+    let point = (input.position.xy - center) / half_extent;
+    let pixel = 1.0 / half_extent;
+
+    // A signed distance estimate from the field and its gradient, which works for every outline
+    // and survives the transform and the warp.
+    let epsilon = 0.35 * pixel;
+    let value = shape_field(shape, point);
+    let gradient = vec2<f32>(
+        shape_field(shape, point + vec2<f32>(epsilon, 0.0)) - value,
+        shape_field(shape, point + vec2<f32>(0.0, epsilon)) - value,
+    ) / epsilon;
+    let gradient_length = max(length(gradient), 1e-3);
+    let distance = value / gradient_length;
+    let normal = gradient / gradient_length;
+    let coverage = saturate(0.5 - distance / pixel);
+
+    // The outline's drawn radius, for widths that grow with it.
+    let determinant = shape.transform.x * shape.transform.w - shape.transform.y * shape.transform.z;
+    let radius = inverseSqrt(max(abs(determinant), 1e-6));
+    // Fades the halo out before the quad's edge would cut it off.
+    let edge = 0.5 * shape.bounds.size / half_extent - abs(point);
+    let edge_fade = saturate(min(edge.x, edge.y) / 0.08);
+
+    var color: vec3<f32>;
+    var alpha: f32;
+    if (shape.material == 1u) {
+        let halo = exp(-max(distance, 0.0) / 0.06) * 0.35 * shape.lighting.w * edge_fade
+            * (1.0 - coverage);
+        color = input.primary.rgb * (coverage + halo);
+        alpha = coverage + halo;
+    } else {
+        let depth = max(-distance, 0.0);
+
+        // Two coloured lights inside a deep body, fixed to the screen rather than the outline's
+        // rotation, turned together by the flow angle.
+        let local = (point - shape.placement.xy) / radius;
+        let primary_light = shape_rotate(vec2<f32>(-0.525, -0.5), shape.lighting.y);
+        let secondary_light = shape_rotate(vec2<f32>(0.5625, 0.525), shape.lighting.y);
+        let primary_weight = exp(-shape_dot2(local - primary_light) / 0.47);
+        let secondary_weight = exp(-shape_dot2(local - secondary_light) / 0.47);
+        var body = input.deep.rgb;
+        body = mix(body, input.primary.rgb, saturate(primary_weight * 0.8));
+        body = mix(body, input.secondary.rgb, saturate(secondary_weight * 0.8));
+        let hue = mix(input.secondary.rgb, input.primary.rgb,
+                      primary_weight / (primary_weight + secondary_weight + 1e-4));
+
+        // A key light and a back light roughly opposite it catch the rim.
+        let key_direction = vec2<f32>(cos(shape.lighting.x), sin(shape.lighting.x));
+        let back_direction = vec2<f32>(cos(shape.lighting.x + 3.65), sin(shape.lighting.x + 3.65));
+        let shine = 0.08
+            + pow(max(dot(normal, key_direction), 0.0), 1.8)
+            + pow(max(dot(normal, back_direction), 0.0), 2.4);
+
+        // A frosted band inside the edge, then a thin bright rim line.
+        let band = exp(-depth / (0.075 * radius));
+        body = mix(body, mix(hue, input.rim.rgb, 0.55), saturate(band * shine));
+        let rim_line = exp(-depth / max(1.8 * pixel, 0.006));
+        body = mix(body, input.rim.rgb, saturate(rim_line * shine * 1.3 * shape.lighting.z));
+
+        var halo = exp(-max(distance, 0.0) / (0.07 * radius)) * 0.3 * clamp(shine, 0.0, 1.2);
+        var halo_color = mix(hue, input.rim.rgb, 0.5);
+        if ((shape.flags & SHAPE_SHADOW_HALO) != 0u) {
+            let shadow_distance =
+                shape_field(shape, point - vec2<f32>(0.0, 0.075 * radius)) / gradient_length;
+            halo = exp(-max(shadow_distance, 0.0) / (0.112 * radius)) * 0.32;
+            halo_color = input.deep.rgb * 0.6;
+        }
+        halo *= shape.lighting.w * edge_fade * (1.0 - coverage);
+        color = body * coverage + halo_color * halo;
+        alpha = coverage + halo;
+    }
+
+    alpha = saturate(alpha);
+    let straight = color / max(alpha, 1e-4);
+    let fade = fade_alpha(input.position.y, fade_vector(shape.content_fade));
+    return blend_color(vec4<f32>(straight, alpha * input.primary.a), fade);
+}
+
 // --- path rasterization --- //
 
 struct PathRasterizationVertex {

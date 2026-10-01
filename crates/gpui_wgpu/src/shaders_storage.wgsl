@@ -7,6 +7,7 @@
 
 @group(1) @binding(0) var<storage, read> b_quads: array<Quad>;
 @group(1) @binding(0) var<storage, read> b_shadows: array<Shadow>;
+@group(1) @binding(0) var<storage, read> b_shapes: array<Shape>;
 @group(1) @binding(0) var<storage, read> b_path_vertices: array<PathRasterizationVertex>;
 @group(1) @binding(0) var<storage, read> b_path_sprites: array<PathSprite>;
 @group(1) @binding(0) var<storage, read> b_underlines: array<Underline>;
@@ -19,6 +20,10 @@ fn load_quad(instance_id: u32) -> Quad {
 
 fn load_shadow(instance_id: u32) -> Shadow {
     return b_shadows[instance_id];
+}
+
+fn load_shape(instance_id: u32) -> Shape {
+    return b_shapes[instance_id];
 }
 
 fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {

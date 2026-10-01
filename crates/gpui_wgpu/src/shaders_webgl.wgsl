@@ -61,6 +61,10 @@ fn read_vec2_i32(cursor: ptr<function, InstanceCursor>) -> vec2<i32> {
     return vec2<i32>(read_i32(cursor), read_i32(cursor));
 }
 
+fn read_vec4_f32(cursor: ptr<function, InstanceCursor>) -> vec4<f32> {
+    return vec4<f32>(read_f32(cursor), read_f32(cursor), read_f32(cursor), read_f32(cursor));
+}
+
 fn read_hsla(cursor: ptr<function, InstanceCursor>) -> Hsla {
     return Hsla(
         read_f32(cursor),
@@ -173,6 +177,29 @@ fn load_shadow(instance_id: u32) -> Shadow {
         read_corners(&cursor),
         read_word(&cursor),
         read_word(&cursor),
+    );
+}
+
+fn load_shape(instance_id: u32) -> Shape {
+    var cursor = instance_cursor(instance_id * 48u);
+    return Shape(
+        read_word(&cursor),
+        read_word(&cursor),
+        read_word(&cursor),
+        read_word(&cursor),
+        read_bounds(&cursor),
+        read_bounds(&cursor),
+        read_fade(&cursor),
+        read_vec4_f32(&cursor),
+        read_vec4_f32(&cursor),
+        read_vec4_f32(&cursor),
+        read_vec4_f32(&cursor),
+        array<Hsla, 4>(
+            read_hsla(&cursor),
+            read_hsla(&cursor),
+            read_hsla(&cursor),
+            read_hsla(&cursor),
+        ),
     );
 }
 

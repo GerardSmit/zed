@@ -1,0 +1,15 @@
+[package]
+name = "gpui_shader_build"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/gpui_shader_build.rs"
+
+[dependencies]
+naga = { version = "29.0.4", features = ["wgsl-in", "msl-out", "hlsl-out"] }

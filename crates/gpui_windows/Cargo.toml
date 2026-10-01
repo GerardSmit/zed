@@ -45,6 +45,9 @@ windows-registry = "0.5"
 workspace = true
 optional = true
 
+[build-dependencies]
+gpui_shader_build.workspace = true
+
 [target.'cfg(target_os = "windows")'.build-dependencies]
 windows-registry = "0.5"
 

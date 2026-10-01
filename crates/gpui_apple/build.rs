@@ -18,9 +18,43 @@ mod macos_build {
         let header_path = generate_shader_bindings();
 
         #[cfg(feature = "runtime_shaders")]
-        emit_stitched_shaders(&header_path);
+        {
+            emit_stitched_shaders(&header_path);
+            translate_wgsl_shaders();
+        }
         #[cfg(not(feature = "runtime_shaders"))]
-        compile_metal_shaders(&header_path);
+        {
+            let shader_path = Path::new("./src/shaders.metal");
+            println!("cargo:rerun-if-changed={}", shader_path.display());
+            compile_metal_library(shader_path, Some(&header_path), "shaders");
+            compile_metal_library(&translate_wgsl_shaders(), None, "wgsl_shaders");
+        }
+    }
+
+    /// Writes the Metal translation of the primitives drawn from `gpui_wgpu`'s WGSL, and the Rust
+    /// constants the renderer binds them with, to `OUT_DIR`.
+    fn translate_wgsl_shaders() -> PathBuf {
+        use gpui_shader_build::{SHAPES, Target, translate};
+
+        for path in gpui_shader_build::wgsl_source_paths() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+        let translation = match translate(Target::Metal, &[SHAPES]) {
+            Ok(translation) => translation,
+            Err(error) => {
+                println!("cargo::error=WGSL shader translation failed:\n{error}");
+                std::process::exit(1);
+            }
+        };
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+        let source_path = out_dir.join("wgsl_shaders.metal");
+        std::fs::write(&source_path, &translation.source).unwrap();
+        std::fs::write(
+            out_dir.join("wgsl_shaders.rs"),
+            translation.rust_constants(),
+        )
+        .unwrap();
+        source_path
     }
 
     fn generate_shader_bindings() -> PathBuf {
@@ -121,16 +155,16 @@ mod macos_build {
         println!("cargo:rerun-if-changed={shader_source_path}");
     }
 
+    /// Compiles `shader_path` into `OUT_DIR/{library_name}.metallib`.
     #[cfg(not(feature = "runtime_shaders"))]
-    fn compile_metal_shaders(header_path: &Path) {
+    fn compile_metal_library(shader_path: &Path, header_path: Option<&Path>, library_name: &str) {
         use std::process::{self, Command};
-        let shader_path = "./src/shaders.metal";
-        let air_output_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.air");
-        let metallib_output_path =
-            PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.metallib");
-        println!("cargo:rerun-if-changed={}", shader_path);
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+        let air_output_path = out_dir.join(format!("{library_name}.air"));
+        let metallib_output_path = out_dir.join(format!("{library_name}.metallib"));
 
-        let output = Command::new("xcrun")
+        let mut command = Command::new("xcrun");
+        command
             .args([
                 "-sdk",
                 "macosx",
@@ -139,18 +173,17 @@ mod macos_build {
                 "-mmacosx-version-min=10.15.7",
                 "-MO",
                 "-c",
-                shader_path,
-                "-include",
-                (header_path.to_str().unwrap()),
-                "-o",
             ])
-            .arg(&air_output_path)
-            .output()
-            .unwrap();
+            .arg(shader_path);
+        if let Some(header_path) = header_path {
+            command.arg("-include").arg(header_path);
+        }
+        let output = command.arg("-o").arg(&air_output_path).output().unwrap();
 
         if !output.status.success() {
             println!(
-                "cargo::error=metal shader compilation failed:\n{}",
+                "cargo::error=metal shader compilation failed for {}:\n{}",
+                shader_path.display(),
                 String::from_utf8_lossy(&output.stderr)
             );
             process::exit(1);

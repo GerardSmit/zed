@@ -47,6 +47,29 @@ pub(crate) type PointF = gpui::Point<f32>;
 const SHADERS_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
 #[cfg(feature = "runtime_shaders")]
 const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitched_shaders.metal"));
+/// The primitives drawn from `gpui_wgpu`'s WGSL, which `gpui_shader_build` translates into a
+/// library of their own.
+#[cfg(not(feature = "runtime_shaders"))]
+const WGSL_SHADERS_METALLIB: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/wgsl_shaders.metallib"));
+#[cfg(feature = "runtime_shaders")]
+const WGSL_SHADERS_SOURCE_FILE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/wgsl_shaders.metal"));
+
+mod wgsl_shaders {
+    include!(concat!(env!("OUT_DIR"), "/wgsl_shaders.rs"));
+}
+
+/// WGSL's `GlobalParams`, which every shader translated from WGSL reads.
+#[repr(C)]
+struct WgslGlobalParams {
+    viewport_size: [f32; 2],
+    premultiplied_alpha: u32,
+    pad: u32,
+}
+
+const _: () = assert!(mem::size_of::<WgslGlobalParams>() == wgsl_shaders::GLOBALS_SIZE);
+const _: () = assert!(mem::size_of::<gpui::Shape>() == wgsl_shaders::SHAPES_INSTANCE_STRIDE);
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
@@ -138,6 +161,7 @@ pub struct MetalRenderer {
     path_sprites_pipeline_state: metal::RenderPipelineState,
     shadows_pipeline_state: metal::RenderPipelineState,
     quads_pipeline_state: metal::RenderPipelineState,
+    shapes_pipeline_state: metal::RenderPipelineState,
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
@@ -262,6 +286,14 @@ impl MetalRenderer {
         let library = device
             .new_library_with_data(SHADERS_METALLIB)
             .expect("error building metal library");
+        #[cfg(feature = "runtime_shaders")]
+        let wgsl_library = device
+            .new_library_with_source(WGSL_SHADERS_SOURCE_FILE, &metal::CompileOptions::new())
+            .expect("error building the metal library translated from WGSL");
+        #[cfg(not(feature = "runtime_shaders"))]
+        let wgsl_library = device
+            .new_library_with_data(WGSL_SHADERS_METALLIB)
+            .expect("error building the metal library translated from WGSL");
 
         fn to_float2_bits(point: PointF) -> u64 {
             let mut output = point.y.to_bits() as u64;
@@ -330,6 +362,15 @@ impl MetalRenderer {
             "quads",
             "quad_vertex",
             "quad_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            false,
+        );
+        let shapes_pipeline_state = build_pipeline_state(
+            &device,
+            &wgsl_library,
+            "shapes",
+            wgsl_shaders::SHAPES_VERTEX_ENTRY_POINT,
+            wgsl_shaders::SHAPES_FRAGMENT_ENTRY_POINT,
             MTLPixelFormat::BGRA8Unorm,
             false,
         );
@@ -420,6 +461,7 @@ impl MetalRenderer {
             path_sprites_pipeline_state,
             shadows_pipeline_state,
             quads_pipeline_state,
+            shapes_pipeline_state,
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
@@ -725,10 +767,11 @@ impl MetalRenderer {
             );
             let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
             format!(
-                "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                "scene too large: {} paths, {} shadows, {} quads, {} shapes, {} underlines, {} mono, {} poly, {} surfaces",
                 scene.paths.len(),
                 scene.shadows.len(),
                 scene.quads.len(),
+                scene.shapes.len(),
                 scene.underlines.len(),
                 scene.monochrome_sprites.len(),
                 scene.polychrome_sprites.len(),
@@ -991,6 +1034,9 @@ impl MetalRenderer {
                     }
                     PrimitiveBatch::Quads(range) => {
                         self.draw_quads(range, instance_bindings, viewport_size, command_encoder)
+                    }
+                    PrimitiveBatch::Shapes(range) => {
+                        self.draw_shapes(range, instance_bindings, viewport_size, command_encoder)
                     }
                     PrimitiveBatch::Paths(range) => {
                         let Some(bounds) = scene
@@ -1338,6 +1384,33 @@ impl MetalRenderer {
             6,
             quads.len() as u64,
             quads.start as u64,
+        );
+    }
+
+    fn draw_shapes(
+        &self,
+        shapes: Range<usize>,
+        instance_bindings: &InstanceBindings,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
+        if shapes.is_empty() {
+            return;
+        }
+
+        command_encoder.set_render_pipeline_state(&self.shapes_pipeline_state);
+        bind_wgsl_inputs(
+            command_encoder,
+            &instance_bindings.shapes,
+            shapes.end * mem::size_of::<gpui::Shape>(),
+            viewport_size,
+        );
+        command_encoder.draw_primitives_instanced_base_instance(
+            metal::MTLPrimitiveType::TriangleStrip,
+            0,
+            4,
+            shapes.len() as u64,
+            shapes.start as u64,
         );
     }
 
@@ -1730,6 +1803,56 @@ fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
     RgbaImage::from_raw(width, height, pixels).context("failed to create RgbaImage from pixel data")
 }
 
+/// Binds what a shader translated from WGSL reads, to both stages: the globals, with straight
+/// alpha, the primitive's instances, and the instance array's byte length, which naga's entry
+/// points take even though nothing reads it with bounds checks off.
+fn bind_wgsl_inputs(
+    command_encoder: &metal::RenderCommandEncoderRef,
+    instances: &InstanceBinding,
+    instance_bytes: usize,
+    viewport_size: Size<DevicePixels>,
+) {
+    let globals = WgslGlobalParams {
+        viewport_size: [viewport_size.width.0 as f32, viewport_size.height.0 as f32],
+        premultiplied_alpha: 0,
+        pad: 0,
+    };
+    let globals_pointer = &globals as *const WgslGlobalParams as *const c_void;
+    let buffer_sizes = [instance_bytes as u32];
+    let buffer_sizes_pointer = buffer_sizes.as_ptr() as *const c_void;
+
+    command_encoder.set_vertex_buffer(
+        wgsl_shaders::INSTANCES_BUFFER_INDEX,
+        Some(&instances.buffer),
+        instances.offset as u64,
+    );
+    command_encoder.set_fragment_buffer(
+        wgsl_shaders::INSTANCES_BUFFER_INDEX,
+        Some(&instances.buffer),
+        instances.offset as u64,
+    );
+    command_encoder.set_vertex_bytes(
+        wgsl_shaders::GLOBALS_BUFFER_INDEX,
+        mem::size_of_val(&globals) as u64,
+        globals_pointer,
+    );
+    command_encoder.set_fragment_bytes(
+        wgsl_shaders::GLOBALS_BUFFER_INDEX,
+        mem::size_of_val(&globals) as u64,
+        globals_pointer,
+    );
+    command_encoder.set_vertex_bytes(
+        wgsl_shaders::BUFFER_SIZES_BUFFER_INDEX,
+        mem::size_of_val(&buffer_sizes) as u64,
+        buffer_sizes_pointer,
+    );
+    command_encoder.set_fragment_bytes(
+        wgsl_shaders::BUFFER_SIZES_BUFFER_INDEX,
+        mem::size_of_val(&buffer_sizes) as u64,
+        buffer_sizes_pointer,
+    );
+}
+
 fn build_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
@@ -1851,6 +1974,7 @@ struct InstanceBinding {
 struct InstanceBindings {
     quads: InstanceBinding,
     shadows: InstanceBinding,
+    shapes: InstanceBinding,
     underlines: InstanceBinding,
     monochrome_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
@@ -1861,6 +1985,7 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
     Ok(InstanceBindings {
         quads: writer.write(&scene.quads)?,
         shadows: writer.write(&scene.shadows)?,
+        shapes: writer.write(&scene.shapes)?,
         underlines: writer.write(&scene.underlines)?,
         monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
         polychrome_sprites: writer.write(&scene.polychrome_sprites)?,

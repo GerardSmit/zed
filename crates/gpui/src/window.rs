@@ -2884,6 +2884,19 @@ impl Window {
         self.rendered_frame.scene.quads.clone()
     }
 
+    /// Returns the shadows and their actual clipping masks from the last painted frame.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_shadows(&self) -> Vec<Shadow> {
+        self.rendered_frame.scene.shadows.clone()
+    }
+
+    /// Returns the analytic shapes in the most recently rendered frame's scene, in scaled pixels,
+    /// like [`Self::painted_quads`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_shapes(&self) -> Vec<crate::Shape> {
+        self.rendered_frame.scene.shapes.clone()
+    }
+
     /// Returns the images (polychrome sprites) in the most recently rendered frame's scene, in
     /// scaled pixels, like [`Self::painted_quads`].
     #[cfg(any(test, feature = "test-support"))]
@@ -4892,6 +4905,65 @@ impl Window {
                 });
             }
         }
+    }
+
+    /// Paint an analytic shape (see [`PaintShape`]) into the scene for the next frame at the
+    /// current z-index. Its antialiasing, rim and halo are computed per pixel, so it stays crisp at
+    /// any scale; keep the halo inside `bounds`, which is where the shader stops drawing.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_shape(&mut self, shape: PaintShape) {
+        self.invalidator.debug_assert_paint();
+
+        let opacity = self.element_opacity();
+        if opacity <= 0. || shape.bounds.is_empty() {
+            return;
+        }
+        let Some((transform, offset)) = shape.transform.inverse() else {
+            return;
+        };
+        let (outline, params) = shape.outline.encode();
+        let mut flags = if shape.mirror { crate::Shape::MIRROR } else { 0 };
+        let (material, lighting, colors) = match shape.material {
+            crate::ShapeMaterial::Glass(glass) => {
+                if glass.halo_style == crate::ShapeHalo::Shadow {
+                    flags |= crate::Shape::SHADOW_HALO;
+                }
+                (
+                    0,
+                    [
+                        glass.light_angle,
+                        glass.flow_angle,
+                        glass.rim_strength.max(0.),
+                        glass.halo.max(0.),
+                    ],
+                    [
+                        glass.primary,
+                        glass.secondary,
+                        glass.deep,
+                        glass.rim,
+                    ],
+                )
+            }
+            crate::ShapeMaterial::Glow { color, halo } => (
+                1,
+                [0., 0., 0., halo.max(0.)],
+                [color, Hsla::default(), Hsla::default(), Hsla::default()],
+            ),
+        };
+        self.next_frame.scene.insert_primitive(crate::Shape {
+            order: 0,
+            outline,
+            material,
+            flags,
+            bounds: self.snap_bounds(shape.bounds),
+            content_mask: self.snapped_content_mask(),
+            params,
+            transform,
+            placement: [offset[0], offset[1], shape.warp.max(0.), shape.warp_phase],
+            lighting,
+            colors: colors.map(|color| color.opacity(opacity)),
+        });
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
@@ -8006,6 +8078,69 @@ impl PaintQuad {
             background: background.into(),
             ..self
         }
+    }
+}
+
+/// An analytic shape to paint with [`Window::paint_shape`]: an outline (a circle, star, polygon,
+/// squircle, heart or capsule) placed in `bounds` by a transform and shaded as lit glass or as a
+/// flat glow.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaintShape {
+    /// The quad drawn. Its largest centred square is the transform's -1 to 1 space.
+    pub bounds: Bounds<Pixels>,
+    /// The outline to fill.
+    pub outline: crate::ShapeOutline,
+    /// Where the outline sits in `bounds`.
+    pub transform: crate::ShapeTransform,
+    /// Also draw the outline mirrored across the vertical centre line of `bounds`: one call
+    /// paints a pair of eyes.
+    pub mirror: bool,
+    /// A liquid wobble: how far the outline's space is displaced, in radii. 0 for none.
+    pub warp: f32,
+    /// Where the wobble is in its cycle, in radians; it repeats every 2π.
+    pub warp_phase: f32,
+    /// How the outline is shaded.
+    pub material: crate::ShapeMaterial,
+}
+
+impl PaintShape {
+    /// Places the outline in its bounds.
+    pub fn transform(self, transform: crate::ShapeTransform) -> Self {
+        PaintShape { transform, ..self }
+    }
+
+    /// Also draws the outline mirrored across the vertical centre line of the bounds.
+    pub fn mirrored(self) -> Self {
+        PaintShape {
+            mirror: true,
+            ..self
+        }
+    }
+
+    /// Wobbles the outline like liquid: `amount` in radii, `phase` in radians.
+    pub fn warp(self, amount: f32, phase: f32) -> Self {
+        PaintShape {
+            warp: amount,
+            warp_phase: phase,
+            ..self
+        }
+    }
+}
+
+/// Creates a shape filling `bounds` with `outline` shaded by `material`, untransformed.
+pub fn shape(
+    bounds: Bounds<Pixels>,
+    outline: crate::ShapeOutline,
+    material: crate::ShapeMaterial,
+) -> PaintShape {
+    PaintShape {
+        bounds,
+        outline,
+        transform: crate::ShapeTransform::default(),
+        mirror: false,
+        warp: 0.,
+        warp_phase: 0.,
+        material,
     }
 }
 

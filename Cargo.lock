@@ -7593,6 +7593,7 @@ dependencies = [
  "etagere",
  "foreign-types 0.5.0",
  "gpui",
+ "gpui_shader_build",
  "image",
  "log",
  "metal",
@@ -7714,6 +7715,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_shader_build"
+version = "0.1.0"
+dependencies = [
+ "naga",
+]
+
+[[package]]
 name = "gpui_shared_string"
 version = "0.1.0"
 dependencies = [
@@ -7803,6 +7811,7 @@ dependencies = [
  "etagere",
  "futures 0.3.32",
  "gpui",
+ "gpui_shader_build",
  "gpui_util",
  "image",
  "itertools 0.14.0",

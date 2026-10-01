@@ -20,9 +20,22 @@ use windows::{
     core::{HSTRING, Interface},
 };
 
-use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
+use crate::directx_renderer::shader_resources::{
+    RawShaderBytes, ShaderModule, ShaderTarget, WgslPrimitive,
+};
 use crate::*;
 use gpui::*;
+
+/// Binding registers and entry points of the shaders `gpui_shader_build` translates from
+/// `gpui_wgpu`'s WGSL.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+mod wgsl_shaders {
+    include!(concat!(env!("OUT_DIR"), "/wgsl_shaders.rs"));
+}
+
+// `set_pipeline_state` binds every instance buffer at `t1`.
+const _: () = assert!(wgsl_shaders::INSTANCES_REGISTER == 1);
+const _: () = assert!(std::mem::size_of::<Shape>() == wgsl_shaders::SHAPES_INSTANCE_STRIDE);
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -123,6 +136,9 @@ impl PathIntermediate {
 struct DirectXRenderPipelines {
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
+    /// Absent below feature level 11_0, whose vertex and pixel shaders cannot read the raw
+    /// buffers naga translates WGSL storage arrays into.
+    shape_pipeline: Option<PipelineState<Shape>>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
     underline_pipeline: PipelineState<Underline>,
@@ -172,6 +188,8 @@ const LAYER_EVICT_FRAMES: u32 = 240;
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     batch_params_buffer: Option<ID3D11Buffer>,
+    wgsl_global_params_buffer: Option<ID3D11Buffer>,
+    wgsl_special_constants_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
 }
 
@@ -663,6 +681,7 @@ impl DirectXRenderer {
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
+                PrimitiveBatch::Shapes(range) => self.draw_shapes(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
                     let Some(bounds) = scene.path_bounds_for_damage(damage, range.clone()) else {
                         continue;
@@ -686,10 +705,11 @@ impl DirectXRenderer {
             .with_context(|| {
                 format!(
                     "scene too large:\
-                    {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
+                    {} paths, {} shadows, {} quads, {} shapes, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
                     scene.paths.len(),
                     scene.shadows.len(),
                     scene.quads.len(),
+                    scene.shapes.len(),
                     scene.underlines.len(),
                     scene.monochrome_sprites.len(),
                     scene.subpixel_sprites.len(),
@@ -970,6 +990,7 @@ impl DirectXRenderer {
             self.scene_uploads += 1;
             self.uploaded_primitive_bytes += std::mem::size_of_val(scene.shadows.as_slice())
                 + std::mem::size_of_val(scene.quads.as_slice())
+                + std::mem::size_of_val(scene.shapes.as_slice())
                 + std::mem::size_of_val(scene.underlines.as_slice())
                 + std::mem::size_of_val(scene.monochrome_sprites.as_slice())
                 + std::mem::size_of_val(scene.subpixel_sprites.as_slice())
@@ -990,6 +1011,16 @@ impl DirectXRenderer {
                 &devices.device,
                 &devices.device_context,
                 &scene.quads,
+            )?;
+        }
+
+        if !scene.shapes.is_empty()
+            && let Some(shape_pipeline) = self.pipelines.shape_pipeline.as_mut()
+        {
+            shape_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &scene.shapes,
             )?;
         }
 
@@ -1039,6 +1070,32 @@ impl DirectXRenderer {
                 .batch_params_buffer
                 .as_ref()
                 .context("batch params buffer missing")?,
+            start as u32,
+            len as u32,
+        )
+    }
+
+    fn draw_shapes(&mut self, start: usize, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let Some(shape_pipeline) = self.pipelines.shape_pipeline.as_ref() else {
+            static SKIPPED_SHAPES: std::sync::Once = std::sync::Once::new();
+            SKIPPED_SHAPES.call_once(|| {
+                log::warn!("Skipping shapes, which need Direct3D feature level 11_0");
+            });
+            return Ok(());
+        };
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let viewport = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .viewport;
+        shape_pipeline.draw_wgsl_range(
+            &devices.device_context,
+            &self.globals,
+            &viewport,
             start as u32,
             len as u32,
         )
@@ -1673,6 +1730,17 @@ impl DirectXRenderPipelines {
             64,
             create_blend_state(device)?,
         )?;
+        let shape_pipeline = if unsafe { device.GetFeatureLevel() }.0 >= D3D_FEATURE_LEVEL_11_0.0 {
+            Some(PipelineState::new_wgsl(
+                device,
+                "shape_pipeline",
+                WgslPrimitive::Shapes,
+                4,
+                create_blend_state(device)?,
+            )?)
+        } else {
+            None
+        };
         let path_rasterization_pipeline = PipelineState::new(
             device,
             "path_rasterization_pipeline",
@@ -1726,6 +1794,7 @@ impl DirectXRenderPipelines {
         Ok(Self {
             shadow_pipeline,
             quad_pipeline,
+            shape_pipeline,
             path_rasterization_pipeline,
             path_sprite_pipeline,
             underline_pipeline,
@@ -1764,6 +1833,8 @@ impl DirectXGlobalElements {
     pub fn new(device: &ID3D11Device) -> Result<Self> {
         let global_params_buffer = create_constant_buffer::<GlobalParams>(device)?;
         let batch_params_buffer = create_constant_buffer::<BatchParams>(device)?;
+        let wgsl_global_params_buffer = create_constant_buffer::<WgslGlobalParams>(device)?;
+        let wgsl_special_constants_buffer = create_constant_buffer::<NagaSpecialConstants>(device)?;
 
         let sampler = unsafe {
             let desc = D3D11_SAMPLER_DESC {
@@ -1786,6 +1857,8 @@ impl DirectXGlobalElements {
         Ok(Self {
             global_params_buffer,
             batch_params_buffer,
+            wgsl_global_params_buffer,
+            wgsl_special_constants_buffer,
             sampler,
         })
     }
@@ -1811,10 +1884,41 @@ struct BatchParams {
 
 const _: () = assert!(std::mem::size_of::<BatchParams>() == 16);
 
+/// WGSL's `GlobalParams`, which every shader translated from WGSL reads.
+#[derive(Debug, Default)]
+#[repr(C)]
+struct WgslGlobalParams {
+    viewport_size: [f32; 2],
+    premultiplied_alpha: u32,
+    pad: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<WgslGlobalParams>() == wgsl_shaders::GLOBALS_SIZE);
+
+/// naga's `NagaConstants`, padded to a whole constant register.
+#[derive(Debug, Default)]
+#[repr(C)]
+struct NagaSpecialConstants {
+    first_vertex: i32,
+    first_instance: i32,
+    other: u32,
+    pad: u32,
+}
+
+/// How a pipeline's shaders read its instance buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InstanceLayout {
+    /// The hand-written shaders' `StructuredBuffer`.
+    Structured,
+    /// The `ByteAddressBuffer` naga translates a WGSL storage array into.
+    Raw,
+}
+
 struct PipelineState<T> {
     label: &'static str,
     vertex: ID3D11VertexShader,
     fragment: ID3D11PixelShader,
+    instance_layout: InstanceLayout,
     buffer: ID3D11Buffer,
     buffer_size: usize,
     view: Option<ID3D11ShaderResourceView>,
@@ -1838,13 +1942,66 @@ impl<T> PipelineState<T> {
             let raw_shader = RawShaderBytes::new(shader_module, ShaderTarget::Fragment)?;
             create_fragment_shader(device, raw_shader.as_bytes())?
         };
-        let buffer = create_buffer(device, std::mem::size_of::<T>(), buffer_size)?;
-        let view = create_buffer_view(device, &buffer)?;
+        Self::from_shaders(
+            device,
+            label,
+            vertex,
+            fragment,
+            InstanceLayout::Structured,
+            buffer_size,
+            blend_state,
+        )
+    }
+
+    /// A pipeline drawn by the shaders `gpui_shader_build` translates from WGSL, with
+    /// [`Self::draw_wgsl_range`].
+    fn new_wgsl(
+        device: &ID3D11Device,
+        label: &'static str,
+        primitive: WgslPrimitive,
+        buffer_size: usize,
+        blend_state: ID3D11BlendState,
+    ) -> Result<Self> {
+        let vertex = {
+            let raw_shader = RawShaderBytes::wgsl(primitive, ShaderTarget::Vertex)?;
+            create_vertex_shader(device, raw_shader.as_bytes())?
+        };
+        let fragment = {
+            let raw_shader = RawShaderBytes::wgsl(primitive, ShaderTarget::Fragment)?;
+            create_fragment_shader(device, raw_shader.as_bytes())?
+        };
+        Self::from_shaders(
+            device,
+            label,
+            vertex,
+            fragment,
+            InstanceLayout::Raw,
+            buffer_size,
+            blend_state,
+        )
+    }
+
+    fn from_shaders(
+        device: &ID3D11Device,
+        label: &'static str,
+        vertex: ID3D11VertexShader,
+        fragment: ID3D11PixelShader,
+        instance_layout: InstanceLayout,
+        buffer_size: usize,
+        blend_state: ID3D11BlendState,
+    ) -> Result<Self> {
+        let (buffer, view) = create_instance_buffer(
+            device,
+            std::mem::size_of::<T>(),
+            buffer_size,
+            instance_layout,
+        )?;
 
         Ok(PipelineState {
             label,
             vertex,
             fragment,
+            instance_layout,
             buffer,
             buffer_size,
             view,
@@ -1877,8 +2034,12 @@ impl<T> PipelineState<T> {
                 self.buffer_size,
                 new_buffer_size
             );
-            let buffer = create_buffer(device, std::mem::size_of::<T>(), new_buffer_size)?;
-            let view = create_buffer_view(device, &buffer)?;
+            let (buffer, view) = create_instance_buffer(
+                device,
+                element_size,
+                new_buffer_size,
+                self.instance_layout,
+            )?;
             self.buffer = buffer;
             self.view = view;
             self.buffer_size = new_buffer_size;
@@ -1954,6 +2115,72 @@ impl<T> PipelineState<T> {
             &self.blend_state,
         );
         unsafe {
+            device_context.DrawInstanced(4, instance_count, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Draws with shaders translated from WGSL, which read their own globals, and add the
+    /// `first_instance` naga's special constants carry to `SV_InstanceID`, which starts at zero.
+    fn draw_wgsl_range(
+        &self,
+        device_context: &ID3D11DeviceContext,
+        globals: &DirectXGlobalElements,
+        viewport: &D3D11_VIEWPORT,
+        first_instance: u32,
+        instance_count: u32,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            first_instance as usize + instance_count as usize <= self.buffer_size,
+            "DirectX instance range exceeds the {} buffer",
+            self.label
+        );
+        update_buffer(
+            device_context,
+            globals
+                .wgsl_global_params_buffer
+                .as_ref()
+                .context("WGSL global params buffer missing")?,
+            &[WgslGlobalParams {
+                viewport_size: [viewport.Width, viewport.Height],
+                premultiplied_alpha: 0,
+                pad: 0,
+            }],
+        )?;
+        update_buffer(
+            device_context,
+            globals
+                .wgsl_special_constants_buffer
+                .as_ref()
+                .context("WGSL special constants buffer missing")?,
+            &[NagaSpecialConstants {
+                first_vertex: 0,
+                first_instance: first_instance as i32,
+                other: 0,
+                pad: 0,
+            }],
+        )?;
+        set_pipeline_state(
+            device_context,
+            slice::from_ref(&self.view),
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+            &self.vertex,
+            &self.fragment,
+            &self.blend_state,
+        );
+        unsafe {
+            device_context.VSSetConstantBuffers(
+                wgsl_shaders::GLOBALS_REGISTER,
+                Some(slice::from_ref(&globals.wgsl_global_params_buffer)),
+            );
+            device_context.PSSetConstantBuffers(
+                wgsl_shaders::GLOBALS_REGISTER,
+                Some(slice::from_ref(&globals.wgsl_global_params_buffer)),
+            );
+            device_context.VSSetConstantBuffers(
+                wgsl_shaders::SPECIAL_CONSTANTS_REGISTER,
+                Some(slice::from_ref(&globals.wgsl_special_constants_buffer)),
+            );
             device_context.DrawInstanced(4, instance_count, 0, 0);
         }
         Ok(())
@@ -2320,32 +2547,50 @@ fn create_constant_buffer<T>(device: &ID3D11Device) -> Result<Option<ID3D11Buffe
 }
 
 #[inline]
-fn create_buffer(
+fn create_instance_buffer(
     device: &ID3D11Device,
     element_size: usize,
     buffer_size: usize,
-) -> Result<ID3D11Buffer> {
+    layout: InstanceLayout,
+) -> Result<(ID3D11Buffer, Option<ID3D11ShaderResourceView>)> {
+    let byte_width = (element_size * buffer_size) as u32;
+    let (misc_flags, structure_byte_stride) = match layout {
+        InstanceLayout::Structured => (
+            D3D11_RESOURCE_MISC_BUFFER_STRUCTURED.0 as u32,
+            element_size as u32,
+        ),
+        InstanceLayout::Raw => (D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS.0 as u32, 0),
+    };
     let desc = D3D11_BUFFER_DESC {
-        ByteWidth: (element_size * buffer_size) as u32,
+        ByteWidth: byte_width,
         Usage: D3D11_USAGE_DYNAMIC,
         BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
         CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
-        MiscFlags: D3D11_RESOURCE_MISC_BUFFER_STRUCTURED.0 as u32,
-        StructureByteStride: element_size as u32,
+        MiscFlags: misc_flags,
+        StructureByteStride: structure_byte_stride,
     };
     let mut buffer = None;
     unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) }?;
-    Ok(buffer.unwrap())
-}
+    let buffer = buffer.context("CreateBuffer returned no instance buffer")?;
 
-#[inline]
-fn create_buffer_view(
-    device: &ID3D11Device,
-    buffer: &ID3D11Buffer,
-) -> Result<Option<ID3D11ShaderResourceView>> {
+    let raw_view_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D11_SRV_DIMENSION_BUFFEREX,
+        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+            BufferEx: D3D11_BUFFEREX_SRV {
+                FirstElement: 0,
+                NumElements: byte_width / 4,
+                Flags: D3D11_BUFFEREX_SRV_FLAG_RAW.0 as u32,
+            },
+        },
+    };
+    let view_desc = match layout {
+        InstanceLayout::Structured => None,
+        InstanceLayout::Raw => Some(&raw_view_desc as *const D3D11_SHADER_RESOURCE_VIEW_DESC),
+    };
     let mut view = None;
-    unsafe { device.CreateShaderResourceView(buffer, None, Some(&mut view)) }?;
-    Ok(view)
+    unsafe { device.CreateShaderResourceView(&buffer, view_desc, Some(&mut view)) }?;
+    Ok((buffer, view))
 }
 
 #[inline]
@@ -2962,10 +3207,10 @@ pub(crate) mod shader_resources {
     #[cfg(debug_assertions)]
     use windows::{
         Win32::Graphics::Direct3D::{
-            Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
-            ID3DBlob,
+            Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompile, D3DCompileFromFile},
+            ID3DBlob, ID3DInclude,
         },
-        core::{HSTRING, PCSTR},
+        core::{HSTRING, PCSTR, s},
     };
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -2982,11 +3227,20 @@ pub(crate) mod shader_resources {
         EmojiRasterization,
     }
 
+    /// A primitive drawn by the shaders `gpui_shader_build` translates from `gpui_wgpu`'s WGSL.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum WgslPrimitive {
+        Shapes,
+    }
+
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub(crate) enum ShaderTarget {
         Vertex,
         Fragment,
     }
+
+    #[cfg(debug_assertions)]
+    const WGSL_SHADERS_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/wgsl_shaders.hlsl"));
 
     pub(crate) struct RawShaderBytes<'t> {
         inner: &'t [u8],
@@ -3004,6 +3258,36 @@ pub(crate) mod shader_resources {
             #[cfg(debug_assertions)]
             {
                 let blob = build_shader_blob(module, target)?;
+                let inner = unsafe {
+                    std::slice::from_raw_parts(
+                        blob.GetBufferPointer() as *const u8,
+                        blob.GetBufferSize(),
+                    )
+                };
+                Ok(Self { inner, _blob: blob })
+            }
+        }
+
+        pub(crate) fn wgsl(primitive: WgslPrimitive, target: ShaderTarget) -> Result<Self> {
+            #[cfg(not(debug_assertions))]
+            {
+                let inner = match (primitive, target) {
+                    (WgslPrimitive::Shapes, ShaderTarget::Vertex) => SHAPES_VERTEX_BYTES,
+                    (WgslPrimitive::Shapes, ShaderTarget::Fragment) => SHAPES_FRAGMENT_BYTES,
+                };
+                Ok(Self { inner })
+            }
+            #[cfg(debug_assertions)]
+            {
+                let entry_point = match (primitive, target) {
+                    (WgslPrimitive::Shapes, ShaderTarget::Vertex) => {
+                        super::wgsl_shaders::SHAPES_VERTEX_ENTRY_POINT
+                    }
+                    (WgslPrimitive::Shapes, ShaderTarget::Fragment) => {
+                        super::wgsl_shaders::SHAPES_FRAGMENT_ENTRY_POINT
+                    }
+                };
+                let blob = build_wgsl_shader_blob(entry_point, target)?;
                 let inner = unsafe {
                     std::slice::from_raw_parts(
                         blob.GetBufferPointer() as *const u8,
@@ -3130,6 +3414,45 @@ pub(crate) mod shader_resources {
             }
             Ok(compile_blob.unwrap())
         }
+    }
+
+    /// Compiles the translated WGSL at shader model 5.0, the level `gpui_shader_build` writes.
+    #[cfg(debug_assertions)]
+    fn build_wgsl_shader_blob(entry_point: &str, target: ShaderTarget) -> Result<ID3DBlob> {
+        let entry_point = std::ffi::CString::new(entry_point)?;
+        let target = match target {
+            ShaderTarget::Vertex => s!("vs_5_0"),
+            ShaderTarget::Fragment => s!("ps_5_0"),
+        };
+        let mut compile_blob = None;
+        let mut error_blob = None;
+        let compiled = unsafe {
+            D3DCompile(
+                WGSL_SHADERS_SOURCE.as_ptr() as *const std::ffi::c_void,
+                WGSL_SHADERS_SOURCE.len(),
+                s!("wgsl_shaders.hlsl"),
+                None,
+                None::<&ID3DInclude>,
+                PCSTR::from_raw(entry_point.as_ptr() as *const u8),
+                target,
+                D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
+                0,
+                &mut compile_blob,
+                Some(&mut error_blob),
+            )
+        };
+        if let Err(error) = compiled {
+            let Some(error_blob) = error_blob else {
+                return Err(anyhow::anyhow!("{error:?}"));
+            };
+            let error_string = unsafe {
+                std::ffi::CStr::from_ptr(error_blob.GetBufferPointer() as *const std::ffi::c_char)
+            }
+            .to_string_lossy();
+            log::error!("Shader compile error: {}", error_string);
+            return Err(anyhow::anyhow!("Compile error: {}", error_string));
+        }
+        compile_blob.ok_or_else(|| anyhow::anyhow!("D3DCompile returned no shader"))
     }
 
     #[cfg(not(debug_assertions))]

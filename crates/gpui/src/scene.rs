@@ -51,6 +51,7 @@ pub struct Scene {
     layer_stack: Vec<DrawOrder>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
+    pub shapes: Vec<Shape>,
     pub paths: Vec<Path<ScaledPixels>>,
     // Upload staging alternates between targets with and without paths. Keep a bounded spare pool.
     staged_path_pool: Vec<Path<ScaledPixels>>,
@@ -99,6 +100,7 @@ impl Scene {
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
+        self.shapes.clear();
         self.underlines.clear();
         self.monochrome_sprites.clear();
         self.subpixel_sprites.clear();
@@ -132,7 +134,9 @@ impl Scene {
             self.insert_unclipped_primitive(primitive);
             return;
         }
-        let visible = primitive.bounds().intersect(&primitive.content_mask().bounds);
+        let visible = primitive
+            .raster_bounds()
+            .intersect(&primitive.content_mask().bounds);
         if visible.is_empty() { return; }
         for index in 0..self.rounded_clips[depth].len() {
             let band = self.rounded_clips[depth][index];
@@ -146,7 +150,7 @@ impl Scene {
 
     fn insert_unclipped_primitive(&mut self, mut primitive: Primitive) {
         let clipped_bounds = primitive
-            .bounds()
+            .raster_bounds()
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
@@ -166,6 +170,10 @@ impl Scene {
             Primitive::Quad(quad) => {
                 quad.order = order;
                 self.quads.push(*quad);
+            }
+            Primitive::Shape(shape) => {
+                shape.order = order;
+                self.shapes.push(*shape);
             }
             Primitive::Path(path) => {
                 path.order = order;
@@ -219,6 +227,10 @@ impl Scene {
             shift(&mut q.bounds, offset);
             shift_mask(&mut q.content_mask, offset);
         }
+        for s in &mut self.shapes {
+            shift(&mut s.bounds, offset);
+            shift_mask(&mut s.content_mask, offset);
+        }
         for p in &mut self.paths {
             shift(&mut p.bounds, offset);
             shift_mask(&mut p.content_mask, offset);
@@ -263,6 +275,7 @@ impl Scene {
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
+        self.shapes.sort_by_key(|shape| shape.order);
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
         self.monochrome_sprites
@@ -287,6 +300,8 @@ impl Scene {
             shadows_iter: self.shadows.iter().peekable(),
             quads_start: 0,
             quads_iter: self.quads.iter().peekable(),
+            shapes_start: 0,
+            shapes_iter: self.shapes.iter().peekable(),
             paths_start: 0,
             paths_iter: self.paths.iter().peekable(),
             underlines_start: 0,
@@ -315,6 +330,7 @@ pub(crate) enum PrimitiveKind {
     Shadow,
     #[default]
     Quad,
+    Shape,
     Path,
     Underline,
     MonochromeSprite,
@@ -334,6 +350,7 @@ pub(crate) enum PaintOperation {
 pub enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
+    Shape(Shape),
     Path(Path<ScaledPixels>),
     Underline(Underline),
     MonochromeSprite(MonochromeSprite),
@@ -344,10 +361,18 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
+    fn raster_bounds(&self) -> Bounds<ScaledPixels> {
+        match self {
+            Self::Shadow(shadow) => shadow.raster_bounds(),
+            _ => *self.bounds(),
+        }
+    }
+
     fn content_mask_mut(&mut self) -> &mut ContentMask<ScaledPixels> {
         match self {
             Self::Shadow(value) => &mut value.content_mask,
             Self::Quad(value) => &mut value.content_mask,
+            Self::Shape(value) => &mut value.content_mask,
             Self::Path(value) => &mut value.content_mask,
             Self::Underline(value) => &mut value.content_mask,
             Self::MonochromeSprite(value) => &mut value.content_mask,
@@ -361,6 +386,7 @@ impl Primitive {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::Quad(quad) => &quad.bounds,
+            Primitive::Shape(shape) => &shape.bounds,
             Primitive::Path(path) => &path.bounds,
             Primitive::Underline(underline) => &underline.bounds,
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
@@ -374,6 +400,7 @@ impl Primitive {
         match self {
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
+            Primitive::Shape(shape) => &shape.content_mask,
             Primitive::Path(path) => &path.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
@@ -396,6 +423,8 @@ struct BatchIterator<'a> {
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
     quads_start: usize,
     quads_iter: Peekable<slice::Iter<'a, Quad>>,
+    shapes_start: usize,
+    shapes_iter: Peekable<slice::Iter<'a, Shape>>,
     paths_start: usize,
     paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
     underlines_start: usize,
@@ -420,6 +449,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                 PrimitiveKind::Shadow,
             ),
             (self.quads_iter.peek().map(|q| q.order), PrimitiveKind::Quad),
+            (self.shapes_iter.peek().map(|s| s.order), PrimitiveKind::Shape),
             (self.paths_iter.peek().map(|q| q.order), PrimitiveKind::Path),
             (
                 self.underlines_iter.peek().map(|u| u.order),
@@ -480,6 +510,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 }
                 self.quads_start = quads_end;
                 Some(PrimitiveBatch::Quads(quads_start..quads_end))
+            }
+            PrimitiveKind::Shape => {
+                let shapes_start = self.shapes_start;
+                let mut shapes_end = shapes_start + 1;
+                self.shapes_iter.next();
+                while self
+                    .shapes_iter
+                    .next_if(|shape| (shape.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    shapes_end += 1;
+                }
+                self.shapes_start = shapes_end;
+                Some(PrimitiveBatch::Shapes(shapes_start..shapes_end))
             }
             PrimitiveKind::Path => {
                 let paths_start = self.paths_start;
@@ -602,6 +646,7 @@ impl<'a> Iterator for BatchIterator<'a> {
 pub enum PrimitiveBatch {
     Shadows(Range<usize>),
     Quads(Range<usize>),
+    Shapes(Range<usize>),
     Paths(Range<usize>),
     Underlines(Range<usize>),
     MonochromeSprites {
@@ -626,6 +671,7 @@ impl PrimitiveBatch {
         match self {
             Self::Shadows(range) => format!("shadows ({})", range.len()),
             Self::Quads(range) => format!("quads ({})", range.len()),
+            Self::Shapes(range) => format!("shapes ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),
             Self::Underlines(range) => format!("underlines ({})", range.len()),
             Self::MonochromeSprites { texture_id, range } => {
@@ -710,9 +756,303 @@ pub struct Shadow {
     pub pad: u32, // align to 8 bytes
 }
 
+impl Shadow {
+    // Match the renderer's three-sigma Gaussian quad without changing the shape it blurs.
+    // Clipping and draw ordering must include the tail; inset shadows stay inside the element.
+    pub(crate) fn raster_bounds(&self) -> Bounds<ScaledPixels> {
+        if self.inset != 0 {
+            self.element_bounds
+        } else {
+            self.bounds.dilate(ScaledPixels(3. * self.blur_radius.0))
+        }
+    }
+}
+
 impl From<Shadow> for Primitive {
     fn from(shadow: Shadow) -> Self {
         Primitive::Shadow(shadow)
+    }
+}
+
+/// An analytic shape, as the renderers receive it: an instanced quad whose fragment shader
+/// evaluates the outline's field, estimates a signed distance from the field and its gradient,
+/// and shades it. Built by [`Window::paint_shape`](crate::Window::paint_shape) from a
+/// [`PaintShape`](crate::PaintShape); the shaders mirror this layout field for field.
+#[derive(Debug, Copy, Clone, Default, PartialEq)]
+#[repr(C)]
+pub struct Shape {
+    /// Draw order within the scene.
+    pub order: DrawOrder,
+    /// Which [`ShapeOutline`] field to evaluate.
+    pub outline: u32,
+    /// Which [`ShapeMaterial`] shades it.
+    pub material: u32,
+    /// [`Shape::MIRROR`] and [`Shape::SHADOW_HALO`].
+    pub flags: u32,
+    /// The quad drawn. Bounds space spans its largest centred square from -1 to 1, y down.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Clip and fade.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// The outline's parameters, packed by [`ShapeOutline`].
+    pub params: [f32; 4],
+    /// Row-major map from bounds space, after `placement`'s offset, to outline space.
+    pub transform: [f32; 4],
+    /// The outline's centre in bounds space, then the liquid warp's amount and phase.
+    pub placement: [f32; 4],
+    /// Key light angle, inner light angle, rim strength and halo strength.
+    pub lighting: [f32; 4],
+    /// Glass: primary, secondary, deep and rim, with `colors[0].a` as the whole shape's opacity.
+    /// Glow: the colour, then unused.
+    pub colors: [Hsla; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<Shape>() == 192);
+// The WGSL `Shape` puts every `vec4` on a 16-byte boundary.
+const _: () = {
+    assert!(std::mem::offset_of!(Shape, bounds) == 16);
+    assert!(std::mem::offset_of!(Shape, content_mask) == 32);
+    assert!(std::mem::offset_of!(Shape, params) == 64);
+    assert!(std::mem::offset_of!(Shape, transform) == 80);
+    assert!(std::mem::offset_of!(Shape, placement) == 96);
+    assert!(std::mem::offset_of!(Shape, lighting) == 112);
+    assert!(std::mem::offset_of!(Shape, colors) == 128);
+};
+
+impl Shape {
+    /// Draw the outline mirrored across the bounds' vertical centre line as well.
+    pub const MIRROR: u32 = 1;
+    /// Shade a glass halo as a soft shadow below the outline instead of a glow around it.
+    pub const SHADOW_HALO: u32 = 2;
+}
+
+impl From<Shape> for Primitive {
+    fn from(shape: Shape) -> Self {
+        Primitive::Shape(shape)
+    }
+}
+
+/// The outline a [`PaintShape`](crate::PaintShape) fills, in an outline space where the shape's
+/// radius is 1 and y points down.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShapeOutline {
+    /// The unit circle.
+    Circle,
+    /// A star, flower or cookie with `lobes` tips, one pointing up, whose radius swings between
+    /// `inner` (0 to 1) and 1. `sharpness` above 1 narrows the tips and rounds the valleys; below
+    /// 1 swells the lobes and pinches the valleys.
+    Polar {
+        /// Tip count, at least 1.
+        lobes: u32,
+        /// Valley radius.
+        inner: f32,
+        /// Tip narrowing exponent.
+        sharpness: f32,
+    },
+    /// A regular polygon with a vertex pointing up, its corners rounded by `rounding` (0 to 1 of
+    /// the radius) without growing past the unit circle.
+    Polygon {
+        /// Side count, at least 3.
+        sides: u32,
+        /// Corner radius.
+        rounding: f32,
+    },
+    /// The superellipse `|x|^exponent + |y|^exponent = 1`: a circle at 2, a squircle near 4.
+    Superellipse {
+        /// The exponent, at least 1.
+        exponent: f32,
+    },
+    /// A heart with its point down, its outline rounded by `rounding`.
+    Heart {
+        /// How far the outline is rounded, in radii.
+        rounding: f32,
+    },
+    /// A vertical capsule of radius 1 whose straight part reaches `half_length` above and below
+    /// its centre.
+    Capsule {
+        /// Half the straight part's length, in radii.
+        half_length: f32,
+    },
+    /// The unit circle drawn out to a rounded point above it, as a drop or a speech balloon's
+    /// tail: the point is a circle of radius `tip` (0 to 1) `reach` radii above the centre, joined
+    /// to the unit circle by their common tangents.
+    Drop {
+        /// How far above the centre the point's circle sits, in radii.
+        reach: f32,
+        /// The point's radius.
+        tip: f32,
+    },
+}
+
+impl ShapeOutline {
+    pub(crate) fn encode(self) -> (u32, [f32; 4]) {
+        match self {
+            Self::Circle => (0, [0.; 4]),
+            Self::Polar {
+                lobes,
+                inner,
+                sharpness,
+            } => (
+                1,
+                [
+                    lobes.max(1) as f32,
+                    inner.clamp(0.05, 1.),
+                    sharpness.clamp(0.1, 8.),
+                    0.,
+                ],
+            ),
+            Self::Polygon { sides, rounding } => {
+                (2, [sides.max(3) as f32, rounding.clamp(0., 0.9), 0., 0.])
+            }
+            Self::Superellipse { exponent } => (3, [exponent.clamp(1., 32.), 0., 0., 0.]),
+            Self::Heart { rounding } => (4, [rounding.clamp(0., 0.5), 0., 0., 0.]),
+            Self::Capsule { half_length } => (5, [half_length.max(0.), 0., 0., 0.]),
+            Self::Drop { reach, tip } => (6, [reach.max(0.), tip.clamp(0., 1.), 0., 0.]),
+        }
+    }
+}
+
+/// Whether a glass shape's halo glows around it or falls below it as a soft shadow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShapeHalo {
+    /// Light spilling out around the rim; reads on dark surfaces.
+    #[default]
+    Glow,
+    /// A soft tinted shadow below the shape; reads on light surfaces.
+    Shadow,
+}
+
+/// Lit glass: a `deep` body with `primary` glowing inside toward the top left and `secondary`
+/// toward the bottom right, a frosted rim lit by a key light and by a back light opposite it, and
+/// a halo outside the outline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GlassMaterial {
+    /// The light inside the glass toward the top left.
+    pub primary: Hsla,
+    /// The light inside the glass toward the bottom right.
+    pub secondary: Hsla,
+    /// The body the lights glow in.
+    pub deep: Hsla,
+    /// The rim light's colour.
+    pub rim: Hsla,
+    /// Direction toward the key light, in radians from +x toward +y (down). The back light sits
+    /// roughly opposite it.
+    pub light_angle: f32,
+    /// How far the inner lights are turned about the centre, in radians.
+    pub flow_angle: f32,
+    /// Rim brightness; 1 is the designed look.
+    pub rim_strength: f32,
+    /// Halo strength; 0 for none.
+    pub halo: f32,
+    /// How the halo is drawn.
+    pub halo_style: ShapeHalo,
+}
+
+impl GlassMaterial {
+    /// The key light toward the top left: the designed default.
+    pub const TOP_LEFT_LIGHT: f32 = -2.58;
+
+    /// Glass of these colours, lit from the top left with a glowing halo.
+    pub fn new(primary: Hsla, secondary: Hsla, deep: Hsla, rim: Hsla) -> Self {
+        Self {
+            primary,
+            secondary,
+            deep,
+            rim,
+            light_angle: Self::TOP_LEFT_LIGHT,
+            flow_angle: 0.,
+            rim_strength: 1.,
+            halo: 1.,
+            halo_style: ShapeHalo::Glow,
+        }
+    }
+}
+
+/// How a [`PaintShape`](crate::PaintShape) is shaded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShapeMaterial {
+    /// Lit glass.
+    Glass(GlassMaterial),
+    /// A flat emissive fill with a soft halo of the same colour; `halo` 0 for none.
+    Glow {
+        /// The fill.
+        color: Hsla,
+        /// Halo strength.
+        halo: f32,
+    },
+}
+
+/// Places a [`ShapeOutline`] in its bounds: a map from outline space to bounds space (the bounds'
+/// largest centred square, -1 to 1, y down). Each step applies after the ones before it, so
+/// `ShapeTransform::default().scale(0.7, 0.7).translate(0., -0.1)` shrinks the unit outline and
+/// then raises it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShapeTransform {
+    matrix: [[f32; 2]; 2],
+    offset: [f32; 2],
+}
+
+impl Default for ShapeTransform {
+    fn default() -> Self {
+        Self {
+            matrix: [[1., 0.], [0., 1.]],
+            offset: [0., 0.],
+        }
+    }
+}
+
+impl ShapeTransform {
+    /// Rotate by `radians`, turning +x toward +y (clockwise on screen).
+    pub fn rotate(self, radians: f32) -> Self {
+        let (sin, cos) = radians.sin_cos();
+        self.then([[cos, -sin], [sin, cos]])
+    }
+
+    /// Scale along the bounds' axes.
+    pub fn scale(self, x: f32, y: f32) -> Self {
+        self.then([[x, 0.], [0., y]])
+    }
+
+    /// Move the outline by `(x, y)` in bounds space.
+    pub fn translate(mut self, x: f32, y: f32) -> Self {
+        self.offset[0] += x;
+        self.offset[1] += y;
+        self
+    }
+
+    fn then(self, m: [[f32; 2]; 2]) -> Self {
+        let a = self.matrix;
+        let o = self.offset;
+        Self {
+            matrix: [
+                [
+                    m[0][0] * a[0][0] + m[0][1] * a[1][0],
+                    m[0][0] * a[0][1] + m[0][1] * a[1][1],
+                ],
+                [
+                    m[1][0] * a[0][0] + m[1][1] * a[1][0],
+                    m[1][0] * a[0][1] + m[1][1] * a[1][1],
+                ],
+            ],
+            offset: [
+                m[0][0] * o[0] + m[0][1] * o[1],
+                m[1][0] * o[0] + m[1][1] * o[1],
+            ],
+        }
+    }
+
+    /// The row-major inverse of the linear part and the offset, or `None` when the outline has
+    /// been scaled to nothing.
+    pub(crate) fn inverse(&self) -> Option<([f32; 4], [f32; 2])> {
+        let [[a, b], [c, d]] = self.matrix;
+        let determinant = a * d - b * c;
+        if !determinant.is_finite() || determinant.abs() < 1e-6 {
+            return None;
+        }
+        let inverse = 1. / determinant;
+        Some((
+            [d * inverse, -b * inverse, -c * inverse, a * inverse],
+            self.offset,
+        ))
     }
 }
 
@@ -1106,5 +1446,62 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shape_transform_inverse_maps_bounds_space_back_to_outline_space() {
+        let transform = ShapeTransform::default()
+            .rotate(std::f32::consts::FRAC_PI_2)
+            .scale(0.5, 0.25)
+            .translate(0.1, -0.2);
+        let (inverse, offset) = transform.inverse().expect("an invertible transform");
+        // The outline's top, (0, -1), turns to (1, 0), shrinks to (0.5, 0) and then moves.
+        let moved = [0.6 - offset[0], -0.2 - offset[1]];
+        let outline = [
+            inverse[0] * moved[0] + inverse[1] * moved[1],
+            inverse[2] * moved[0] + inverse[3] * moved[1],
+        ];
+        assert!(outline[0].abs() < 1e-5, "{outline:?}");
+        assert!((outline[1] + 1.).abs() < 1e-5, "{outline:?}");
+
+        assert!(ShapeTransform::default().scale(0., 1.).inverse().is_none());
+    }
+
+    #[test]
+    fn shape_outline_parameters_are_clamped_into_their_documented_ranges() {
+        assert_eq!(
+            ShapeOutline::Polar {
+                lobes: 0,
+                inner: 2.,
+                sharpness: 100.,
+            }
+            .encode(),
+            (1, [1., 1., 8., 0.])
+        );
+        assert_eq!(
+            ShapeOutline::Polygon {
+                sides: 1,
+                rounding: -1.,
+            }
+            .encode(),
+            (2, [3., 0., 0., 0.])
+        );
+        assert_eq!(
+            ShapeOutline::Superellipse { exponent: 0.5 }.encode(),
+            (3, [1., 0., 0., 0.])
+        );
+        assert_eq!(
+            ShapeOutline::Drop {
+                reach: -1.,
+                tip: 2.,
+            }
+            .encode(),
+            (6, [0., 1., 0., 0.])
+        );
     }
 }

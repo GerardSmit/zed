@@ -189,14 +189,7 @@ fn footprint(
 }
 
 fn shadow_footprint(shadow: &Shadow) -> Bounds<ScaledPixels> {
-    let bounds = if shadow.inset != 0 {
-        shadow.element_bounds
-    } else {
-        shadow
-            .bounds
-            .dilate(ScaledPixels(3. * shadow.blur_radius.0))
-    };
-    footprint(bounds, shadow.content_mask)
+    footprint(shadow.raster_bounds(), shadow.content_mask)
 }
 
 fn sprite_footprint(
@@ -369,6 +362,7 @@ impl Scene {
         }
         compare!(shadows, shadow_footprint);
         compare!(quads);
+        compare!(shapes);
         compare!(paths);
         compare!(underlines);
         compare!(monochrome_sprites, |value| sprite_footprint(
@@ -467,6 +461,7 @@ impl Scene {
         }
         copy!(shadows, shadow_footprint);
         copy!(quads: Quad);
+        copy!(shapes: Shape);
         copy!(underlines: Underline);
         copy!(monochrome_sprites, |value: &MonochromeSprite| {
             sprite_footprint(value.bounds, value.content_mask, value.transformation)
@@ -579,6 +574,7 @@ impl Scene {
                     .iter()
                     .any(|value| touches(shadow_footprint(value))),
                 PrimitiveBatch::Quads(range) => intersects!(quads, range),
+                PrimitiveBatch::Shapes(range) => intersects!(shapes, range),
                 PrimitiveBatch::Paths(range) => intersects!(paths, range),
                 PrimitiveBatch::Underlines(range) => intersects!(underlines, range),
                 PrimitiveBatch::MonochromeSprites { range, .. } => {
@@ -797,6 +793,54 @@ mod tests {
         );
     }
 
+    fn shape(x: f32) -> Shape {
+        Shape {
+            bounds: rect(x, 20., 10., 10.),
+            content_mask: ContentMask {
+                bounds: rect(0., 0., 200., 200.),
+                ..Default::default()
+            },
+            transform: [1., 0., 0., 1.],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shapes_batch_in_draw_order_and_join_damage() {
+        let mut old = Scene::default();
+        old.insert_primitive(quad(20.));
+        old.insert_primitive(shape(40.));
+        old.insert_primitive(shape(60.));
+        old.insert_primitive(quad(80.));
+        old.finish();
+        assert_eq!(
+            old.batches().map(|batch| batch.label()).collect::<Vec<_>>(),
+            ["quads (1)", "shapes (2)", "quads (1)"]
+        );
+
+        let mut new = Scene::default();
+        new.insert_primitive(quad(20.));
+        new.insert_primitive(shape(40.));
+        new.insert_primitive(Shape {
+            placement: [0., 0., 0.05, 1.],
+            ..shape(60.)
+        });
+        new.insert_primitive(quad(80.));
+        new.finish();
+        new.update_damage(&old, false);
+        assert_eq!(new.damage, SceneDamage::Partial(rect(59., 19., 12., 12.)));
+        assert_eq!(
+            new.batches_for_damage(new.damage)
+                .map(|batch| batch.label())
+                .collect::<Vec<_>>(),
+            ["shapes (2)"]
+        );
+        let mut staged = Scene::default();
+        new.copy_primitives_for_damage(new.damage, &mut staged);
+        assert_eq!(staged.shapes.len(), 1);
+        assert!(staged.quads.is_empty());
+    }
+
     #[test]
     fn movement_removal_and_order_include_old_pixels() {
         let mut old = Scene::default();
@@ -904,6 +948,52 @@ mod tests {
             ),
             rect(24., 24., 7., 7.)
         );
+    }
+
+    #[test]
+    fn rounded_clips_retain_shadow_tails_and_limit_inset_shadows() {
+        let shadow = Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(4.),
+            bounds: rect(30., 30., 10., 10.),
+            corner_radii: Corners::default(),
+            content_mask: ContentMask {
+                bounds: rect(0., 0., 200., 200.),
+                ..Default::default()
+            },
+            color: rgba(0x00000040).into(),
+            element_bounds: rect(28., 28., 14., 14.),
+            element_corner_radii: Corners::default(),
+            inset: 0,
+            pad: 0,
+        };
+        let mut scene = Scene::default();
+        scene.push_rounded_clip(vec![rect(0., 0., 200., 200.)]);
+        scene.insert_primitive(shadow);
+        assert_eq!(
+            scene.shadows[0].content_mask.bounds,
+            rect(18., 18., 34., 34.)
+        );
+        // A nested clip can intersect only the blur, with the shape itself fully outside it.
+        scene.push_rounded_clip(vec![rect(16., 16., 10., 10.)]);
+        scene.insert_primitive(shadow);
+        assert_eq!(scene.shadows.len(), 2);
+        assert_eq!(scene.shadows[1].content_mask.bounds, rect(18., 18., 8., 8.));
+        scene.pop_rounded_clip();
+        scene.insert_primitive(Shadow {
+            inset: 1,
+            ..shadow
+        });
+        assert_eq!(scene.shadows[2].content_mask.bounds, shadow.element_bounds);
+
+        // The tail also participates in ordering outside rounded containers.
+        let mut scene = Scene::default();
+        scene.insert_primitive(shadow);
+        scene.insert_primitive(Quad {
+            bounds: rect(19., 19., 5., 5.),
+            ..quad(19.)
+        });
+        assert!(scene.quads[0].order > scene.shadows[0].order);
     }
 
     #[test]

@@ -39,6 +39,7 @@ parking_lot.workspace = true
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cbindgen.workspace = true
 gpui.workspace = true
+gpui_shader_build.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

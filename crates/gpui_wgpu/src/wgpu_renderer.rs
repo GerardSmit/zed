@@ -223,6 +223,7 @@ struct WgpuPipelines {
     frame_present: wgpu::RenderPipeline,
     quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
+    shapes: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
@@ -252,6 +253,7 @@ struct InstanceBinding {
 struct InstanceBindings {
     quads: InstanceBinding,
     shadows: InstanceBinding,
+    shapes: InstanceBinding,
     underlines: InstanceBinding,
     monochrome_sprites: InstanceBinding,
     subpixel_sprites: InstanceBinding,
@@ -1143,6 +1145,19 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let shapes = create_pipeline(
+            "shapes",
+            "vs_shape",
+            "fs_shape",
+            &layouts.globals,
+            &layouts.instances,
+            None,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
         let path_rasterization = create_pipeline(
             "path_rasterization",
             "vs_path_rasterization",
@@ -1327,6 +1342,7 @@ impl WgpuRenderer {
             frame_present,
             quads,
             shadows,
+            shapes,
             path_rasterization,
             paths,
             underlines,
@@ -1903,6 +1919,13 @@ impl WgpuRenderer {
                             globals,
                             &mut pass,
                         ),
+                        PrimitiveBatch::Shapes(range) => self.draw_instances(
+                            &instance_bindings.shapes,
+                            &self.resources().pipelines.shapes,
+                            instance_range(range),
+                            globals,
+                            &mut pass,
+                        ),
                         PrimitiveBatch::Underlines(range) => self.draw_instances(
                             &instance_bindings.underlines,
                             &self.resources().pipelines.underlines,
@@ -2258,6 +2281,11 @@ impl WgpuRenderer {
                 "shadows_bind_group",
                 instance_offset,
                 &scene.shadows,
+            )?,
+            shapes: self.write_instance_binding(
+                "shapes_bind_group",
+                instance_offset,
+                &scene.shapes,
             )?,
             underlines: self.write_instance_binding(
                 "underlines_bind_group",
@@ -3291,7 +3319,9 @@ mod tests {
         assert_eq!(calls, 3);
         assert_eq!(offset, 34);
     }
-    use gpui::{MonochromeSprite, PolychromeSprite, Quad, Shadow, SubpixelSprite, Underline};
+    use gpui::{
+        MonochromeSprite, PolychromeSprite, Quad, Shadow, Shape, SubpixelSprite, Underline,
+    };
 
     #[test]
     fn animated_path_sizes_share_buckets_within_device_limits() {
@@ -4013,6 +4043,7 @@ mod tests {
     fn webgl_record_sizes_match_shader_word_strides() {
         assert_eq!(std::mem::size_of::<Quad>(), 44 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<Shape>(), 48 * 4);
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 30 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 8 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 20 * 4);
