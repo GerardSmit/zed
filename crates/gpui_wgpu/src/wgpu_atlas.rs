@@ -37,6 +37,7 @@ struct WgpuAtlasState {
     storage: WgpuAtlasStorage,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     pending_uploads: Vec<PendingUpload>,
+    upload_ring: Option<crate::upload_ring::UploadRing>,
 }
 
 pub struct WgpuTextureInfo {
@@ -58,6 +59,7 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             tiles_by_key: Default::default(),
             pending_uploads: Vec::new(),
+            upload_ring: None,
         }))
     }
 
@@ -67,6 +69,10 @@ impl WgpuAtlas {
             context.queue.clone(),
             context.color_texture_format(),
         )
+    }
+
+    pub(crate) fn before_external_frame(&self) -> Result<bool> {
+        self.0.lock().flush_ring_uploads()
     }
 
     pub fn before_frame(&self) {
@@ -102,6 +108,7 @@ impl WgpuAtlas {
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
         lock.pending_uploads.clear();
+        lock.upload_ring = None;
     }
 
     /// Handles device lost by clearing all textures and cached tiles.
@@ -114,6 +121,7 @@ impl WgpuAtlas {
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
         lock.pending_uploads.clear();
+        lock.upload_ring = None;
     }
 }
 
@@ -303,6 +311,67 @@ impl WgpuAtlasState {
                 },
             );
         }
+    }
+
+    fn flush_ring_uploads(&mut self) -> Result<bool> {
+        if self.pending_uploads.is_empty() { return Ok(true); }
+        let mut required = 0u64;
+        for upload in &self.pending_uploads {
+            let Some(texture) = self.storage.get(upload.id) else { continue; };
+            let width = u64::try_from(upload.bounds.size.width.0)?;
+            let height = u64::try_from(upload.bounds.size.height.0)?;
+            let x = u32::try_from(upload.bounds.origin.x.0)?;
+            let y = u32::try_from(upload.bounds.origin.y.0)?;
+            anyhow::ensure!(width > 0 && height > 0, "Empty atlas upload");
+            anyhow::ensure!(u64::from(x).checked_add(width).is_some_and(|right| right <= u64::from(texture.texture.width()))
+                && u64::from(y).checked_add(height).is_some_and(|bottom| bottom <= u64::from(texture.texture.height())),
+                "Atlas upload exceeds texture bounds");
+            let row = width.checked_mul(texture.bytes_per_pixel() as u64).context("Atlas row overflow")?;
+            let pitch = row.checked_add(255).context("Atlas pitch overflow")? & !255;
+            u32::try_from(pitch).context("Atlas pitch exceeds copy layout")?;
+            let bytes = pitch.checked_mul(height).context("Atlas upload overflow")?;
+            anyhow::ensure!(row.checked_mul(height) == Some(upload.data.len() as u64), "Invalid atlas upload size");
+            required = required.checked_add(bytes).context("Atlas staging overflow")?;
+        }
+        if required == 0 { self.pending_uploads.clear(); return Ok(true); }
+        anyhow::ensure!(required <= self.device.limits().max_buffer_size && required <= 64 * 1024 * 1024,
+            "Atlas upload exceeds staging budget");
+        if self.upload_ring.as_ref().is_none_or(|ring| ring.capacity() < required) {
+            let capacity = required.max(512 * 1024).checked_next_power_of_two().context("Atlas staging capacity overflow")?;
+            anyhow::ensure!(capacity <= self.device.limits().max_buffer_size, "Atlas staging exceeds device limit");
+            self.upload_ring = Some(crate::upload_ring::UploadRing::new(&self.device, capacity));
+        }
+        let ring = self.upload_ring.as_ref().context("Atlas upload ring missing")?;
+        anyhow::ensure!(!ring.failed(), "Atlas staging mapping failed");
+        let Some(index) = ring.acquire() else { return Ok(false); };
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpui_atlas_uploads"),
+        });
+        let mut offset = 0;
+        for upload in &self.pending_uploads {
+            let Some(texture) = self.storage.get(upload.id) else { continue; };
+            let width = upload.bounds.size.width.0 as u32;
+            let height = upload.bounds.size.height.0 as u32;
+            let row = u64::from(width) * texture.bytes_per_pixel() as u64;
+            let pitch = (row + 255) & !255;
+            for (line, bytes) in upload.data.chunks_exact(row as usize).enumerate() {
+                ring.write(index, offset + line as u64 * pitch, bytes)?;
+            }
+            encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo {
+                buffer: ring.buffer(index),
+                layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(pitch as u32), rows_per_image: None },
+            }, wgpu::TexelCopyTextureInfo {
+                texture: &texture.texture, mip_level: 0,
+                origin: wgpu::Origin3d { x: upload.bounds.origin.x.0 as u32, y: upload.bounds.origin.y.0 as u32, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            }, wgpu::Extent3d { width, height, depth_or_array_layers: 1 });
+            offset += pitch * u64::from(height);
+        }
+        ring.unmap(index);
+        self.queue.submit([encoder.finish()]);
+        ring.submitted(index);
+        self.pending_uploads.clear();
+        Ok(true)
     }
 }
 

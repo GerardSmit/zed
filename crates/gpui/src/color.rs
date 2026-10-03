@@ -908,6 +908,11 @@ impl LinearColorStop {
 }
 
 impl Background {
+    /// Exposes linear gradient geometry for native software reference renderers.
+    pub fn as_linear_gradient(&self) -> Option<(f32, [LinearColorStop; 2], ColorSpace)> {
+        (self.tag == BackgroundTag::LinearGradient)
+            .then_some((self.gradient_angle_or_pattern_height, self.colors, self.color_space))
+    }
     /// Returns the solid color if this is a solid background, None otherwise.
     pub fn as_solid(&self) -> Option<Hsla> {
         if self.tag == BackgroundTag::Solid {

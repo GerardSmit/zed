@@ -3,7 +3,7 @@ use anyhow::Context as _;
 #[cfg(not(target_family = "wasm"))]
 use gpui_util::ResultExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use wgpu::TextureFormat;
 
 pub struct WgpuContext {
@@ -11,6 +11,8 @@ pub struct WgpuContext {
     pub adapter: wgpu::Adapter,
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
+    pub(crate) pipeline_cache: Option<wgpu::PipelineCache>,
+    pub(crate) pipeline_cache_revision: Arc<AtomicU64>,
     backend: WgpuBackend,
     dual_source_blending: bool,
     color_texture_format: wgpu::TextureFormat,
@@ -63,6 +65,91 @@ pub struct CompositorGpuHint {
 }
 
 impl WgpuContext {
+    /// Create a context for caller-owned render targets without a window surface.
+    pub async fn new_external(instance: wgpu::Instance) -> anyhow::Result<Self> {
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("Failed to request external-target adapter: {error}")
+            })?;
+        let (device, queue, dual_source_blending, color_texture_format) =
+            Self::create_device(&adapter, true).await?;
+        let pipeline_cache = if device.features().contains(wgpu::Features::PIPELINE_CACHE) {
+            // An empty cache has no externally supplied driver data.
+            match unsafe { Self::create_pipeline_cache(&device, None).await } {
+                Ok(cache) => Some(cache),
+                Err(error) => { log::warn!("Pipeline cache unavailable: {error}"); None }
+            }
+        } else { None };
+        let device_lost = Arc::new(AtomicBool::new(false));
+        device.set_device_lost_callback({
+            let device_lost = Arc::clone(&device_lost);
+            move |reason, message| {
+                log::error!("wgpu device lost: reason={reason:?}, message={message}");
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    device_lost.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        let backend = WgpuBackend::Native(adapter.get_info().backend);
+        Ok(Self {
+            instance,
+            adapter,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            pipeline_cache,
+            pipeline_cache_revision: Arc::new(AtomicU64::new(0)),
+            backend,
+            dual_source_blending,
+            color_texture_format,
+            device_lost,
+        })
+    }
+
+    /// Restore a cache before creating renderers from this context.
+    ///
+    /// # Safety
+    /// `data` must be unmodified output of `PipelineCache::get_data` from a
+    /// compatible adapter. The caller owns persistence integrity and identity.
+    pub async unsafe fn restore_pipeline_cache(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        if self.pipeline_cache.is_some() {
+            let cache = unsafe { Self::create_pipeline_cache(&self.device, Some(data)).await }?;
+            self.pipeline_cache = Some(cache);
+        }
+        Ok(())
+    }
+
+    async unsafe fn create_pipeline_cache(
+        device: &wgpu::Device, data: Option<&[u8]>,
+    ) -> anyhow::Result<wgpu::PipelineCache> {
+        let memory_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let internal_scope = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let cache = unsafe { device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+            label: Some("gpui_pipeline_cache"), data, fallback: true,
+        }) };
+        let validation = validation_scope.pop().await;
+        let internal = internal_scope.pop().await;
+        let memory = memory_scope.pop().await;
+        if let Some(error) = validation.or(internal).or(memory) {
+            anyhow::bail!("Pipeline cache creation failed: {error}");
+        }
+        Ok(cache)
+    }
+
+    pub fn pipeline_cache_revision(&self) -> u64 {
+        self.pipeline_cache_revision.load(Ordering::Acquire)
+    }
+
+    pub fn pipeline_cache_data(&self) -> Option<Vec<u8>> {
+        self.pipeline_cache.as_ref()?.get_data()
+    }
+
     #[cfg(not(target_family = "wasm"))]
     pub fn new(
         instance: wgpu::Instance,
@@ -134,6 +221,8 @@ impl WgpuContext {
             adapter,
             device: Arc::new(device),
             queue: Arc::new(queue),
+            pipeline_cache: None,
+            pipeline_cache_revision: Arc::new(AtomicU64::new(0)),
             backend,
             dual_source_blending,
             color_texture_format,
@@ -203,7 +292,7 @@ impl WgpuContext {
 
         let device_lost = Arc::new(AtomicBool::new(false));
         let (device, queue, dual_source_blending, color_texture_format) =
-            Self::create_device(&adapter).await?;
+            Self::create_device(&adapter, false).await?;
         device.set_device_lost_callback({
             let device_lost = Arc::clone(&device_lost);
             move |reason, message| {
@@ -225,6 +314,8 @@ impl WgpuContext {
             adapter,
             device: Arc::new(device),
             queue: Arc::new(queue),
+            pipeline_cache: None,
+            pipeline_cache_revision: Arc::new(AtomicU64::new(0)),
             backend,
             dual_source_blending,
             color_texture_format,
@@ -235,12 +326,20 @@ impl WgpuContext {
 
     async fn create_device(
         adapter: &wgpu::Adapter,
+        enable_pipeline_cache: bool,
     ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool, TextureFormat)> {
         let dual_source_blending = adapter
             .features()
             .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
 
         let mut required_features = wgpu::Features::empty();
+        let timestamps = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        if enable_pipeline_cache && adapter.features().contains(timestamps) {
+            required_features |= timestamps;
+        }
+        if enable_pipeline_cache && adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
+            required_features |= wgpu::Features::PIPELINE_CACHE;
+        }
         if dual_source_blending {
             required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
         } else {
@@ -470,7 +569,7 @@ impl WgpuContext {
         }
 
         let (device, queue, dual_source_blending, color_atlas_texture_format) =
-            Self::create_device(adapter).await?;
+            Self::create_device(adapter, false).await?;
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
         let test_config = wgpu::SurfaceConfiguration {
