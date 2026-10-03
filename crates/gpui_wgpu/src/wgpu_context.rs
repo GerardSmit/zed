@@ -361,16 +361,45 @@ impl WgpuContext {
                 .using_alignment(adapter.limits())
         };
         #[cfg(not(target_family = "wasm"))]
-        let required_limits = wgpu::Limits::downlevel_defaults()
-            .using_resolution(adapter.limits())
-            .using_alignment(adapter.limits());
+        let required_limits = {
+            let adapter_limits = adapter.limits();
+            let mut limits = wgpu::Limits::downlevel_defaults()
+                .using_resolution(adapter_limits.clone())
+                .using_alignment(adapter_limits.clone());
+            // Vulkan only guarantees 128 for Y/Z and invocations (e.g. PowerVR
+            // Rogue); GPUI's compute work fits within the Vulkan minimums.
+            limits.max_compute_workgroup_size_x = limits
+                .max_compute_workgroup_size_x
+                .min(adapter_limits.max_compute_workgroup_size_x);
+            limits.max_compute_workgroup_size_y = limits
+                .max_compute_workgroup_size_y
+                .min(adapter_limits.max_compute_workgroup_size_y);
+            limits.max_compute_workgroup_size_z = limits
+                .max_compute_workgroup_size_z
+                .min(adapter_limits.max_compute_workgroup_size_z);
+            limits.max_compute_invocations_per_workgroup = limits
+                .max_compute_invocations_per_workgroup
+                .min(adapter_limits.max_compute_invocations_per_workgroup);
+            // Unified-memory drivers size these from the system heap, which can
+            // be below WebGPU's downlevel defaults on small boards.
+            limits.max_buffer_size = limits.max_buffer_size.min(adapter_limits.max_buffer_size);
+            limits.max_storage_buffer_binding_size = limits
+                .max_storage_buffer_binding_size
+                .min(adapter_limits.max_storage_buffer_binding_size);
+            limits
+        };
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("gpui_device"),
                 required_features,
                 required_limits,
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                // Smallest suballocation blocks wgpu allows: unified-memory
+                // boards share these frames with the rest of the system, and
+                // larger buffers get dedicated allocations anyway.
+                memory_hints: wgpu::MemoryHints::Manual {
+                    suballocated_device_memory_block_size: 4 * 1024 * 1024..4 * 1024 * 1024,
+                },
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
             })

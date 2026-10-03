@@ -1569,7 +1569,9 @@ impl WgpuRenderer {
             sample_count,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // Samples are cleared, resolved and discarded within one pass, so
+            // tile-based GPUs can keep them on chip without backing memory.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TRANSIENT,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
