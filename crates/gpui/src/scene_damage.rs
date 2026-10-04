@@ -177,10 +177,7 @@ fn footprint(
     mask: ContentMask<ScaledPixels>,
 ) -> Bounds<ScaledPixels> {
     if !finite(bounds) || !finite(mask.bounds) {
-        return Bounds::new(
-            point(ScaledPixels(f32::NAN), ScaledPixels(f32::NAN)),
-            Size::default(),
-        );
+        return invalid_bounds();
     }
     // Cover fractional edges and antialiasing, including MSAA resolve/filtering at primitive edges.
     bounds
@@ -211,10 +208,7 @@ fn sprite_footprint(
         .iter()
         .any(|point| !point.x.0.is_finite() || !point.y.0.is_finite())
     {
-        return Bounds::new(
-            point(ScaledPixels(f32::NAN), ScaledPixels(f32::NAN)),
-            Size::default(),
-        );
+        return invalid_bounds();
     }
     let mut minimum = corners[0];
     let mut maximum = corners[0];
@@ -227,41 +221,469 @@ fn sprite_footprint(
     footprint(Bounds::from_corners(minimum, maximum), mask)
 }
 
-fn changed<T>(
-    previous: &[T],
-    current: &[T],
-    equal: impl Fn(&T, &T) -> bool,
-    bounds: impl Fn(&T) -> Bounds<ScaledPixels>,
-) -> SceneDamage {
-    let mut damage = SceneDamage::None;
-    let prefix = previous
-        .iter()
-        .zip(current)
-        .take_while(|(old, new)| equal(old, new))
-        .count();
-    let previous = &previous[prefix..];
-    let current = &current[prefix..];
-    let suffix = previous
-        .iter()
-        .rev()
-        .zip(current.iter().rev())
-        .take_while(|(old, new)| equal(old, new))
-        .count();
-    let previous = &previous[..previous.len() - suffix];
-    let current = &current[..current.len() - suffix];
-    if previous.len() == current.len() {
-        for (old, new) in previous.iter().zip(current) {
-            if !equal(old, new) {
-                damage.include(bounds(old));
-                damage.include(bounds(new));
+const MAX_CONTENT_COMPARISONS: usize = 1 << 20;
+const MAX_ORDER_CHECKS: usize = 1 << 21;
+
+fn invalid_bounds() -> Bounds<ScaledPixels> {
+    Bounds::new(
+        point(ScaledPixels(f32::NAN), ScaledPixels(f32::NAN)),
+        Size::default(),
+    )
+}
+
+/// Position in the renderer's paint sequence: batches interleave kinds by `(order, kind)` and
+/// draw each kind's instances in array order.
+type DrawKey = (DrawOrder, PrimitiveKind, usize);
+
+#[derive(Clone, Copy)]
+struct ContentEntry {
+    hash: u64,
+    draw: DrawKey,
+}
+
+#[derive(Clone, Copy)]
+struct MatchedPrimitive {
+    previous: DrawKey,
+    current: DrawKey,
+    footprint: Bounds<ScaledPixels>,
+}
+
+/// Buffers reused across frames by content-based damage, sized by the largest scene compared.
+#[derive(Default)]
+pub(super) struct DamageScratch {
+    previous: Vec<ContentEntry>,
+    current: Vec<ContentEntry>,
+    previous_matched: Vec<bool>,
+    matched: Vec<MatchedPrimitive>,
+    tails: Vec<usize>,
+    predecessors: Vec<usize>,
+    in_order: Vec<bool>,
+}
+
+trait DamagePrimitive {
+    const KIND: PrimitiveKind;
+    fn order(&self) -> DrawOrder;
+    /// Must agree with `same_content`: equal content implies an equal hash.
+    fn content_hash(&self) -> u64;
+    /// Whether two primitives rasterize identically, ignoring only their draw order.
+    fn same_content(&self, other: &Self) -> bool;
+    fn damage_footprint(&self) -> Bounds<ScaledPixels>;
+}
+
+fn mix(hash: u64, value: u64) -> u64 {
+    (hash.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95)
+}
+
+fn geometry_hash(
+    kind: PrimitiveKind,
+    bounds: Bounds<ScaledPixels>,
+    mask: ContentMask<ScaledPixels>,
+) -> u64 {
+    [
+        bounds.origin.x,
+        bounds.origin.y,
+        bounds.size.width,
+        bounds.size.height,
+        mask.bounds.origin.x,
+        mask.bounds.origin.y,
+        mask.bounds.size.width,
+        mask.bounds.size.height,
+    ]
+    .iter()
+    // Positive and negative zero compare equal, so they must hash equally.
+    .fold(kind as u64, |hash, value| {
+        mix(
+            hash,
+            if value.0 == 0. {
+                0
+            } else {
+                value.0.to_bits() as u64
+            },
+        )
+    })
+}
+
+macro_rules! damage_primitive {
+    ($type:ty, $kind:ident, |$value:ident| $footprint:expr) => {
+        impl DamagePrimitive for $type {
+            const KIND: PrimitiveKind = PrimitiveKind::$kind;
+
+            fn order(&self) -> DrawOrder {
+                self.order
+            }
+
+            fn content_hash(&self) -> u64 {
+                geometry_hash(Self::KIND, self.bounds, self.content_mask)
+            }
+
+            fn same_content(&self, other: &Self) -> bool {
+                Self { order: 0, ..*self } == Self { order: 0, ..*other }
+            }
+
+            fn damage_footprint(&self) -> Bounds<ScaledPixels> {
+                let $value = self;
+                $footprint
             }
         }
-    } else {
-        for value in previous.iter().chain(current) {
-            damage.include(bounds(value));
+    };
+}
+
+damage_primitive!(Shadow, Shadow, |value| shadow_footprint(value));
+damage_primitive!(Quad, Quad, |value| footprint(
+    value.bounds,
+    value.content_mask
+));
+damage_primitive!(Shape, Shape, |value| footprint(
+    value.bounds,
+    value.content_mask
+));
+damage_primitive!(Underline, Underline, |value| footprint(
+    value.bounds,
+    value.content_mask
+));
+damage_primitive!(
+    MonochromeSprite,
+    MonochromeSprite,
+    |value| sprite_footprint(value.bounds, value.content_mask, value.transformation)
+);
+damage_primitive!(SubpixelSprite, SubpixelSprite, |value| sprite_footprint(
+    value.bounds,
+    value.content_mask,
+    value.transformation
+));
+damage_primitive!(PolychromeSprite, PolychromeSprite, |value| footprint(
+    value.bounds,
+    value.content_mask
+));
+
+impl DamagePrimitive for Path<ScaledPixels> {
+    const KIND: PrimitiveKind = PrimitiveKind::Path;
+
+    fn order(&self) -> DrawOrder {
+        self.order
+    }
+
+    fn content_hash(&self) -> u64 {
+        geometry_hash(Self::KIND, self.bounds, self.content_mask)
+    }
+
+    // `id` is the path's index in this scene, so it changes whenever earlier paths do.
+    fn same_content(&self, other: &Self) -> bool {
+        self.bounds == other.bounds
+            && self.content_mask == other.content_mask
+            && self.color == other.color
+            && self.start == other.start
+            && self.current == other.current
+            && self.contour_count == other.contour_count
+            && self.vertices == other.vertices
+    }
+
+    fn damage_footprint(&self) -> Bounds<ScaledPixels> {
+        footprint(self.bounds, self.content_mask)
+    }
+}
+
+impl DamagePrimitive for PaintSurface {
+    const KIND: PrimitiveKind = PrimitiveKind::Surface;
+
+    fn order(&self) -> DrawOrder {
+        self.order
+    }
+
+    fn content_hash(&self) -> u64 {
+        geometry_hash(Self::KIND, self.bounds, self.content_mask)
+    }
+
+    // Only layer composites are comparable; changes inside a layer are added separately.
+    fn same_content(&self, other: &Self) -> bool {
+        self.bounds == other.bounds
+            && self.content_mask == other.content_mask
+            && self.stretch == other.stretch
+            && matches!(
+                (&self.source, &other.source),
+                (PaintSurfaceSource::Layer(old), PaintSurfaceSource::Layer(new)) if old == new
+            )
+    }
+
+    fn damage_footprint(&self) -> Bounds<ScaledPixels> {
+        footprint(self.bounds, self.content_mask)
+    }
+}
+
+fn identical<T: DamagePrimitive>(previous: &[T], current: &[T]) -> bool {
+    previous.len() == current.len()
+        && previous
+            .iter()
+            .zip(current)
+            .all(|(old, new)| old.order() == new.order() && old.same_content(new))
+}
+
+fn push_entries<T: DamagePrimitive>(entries: &mut Vec<ContentEntry>, primitives: &[T]) {
+    entries.extend(
+        primitives
+            .iter()
+            .enumerate()
+            .map(|(index, primitive)| ContentEntry {
+                hash: primitive.content_hash(),
+                draw: (primitive.order(), T::KIND, index),
+            }),
+    );
+}
+
+fn collect_entries(scene: &Scene, entries: &mut Vec<ContentEntry>) {
+    entries.clear();
+    push_entries(entries, &scene.shadows);
+    push_entries(entries, &scene.quads);
+    push_entries(entries, &scene.shapes);
+    push_entries(entries, &scene.paths);
+    push_entries(entries, &scene.underlines);
+    push_entries(entries, &scene.monochrome_sprites);
+    push_entries(entries, &scene.subpixel_sprites);
+    push_entries(entries, &scene.polychrome_sprites);
+    push_entries(entries, &scene.surfaces);
+    // Within a hash group, matching walks both frames in paint order so duplicates pair up
+    // without reordering among themselves.
+    entries.sort_unstable_by_key(|entry| (entry.hash, entry.draw));
+}
+
+fn primitive_footprint(scene: &Scene, (_, kind, index): DrawKey) -> Bounds<ScaledPixels> {
+    fn get<T: DamagePrimitive>(primitives: &[T], index: usize) -> Bounds<ScaledPixels> {
+        primitives
+            .get(index)
+            .map_or_else(invalid_bounds, DamagePrimitive::damage_footprint)
+    }
+    match kind {
+        PrimitiveKind::Shadow => get(&scene.shadows, index),
+        PrimitiveKind::Quad => get(&scene.quads, index),
+        PrimitiveKind::Shape => get(&scene.shapes, index),
+        PrimitiveKind::Path => get(&scene.paths, index),
+        PrimitiveKind::Underline => get(&scene.underlines, index),
+        PrimitiveKind::MonochromeSprite => get(&scene.monochrome_sprites, index),
+        PrimitiveKind::SubpixelSprite => get(&scene.subpixel_sprites, index),
+        PrimitiveKind::PolychromeSprite => get(&scene.polychrome_sprites, index),
+        PrimitiveKind::Surface => get(&scene.surfaces, index),
+    }
+}
+
+fn same_primitive(
+    previous: &Scene,
+    current: &Scene,
+    (_, previous_kind, previous_index): DrawKey,
+    (_, current_kind, current_index): DrawKey,
+) -> bool {
+    fn same<T: DamagePrimitive>(previous: &[T], current: &[T], old: usize, new: usize) -> bool {
+        match (previous.get(old), current.get(new)) {
+            (Some(old), Some(new)) => old.same_content(new),
+            _ => false,
         }
     }
-    damage
+    let (old, new) = (previous_index, current_index);
+    previous_kind == current_kind
+        && match current_kind {
+            PrimitiveKind::Shadow => same(&previous.shadows, &current.shadows, old, new),
+            PrimitiveKind::Quad => same(&previous.quads, &current.quads, old, new),
+            PrimitiveKind::Shape => same(&previous.shapes, &current.shapes, old, new),
+            PrimitiveKind::Path => same(&previous.paths, &current.paths, old, new),
+            PrimitiveKind::Underline => same(&previous.underlines, &current.underlines, old, new),
+            PrimitiveKind::MonochromeSprite => same(
+                &previous.monochrome_sprites,
+                &current.monochrome_sprites,
+                old,
+                new,
+            ),
+            PrimitiveKind::SubpixelSprite => same(
+                &previous.subpixel_sprites,
+                &current.subpixel_sprites,
+                old,
+                new,
+            ),
+            PrimitiveKind::PolychromeSprite => same(
+                &previous.polychrome_sprites,
+                &current.polychrome_sprites,
+                old,
+                new,
+            ),
+            PrimitiveKind::Surface => same(&previous.surfaces, &current.surfaces, old, new),
+        }
+}
+
+impl DamageScratch {
+    /// Damage from primitives present in only one frame, plus overlaps whose paint order flipped.
+    ///
+    /// A pixel's value depends only on the primitives covering it and their relative paint
+    /// order. Primitives drawn identically in both frames are paired up; unpaired ones damage
+    /// their footprint, and paired ones whose order flipped damage the area they share.
+    fn compare(&mut self, previous: &Scene, current: &Scene) -> SceneDamage {
+        if identical(&previous.shadows, &current.shadows)
+            && identical(&previous.quads, &current.quads)
+            && identical(&previous.shapes, &current.shapes)
+            && identical(&previous.paths, &current.paths)
+            && identical(&previous.underlines, &current.underlines)
+            && identical(&previous.monochrome_sprites, &current.monochrome_sprites)
+            && identical(&previous.subpixel_sprites, &current.subpixel_sprites)
+            && identical(&previous.polychrome_sprites, &current.polychrome_sprites)
+            && identical(&previous.surfaces, &current.surfaces)
+        {
+            return SceneDamage::None;
+        }
+
+        let Self {
+            previous: previous_entries,
+            current: current_entries,
+            previous_matched,
+            matched,
+            tails,
+            predecessors,
+            in_order,
+        } = self;
+        collect_entries(previous, previous_entries);
+        collect_entries(current, current_entries);
+        previous_matched.clear();
+        previous_matched.resize(previous_entries.len(), false);
+        matched.clear();
+
+        let mut damage = SceneDamage::None;
+        let mut comparisons = 0;
+        let (mut previous_start, mut current_start) = (0, 0);
+        loop {
+            let hash = match (
+                previous_entries.get(previous_start),
+                current_entries.get(current_start),
+            ) {
+                (Some(old), Some(new)) => old.hash.min(new.hash),
+                (Some(old), None) => old.hash,
+                (None, Some(new)) => new.hash,
+                (None, None) => break,
+            };
+            let previous_end = previous_start
+                + previous_entries[previous_start..]
+                    .iter()
+                    .take_while(|entry| entry.hash == hash)
+                    .count();
+            let current_end = current_start
+                + current_entries[current_start..]
+                    .iter()
+                    .take_while(|entry| entry.hash == hash)
+                    .count();
+            let mut first_unmatched = previous_start;
+            for new in &current_entries[current_start..current_end] {
+                while previous_matched
+                    .get(first_unmatched)
+                    .is_some_and(|matched| *matched)
+                {
+                    first_unmatched += 1;
+                }
+                let mut found = None;
+                for candidate in first_unmatched..previous_end {
+                    if previous_matched[candidate] {
+                        continue;
+                    }
+                    // Past the budget, leaving primitives unpaired only over-reports damage.
+                    if comparisons == MAX_CONTENT_COMPARISONS {
+                        break;
+                    }
+                    comparisons += 1;
+                    if same_primitive(
+                        previous,
+                        current,
+                        previous_entries[candidate].draw,
+                        new.draw,
+                    ) {
+                        found = Some(candidate);
+                        break;
+                    }
+                }
+                let footprint = primitive_footprint(current, new.draw);
+                if let Some(candidate) = found {
+                    previous_matched[candidate] = true;
+                    matched.push(MatchedPrimitive {
+                        previous: previous_entries[candidate].draw,
+                        current: new.draw,
+                        footprint,
+                    });
+                } else {
+                    damage.include(footprint);
+                }
+            }
+            previous_start = previous_end;
+            current_start = current_end;
+        }
+        for (entry, matched) in previous_entries.iter().zip(previous_matched.iter()) {
+            if !matched {
+                damage.include(primitive_footprint(previous, entry.draw));
+            }
+        }
+
+        matched.sort_unstable_by_key(|primitive| primitive.previous);
+        if matched
+            .windows(2)
+            .all(|pair| pair[0].current < pair[1].current)
+        {
+            return damage;
+        }
+        // Every pair whose relative order flipped has at least one member outside a longest
+        // order-preserving subsequence, so only those members need checking against the rest.
+        mark_longest_in_order(matched, tails, predecessors, in_order);
+        let moved = in_order.iter().filter(|kept| !**kept).count();
+        let check_overlaps = moved.saturating_mul(matched.len()) <= MAX_ORDER_CHECKS;
+        for (primitive, kept) in matched.iter().zip(in_order.iter()) {
+            if *kept {
+                continue;
+            }
+            if !check_overlaps {
+                damage.include(primitive.footprint);
+                continue;
+            }
+            for other in matched.iter() {
+                if (primitive.previous < other.previous) == (primitive.current < other.current) {
+                    continue;
+                }
+                if finite(primitive.footprint) && finite(other.footprint) {
+                    damage.include(primitive.footprint.intersect(&other.footprint));
+                } else {
+                    damage.include(invalid_bounds());
+                }
+            }
+        }
+        damage
+    }
+}
+
+/// Marks one longest subsequence whose current paint order is increasing, given primitives
+/// sorted by their previous paint order.
+fn mark_longest_in_order(
+    matched: &[MatchedPrimitive],
+    tails: &mut Vec<usize>,
+    predecessors: &mut Vec<usize>,
+    in_order: &mut Vec<bool>,
+) {
+    tails.clear();
+    predecessors.clear();
+    in_order.clear();
+    in_order.resize(matched.len(), false);
+    for (index, primitive) in matched.iter().enumerate() {
+        let position = tails.partition_point(|tail| {
+            matched
+                .get(*tail)
+                .is_some_and(|tail| tail.current < primitive.current)
+        });
+        predecessors.push(
+            position
+                .checked_sub(1)
+                .and_then(|previous| tails.get(previous).copied())
+                .unwrap_or(usize::MAX),
+        );
+        if let Some(tail) = tails.get_mut(position) {
+            *tail = index;
+        } else {
+            tails.push(index);
+        }
+    }
+    let mut index = tails.last().copied().unwrap_or(usize::MAX);
+    while let Some(kept) = in_order.get_mut(index) {
+        *kept = true;
+        index = predecessors.get(index).copied().unwrap_or(usize::MAX);
+    }
 }
 
 impl Scene {
@@ -314,7 +736,8 @@ impl Scene {
         }
     }
 
-    /// Compare final primitive values, including draw order, without retaining another scene copy.
+    /// Compare final primitive values and their overlapping paint order, without retaining another
+    /// scene copy.
     /// `pending` preserves changes from frames drawn but not yet presented.
     pub fn update_damage(&mut self, previous: &Scene, pending: bool) {
         for layer in &mut self.layers {
@@ -346,40 +769,9 @@ impl Scene {
             self.damage = SceneDamage::Full;
             return;
         }
-        let mut damage = SceneDamage::None;
-        macro_rules! compare {
-            ($field:ident, $bounds:expr) => {
-                damage.extend(changed(
-                    &previous.$field,
-                    &self.$field,
-                    |old, new| old == new,
-                    $bounds,
-                ));
-            };
-            ($field:ident) => {
-                compare!($field, |value| footprint(value.bounds, value.content_mask));
-            };
-        }
-        compare!(shadows, shadow_footprint);
-        compare!(quads);
-        compare!(shapes);
-        compare!(paths);
-        compare!(underlines);
-        compare!(monochrome_sprites, |value| sprite_footprint(
-            value.bounds,
-            value.content_mask,
-            value.transformation
-        ));
-        compare!(subpixel_sprites, |value| sprite_footprint(
-            value.bounds,
-            value.content_mask,
-            value.transformation
-        ));
-        compare!(polychrome_sprites);
-        damage.extend(changed(&previous.surfaces, &self.surfaces, |old, new| {
-            old.order == new.order && old.bounds == new.bounds && old.content_mask == new.content_mask && old.stretch == new.stretch
-                && matches!((&old.source, &new.source), (PaintSurfaceSource::Layer(old), PaintSurfaceSource::Layer(new)) if old == new)
-        }, |surface| footprint(surface.bounds, surface.content_mask)));
+        let mut scratch = std::mem::take(&mut self.damage_scratch);
+        let mut damage = scratch.compare(previous, self);
+        self.damage_scratch = scratch;
         for surface in &self.surfaces {
             let PaintSurfaceSource::Layer(id) = surface.source else {
                 continue;
@@ -607,7 +999,7 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{rgba, size};
+    use crate::{AtlasTextureKind, TileId, rgba, size};
 
     fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
         Bounds::new(
@@ -842,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn movement_removal_and_order_include_old_pixels() {
+    fn movement_and_removal_include_old_pixels() {
         let mut old = Scene::default();
         old.quads.push(quad(20.));
         let mut new = Scene::default();
@@ -852,12 +1244,251 @@ mod tests {
         new.quads.clear();
         new.update_damage(&old, false);
         assert_eq!(new.damage, SceneDamage::Partial(rect(19., 19., 12., 12.)));
+        // A draw order value alone changes no pixels unless another primitive overlaps.
         new.quads.push(Quad {
             order: 1,
             ..quad(20.)
         });
         new.update_damage(&old, false);
-        assert_eq!(new.damage, SceneDamage::Partial(rect(19., 19., 12., 12.)));
+        assert_eq!(new.damage, SceneDamage::None);
+    }
+
+    fn glyph(x: f32, tile_id: u32) -> MonochromeSprite {
+        MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: rect(x, 20., 8., 16.),
+            content_mask: ContentMask {
+                bounds: rect(0., 0., 1000., 200.),
+                ..Default::default()
+            },
+            color: Hsla::default(),
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: AtlasTextureKind::Monochrome,
+                },
+                tile_id: TileId(tile_id),
+                padding: 0,
+                bounds: Bounds::default(),
+            },
+            transformation: TransformationMatrix::unit(),
+        }
+    }
+
+    fn text_scene(glyphs: impl IntoIterator<Item = MonochromeSprite>) -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: rect(0., 0., 1000., 100.),
+            content_mask: glyph(0., 0).content_mask,
+            ..quad(0.)
+        });
+        for glyph in glyphs {
+            scene.insert_primitive(glyph);
+        }
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn changing_one_glyph_damages_only_that_glyph() {
+        // Glyph boxes overlap their neighbours, so a changed box would also renumber later orders.
+        let tiles = |changed: u32| {
+            (0..80).map(move |index| {
+                let tile = if index == 40 { changed } else { index % 10 };
+                glyph(index as f32 * 7., tile)
+            })
+        };
+        let old = text_scene(tiles(3));
+        let mut new = text_scene(tiles(4));
+        new.update_damage(&old, false);
+        assert_eq!(
+            new.damage,
+            SceneDamage::Partial(footprint(
+                glyph(280., 0).bounds,
+                glyph(280., 0).content_mask
+            ))
+        );
+
+        let narrower = |index: usize| {
+            let mut value = glyph(index as f32 * 7., index as u32 % 10);
+            if index == 40 {
+                value.bounds.size.width = ScaledPixels(5.);
+            }
+            value
+        };
+        let mut new = text_scene((0..80).map(narrower));
+        assert_ne!(
+            new.monochrome_sprites
+                .iter()
+                .map(|sprite| sprite.order)
+                .collect::<Vec<_>>(),
+            old.monochrome_sprites
+                .iter()
+                .map(|sprite| sprite.order)
+                .collect::<Vec<_>>()
+        );
+        new.update_damage(&old, false);
+        assert_eq!(new.damage, SceneDamage::Partial(rect(279., 19., 10., 18.)));
+    }
+
+    fn wide_quad(x: f32) -> Quad {
+        Quad {
+            content_mask: glyph(0., 0).content_mask,
+            ..quad(x)
+        }
+    }
+
+    #[test]
+    fn inserting_a_primitive_damages_only_its_footprint() {
+        let row = |inserted: bool| {
+            let mut scene = Scene::default();
+            for index in 0..20 {
+                scene.insert_primitive(wide_quad(index as f32 * 40.));
+                if inserted && index == 9 {
+                    scene.insert_primitive(Underline {
+                        order: 0,
+                        pad: 0,
+                        bounds: rect(380., 50., 30., 2.),
+                        content_mask: wide_quad(0.).content_mask,
+                        color: Hsla::default(),
+                        thickness: ScaledPixels(1.),
+                        wavy: false.into(),
+                    });
+                    scene.insert_primitive(Quad {
+                        bounds: rect(380., 60., 10., 10.),
+                        ..wide_quad(0.)
+                    });
+                }
+            }
+            scene.finish();
+            scene
+        };
+        let old = row(false);
+        let mut new = row(true);
+        new.update_damage(&old, false);
+        let viewport = size(DevicePixels(1000), DevicePixels(200));
+        let mut rects: Vec<_> = new
+            .damage
+            .pixel_rects(viewport)
+            .map(|bounds| (bounds.origin.y.0, bounds.size.width.0, bounds.size.height.0))
+            .collect();
+        rects.sort();
+        assert_eq!(rects, [(49, 32, 4), (59, 12, 12)]);
+        assert!(
+            new.damage
+                .pixel_rects(viewport)
+                .all(|bounds| bounds.origin.x.0 == 379)
+        );
+    }
+
+    #[test]
+    fn moving_a_primitive_damages_old_and_new_bounds_separately() {
+        let scene = |moved: f32| {
+            let mut scene = Scene::default();
+            for x in [0., 40., 80., 400.] {
+                scene.insert_primitive(wide_quad(x));
+            }
+            scene.insert_primitive(wide_quad(moved));
+            scene.finish();
+            scene
+        };
+        let old = scene(150.);
+        let mut new = scene(300.);
+        new.update_damage(&old, false);
+        let viewport = size(DevicePixels(1000), DevicePixels(200));
+        let rects: Vec<_> = new.damage.pixel_rects(viewport).collect();
+        assert_eq!(rects.len(), 2);
+        assert!(new.damage.intersects(rect(150., 20., 10., 10.)));
+        assert!(new.damage.intersects(rect(300., 20., 10., 10.)));
+        assert!(!new.damage.intersects(rect(200., 20., 10., 10.)));
+        assert!(!new.damage.intersects(rect(80., 20., 10., 10.)));
+    }
+
+    #[test]
+    fn swapping_overlapping_primitives_damages_their_overlap() {
+        let first = Quad {
+            bounds: rect(20., 20., 20., 20.),
+            background: rgba(0xff0000ff).into(),
+            ..quad(0.)
+        };
+        let second = Quad {
+            bounds: rect(30., 30., 20., 20.),
+            background: rgba(0x0000ffff).into(),
+            ..quad(0.)
+        };
+        let far = |order| Quad {
+            order,
+            bounds: rect(150., 150., 10., 10.),
+            ..quad(0.)
+        };
+        let mut old = Scene::default();
+        old.quads = vec![
+            far(0),
+            Quad { order: 1, ..first },
+            Quad { order: 2, ..second },
+        ];
+        let mut new = Scene::default();
+        // The distant quad also changes relative order, but overlaps neither.
+        new.quads = vec![
+            Quad { order: 1, ..second },
+            Quad { order: 2, ..first },
+            far(3),
+        ];
+        new.update_damage(&old, false);
+        assert_eq!(new.damage, SceneDamage::Partial(rect(29., 29., 12., 12.)));
+
+        // Kinds interleave by draw order, so a sprite moving under a quad is a swap too.
+        let sprite = MonochromeSprite {
+            bounds: rect(25., 25., 8., 8.),
+            ..glyph(0., 1)
+        };
+        let mut old = Scene::default();
+        old.quads = vec![Quad { order: 1, ..first }];
+        old.monochrome_sprites = vec![MonochromeSprite { order: 2, ..sprite }];
+        let mut new = Scene::default();
+        new.monochrome_sprites = vec![MonochromeSprite { order: 1, ..sprite }];
+        new.quads = vec![Quad { order: 2, ..first }];
+        new.update_damage(&old, false);
+        assert_eq!(new.damage, SceneDamage::Partial(rect(24., 24., 10., 10.)));
+    }
+
+    #[test]
+    fn identical_frames_have_no_damage() {
+        let build = || text_scene((0..50).map(|index| glyph(index as f32 * 7., index % 7)));
+        let old = build();
+        let mut new = build();
+        new.update_damage(&old, false);
+        assert_eq!(new.damage, SceneDamage::None);
+
+        // Duplicates pair up, and a frame re-sorted only among non-overlapping primitives is
+        // unchanged on screen.
+        let mut old = Scene::default();
+        old.quads = vec![
+            quad(20.),
+            quad(20.),
+            Quad {
+                order: 1,
+                ..quad(60.)
+            },
+        ];
+        let mut new = Scene::default();
+        new.quads = vec![
+            Quad {
+                order: 0,
+                ..quad(60.)
+            },
+            Quad {
+                order: 4,
+                ..quad(20.)
+            },
+            Quad {
+                order: 4,
+                ..quad(20.)
+            },
+        ];
+        new.update_damage(&old, false);
+        assert_eq!(new.damage, SceneDamage::None);
     }
 
     #[test]

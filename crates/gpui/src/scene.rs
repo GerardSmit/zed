@@ -65,6 +65,7 @@ pub struct Scene {
     /// texture, then the main scene composites it via a `PaintSurface` with
     /// `SurfaceSource::Layer(id)`. See `Window::paint_layer`.
     pub layers: Vec<SceneLayer>,
+    damage_scratch: damage::DamageScratch,
 }
 
 /// One cached render layer captured during a frame's paint (see [`Scene::layers`]).
