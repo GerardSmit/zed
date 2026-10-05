@@ -1546,6 +1546,12 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
 }
 
 impl Window {
+    /// Returns the painted bounds of the element tagged with the given debug selector.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn debug_bounds(&self, selector: &str) -> Option<Bounds<Pixels>> {
+        self.rendered_frame.debug_bounds.get(selector).copied()
+    }
+
     pub(crate) fn new(
         handle: AnyWindowHandle,
         options: WindowOptions,
