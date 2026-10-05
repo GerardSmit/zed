@@ -57,6 +57,7 @@ pub struct TextSystem {
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
+    letter_spacing: Arc<LetterSpacing>,
 }
 
 impl TextSystem {
@@ -69,6 +70,7 @@ impl TextSystem {
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
+            letter_spacing: Arc::default(),
             fallback_font_stack: smallvec![
                 // TODO: Remove this when Linux have implemented setting fallbacks.
                 font(".ZedMono"),
@@ -122,6 +124,10 @@ impl TextSystem {
             font_id
         } else {
             let font_id = self.platform_text_system.font_id(font);
+            if let Ok(id) = &font_id {
+                self.letter_spacing
+                    .register(*id, font.features.letter_spacing());
+            }
             self.font_ids_by_font
                 .write()
                 .insert(font.clone(), clone_font_id_result(&font_id));
@@ -410,7 +416,10 @@ impl WindowTextSystem {
     /// Create a new WindowTextSystem with the given TextSystem.
     pub fn new(text_system: Arc<TextSystem>) -> Self {
         Self {
-            line_layout_cache: LineLayoutCache::new(text_system.platform_text_system.clone()),
+            line_layout_cache: LineLayoutCache::new(
+                text_system.platform_text_system.clone(),
+                text_system.letter_spacing.clone(),
+            ),
             text_system,
         }
     }

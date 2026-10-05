@@ -3,6 +3,10 @@ use std::sync::Arc;
 
 use schemars::{JsonSchema, json_schema};
 
+/// The private tag [`FontFeatures::with_letter_spacing`] stores its amount under. Fonts define no
+/// feature by that name, so shapers ignore it.
+pub const LETTER_SPACING_TAG: &str = "HSLS";
+
 /// The OpenType features that can be configured for a given font.
 #[derive(Default, Clone, Eq, PartialEq, Hash)]
 pub struct FontFeatures(pub Arc<Vec<(String, u32)>>);
@@ -17,6 +21,31 @@ impl FontFeatures {
     /// only enabled or disabled features are returned
     pub fn tag_value_list(&self) -> &[(String, u32)] {
         self.0.as_slice()
+    }
+
+    /// These features with extra room after every character, in thousandths of an em of the text
+    /// it is laid out at (tightened when negative). The amount rides in a private tag, so fonts
+    /// that differ only by it resolve to distinct font ids, and line layout applies it.
+    pub fn with_letter_spacing(&self, milli_em: i32) -> Self {
+        let mut features: Vec<(String, u32)> = self
+            .0
+            .iter()
+            .filter(|(tag, _)| tag != LETTER_SPACING_TAG)
+            .cloned()
+            .collect();
+        if milli_em != 0 {
+            features.push((LETTER_SPACING_TAG.into(), milli_em as u32));
+        }
+        Self(Arc::new(features))
+    }
+
+    /// The letter spacing [`Self::with_letter_spacing`] set, in thousandths of an em.
+    pub fn letter_spacing(&self) -> Option<i32> {
+        self.0
+            .iter()
+            .find(|(tag, _)| tag == LETTER_SPACING_TAG)
+            .map(|(_, value)| *value as i32)
+            .filter(|value| *value != 0)
     }
 
     /// Returns whether the `calt` feature is enabled.

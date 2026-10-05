@@ -455,6 +455,70 @@ pub(crate) struct LineLayoutCache {
     previous_frame: Mutex<FrameCache>,
     current_frame: RwLock<FrameCache>,
     platform_text_system: Arc<dyn PlatformTextSystem>,
+    letter_spacing: Arc<LetterSpacing>,
+}
+
+/// The letter spacing each font id was resolved with, from
+/// [`crate::FontFeatures::with_letter_spacing`].
+#[derive(Default)]
+pub(crate) struct LetterSpacing {
+    spaced: RwLock<FxHashMap<FontId, i32>>,
+    /// Ids some font without letter spacing resolved to. A platform that hands one id to fonts
+    /// that differ only by spacing (a missing family falling back) keeps that id unspaced.
+    plain: RwLock<collections::FxHashSet<FontId>>,
+}
+
+impl LetterSpacing {
+    pub(crate) fn register(&self, id: FontId, milli_em: Option<i32>) {
+        match milli_em {
+            Some(milli_em) => {
+                if !self.plain.read().contains(&id) {
+                    self.spaced.write().insert(id, milli_em);
+                }
+            }
+            None => {
+                if self.plain.write().insert(id) {
+                    self.spaced.write().remove(&id);
+                }
+            }
+        }
+    }
+
+    /// Moves each glyph right by the spacing of the characters before it, and widens the line
+    /// by the whole amount. Marks that do not advance past their base take no spacing of their own.
+    fn apply(&self, layout: &mut LineLayout, font_size: Pixels, runs: &[FontRun]) {
+        let spaced = self.spaced.read();
+        if spaced.is_empty() || !runs.iter().any(|run| spaced.contains_key(&run.font_id)) {
+            return;
+        }
+        let spacing_at = |index: usize| {
+            let mut start = 0;
+            for run in runs {
+                if index < start + run.len {
+                    return spaced
+                        .get(&run.font_id)
+                        .map_or(px(0.), |milli_em| font_size * (*milli_em as f32 / 1000.));
+                }
+                start += run.len;
+            }
+            px(0.)
+        };
+        let mut shift = px(0.);
+        let mut pending = px(0.);
+        let mut last_x = px(f32::NEG_INFINITY);
+        for run in layout.runs.iter_mut() {
+            for glyph in run.glyphs.iter_mut() {
+                let shaped_x = glyph.position.x;
+                if shaped_x > last_x {
+                    shift += pending;
+                    pending = spacing_at(glyph.index);
+                    last_x = shaped_x;
+                }
+                glyph.position.x += shift;
+            }
+        }
+        layout.width = (layout.width + shift + pending).max(px(0.));
+    }
 }
 
 #[derive(Default)]
@@ -485,11 +549,15 @@ pub(crate) struct LineLayoutIndex {
 }
 
 impl LineLayoutCache {
-    pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
+    pub fn new(
+        platform_text_system: Arc<dyn PlatformTextSystem>,
+        letter_spacing: Arc<LetterSpacing>,
+    ) -> Self {
         Self {
             previous_frame: Mutex::default(),
             current_frame: RwLock::default(),
             platform_text_system,
+            letter_spacing,
         }
     }
 
@@ -670,6 +738,7 @@ impl LineLayoutCache {
             let mut layout = self
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
+            self.letter_spacing.apply(&mut layout, font_size, runs);
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -819,6 +888,7 @@ impl LineLayoutCache {
         let mut layout = self
             .platform_text_system
             .layout_line(&text, font_size, runs);
+        self.letter_spacing.apply(&mut layout, font_size, runs);
 
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
@@ -1136,5 +1206,37 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn letter_spacing_follows_each_character_of_its_run_but_not_marks() {
+        let spacing = LetterSpacing::default();
+        spacing.register(FontId(1), None);
+        spacing.register(FontId(2), Some(250));
+        // "ab" spaced (a quarter em, 4px at 16px), a mark on "b", then "c" not spaced.
+        let mut layout = make_layout(vec![
+            glyph_at(0., 0),
+            glyph_at(8., 1),
+            glyph_at(8., 2),
+            glyph_at(16., 4),
+        ]);
+        layout.width = px(24.);
+        let runs = [
+            FontRun { len: 4, font_id: FontId(2) },
+            FontRun { len: 1, font_id: FontId(1) },
+        ];
+        spacing.apply(&mut layout, px(16.), &runs);
+        assert_eq!(glyph_x_positions(&layout), vec![0., 12., 12., 24.]);
+        assert_eq!(layout.width, px(32.));
+    }
+
+    #[test]
+    fn an_id_a_plain_font_resolved_to_is_never_spaced() {
+        let spacing = LetterSpacing::default();
+        spacing.register(FontId(0), None);
+        spacing.register(FontId(0), Some(100));
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(8., 1)]);
+        spacing.apply(&mut layout, px(16.), &[FontRun { len: 2, font_id: FontId(0) }]);
+        assert_eq!(glyph_x_positions(&layout), vec![0., 8.]);
     }
 }

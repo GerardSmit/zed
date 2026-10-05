@@ -1148,8 +1148,12 @@ impl PlatformTextSystem for NoopTextSystem {
         Vec::new()
     }
 
-    fn font_id(&self, _descriptor: &Font) -> Result<FontId> {
-        Ok(FontId(1))
+    fn font_id(&self, descriptor: &Font) -> Result<FontId> {
+        // Letter-spaced fonts get ids of their own, as a real text system's do.
+        Ok(descriptor
+            .features
+            .letter_spacing()
+            .map_or(FontId(1), |milli_em| FontId(2 + (milli_em as u16) as usize)))
     }
 
     fn font_metrics(&self, _font_id: FontId) -> FontMetrics {
