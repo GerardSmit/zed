@@ -38,6 +38,7 @@ struct WgpuAtlasState {
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     pending_uploads: Vec<PendingUpload>,
     upload_ring: Option<crate::upload_ring::UploadRing>,
+    merged_uploads: bool,
 }
 
 pub struct WgpuTextureInfo {
@@ -60,6 +61,7 @@ impl WgpuAtlas {
             tiles_by_key: Default::default(),
             pending_uploads: Vec::new(),
             upload_ring: None,
+            merged_uploads: false,
         }))
     }
 
@@ -73,6 +75,13 @@ impl WgpuAtlas {
 
     pub(crate) fn before_external_frame(&self) -> Result<bool> {
         self.0.lock().flush_ring_uploads()
+    }
+
+    /// Copy each frame's new tiles into an atlas texture with as few copy regions as fit the
+    /// staging buffer, instead of one region per tile; see [`merge_upload_regions`]. Only the
+    /// external-target path (`before_external_frame`) merges.
+    pub fn set_merged_uploads(&self, merged: bool) {
+        self.0.lock().merged_uploads = merged;
     }
 
     pub fn before_frame(&self) {
@@ -230,7 +239,7 @@ impl WgpuAtlasState {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | ATLAS_TEST_USAGE,
             view_formats: &[],
         });
 
@@ -250,6 +259,11 @@ impl WgpuAtlasState {
             view,
             live_atlas_keys: 0,
             bind_group: Default::default(),
+            shadow: (self.merged_uploads && texture_bytes(size, format) <= SHADOW_MAX_BYTES).then(|| {
+                let bpp = format.block_copy_size(None).unwrap_or(4) as usize;
+                vec![0; size.width.0 as usize * size.height.0 as usize * bpp]
+            }),
+            initialized: false,
         };
 
         if let Some(ix) = index {
@@ -275,6 +289,9 @@ impl WgpuAtlasState {
             .get(id)
             .map(|texture| swizzle_upload_data(bytes, texture.format))
             .unwrap_or_else(|| bytes.to_vec());
+        if let Some(texture) = self.storage.get_mut(id) {
+            texture.write_shadow(bounds, &data);
+        }
 
         self.pending_uploads
             .push(PendingUpload { id, bounds, data });
@@ -315,7 +332,7 @@ impl WgpuAtlasState {
 
     fn flush_ring_uploads(&mut self) -> Result<bool> {
         if self.pending_uploads.is_empty() { return Ok(true); }
-        let mut required = 0u64;
+        let mut separate = 0u64;
         for upload in &self.pending_uploads {
             let Some(texture) = self.storage.get(upload.id) else { continue; };
             let width = u64::try_from(upload.bounds.size.width.0)?;
@@ -327,19 +344,23 @@ impl WgpuAtlasState {
                 && u64::from(y).checked_add(height).is_some_and(|bottom| bottom <= u64::from(texture.texture.height())),
                 "Atlas upload exceeds texture bounds");
             let row = width.checked_mul(texture.bytes_per_pixel() as u64).context("Atlas row overflow")?;
-            let pitch = row.checked_add(255).context("Atlas pitch overflow")? & !255;
-            u32::try_from(pitch).context("Atlas pitch exceeds copy layout")?;
-            let bytes = pitch.checked_mul(height).context("Atlas upload overflow")?;
             anyhow::ensure!(row.checked_mul(height) == Some(upload.data.len() as u64), "Invalid atlas upload size");
-            required = required.checked_add(bytes).context("Atlas staging overflow")?;
+            u32::try_from(staging_pitch(row)).context("Atlas pitch exceeds copy layout")?;
+            separate = separate.checked_add(staging_pitch(row) * height).context("Atlas staging overflow")?;
         }
-        if required == 0 { self.pending_uploads.clear(); return Ok(true); }
-        anyhow::ensure!(required <= self.device.limits().max_buffer_size && required <= 64 * 1024 * 1024,
+        if separate == 0 { self.pending_uploads.clear(); return Ok(true); }
+        anyhow::ensure!(separate <= self.device.limits().max_buffer_size && separate <= 64 * 1024 * 1024,
             "Atlas upload exceeds staging budget");
+        // Merging never asks for more staging than one region per tile would, beyond the
+        // smallest ring, so the ring grows exactly as it did without merging.
+        let ring_capacity = self.upload_ring.as_ref().map_or(0, |ring| ring.capacity());
+        let budget = separate.max(ring_capacity).max(MIN_STAGING_BYTES);
+        let plan = self.plan_upload_regions(separate, budget);
+        let required = plan.iter().map(|(_, region)| region.staging_bytes).sum::<u64>();
         if self.upload_ring.as_ref().is_none_or(|ring| ring.capacity() < required) {
-            let capacity = required.max(512 * 1024).checked_next_power_of_two().context("Atlas staging capacity overflow")?;
+            let capacity = required.max(MIN_STAGING_BYTES).checked_next_power_of_two().context("Atlas staging capacity overflow")?;
             anyhow::ensure!(capacity <= self.device.limits().max_buffer_size, "Atlas staging exceeds device limit");
-            self.upload_ring = Some(crate::upload_ring::UploadRing::new(&self.device, capacity));
+            self.upload_ring = Some(crate::upload_ring::UploadRing::new(&self.device, capacity, false));
         }
         let ring = self.upload_ring.as_ref().context("Atlas upload ring missing")?;
         anyhow::ensure!(!ring.failed(), "Atlas staging mapping failed");
@@ -348,31 +369,192 @@ impl WgpuAtlasState {
             label: Some("gpui_atlas_uploads"),
         });
         let mut offset = 0;
-        for upload in &self.pending_uploads {
-            let Some(texture) = self.storage.get(upload.id) else { continue; };
-            let width = upload.bounds.size.width.0 as u32;
-            let height = upload.bounds.size.height.0 as u32;
-            let row = u64::from(width) * texture.bytes_per_pixel() as u64;
-            let pitch = (row + 255) & !255;
-            for (line, bytes) in upload.data.chunks_exact(row as usize).enumerate() {
-                ring.write(index, offset + line as u64 * pitch, bytes)?;
+        let mut staging = Vec::new();
+        let mut init_regions = 0;
+        let mut init_bytes = 0;
+        for (position, (id, region)) in plan.iter().enumerate() {
+            let texture = &self.storage[*id];
+            let rect = region.rect;
+            texture.compose(rect, &self.pending_uploads, &mut staging);
+            ring.write(index, offset, &staging)?;
+            let first = plan[..position].iter().all(|(earlier, _)| earlier != id);
+            if first && !texture.initialized && !rect.covers(texture.texture.width(), texture.texture.height()) {
+                // wgpu zero-fills the whole texture before the first copy that leaves texels
+                // undefined, with one region per 512 KiB of its zero buffer.
+                let bytes = texture_bytes(Size {
+                    width: DevicePixels(texture.texture.width() as i32),
+                    height: DevicePixels(texture.texture.height() as i32),
+                }, texture.format);
+                init_regions += bytes.div_ceil(ZERO_BUFFER_BYTES) as u32;
+                init_bytes += bytes;
             }
             encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo {
                 buffer: ring.buffer(index),
-                layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(pitch as u32), rows_per_image: None },
+                layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(region.pitch as u32), rows_per_image: None },
             }, wgpu::TexelCopyTextureInfo {
                 texture: &texture.texture, mip_level: 0,
-                origin: wgpu::Origin3d { x: upload.bounds.origin.x.0 as u32, y: upload.bounds.origin.y.0 as u32, z: 0 },
+                origin: wgpu::Origin3d { x: rect.x0, y: rect.y0, z: 0 },
                 aspect: wgpu::TextureAspect::All,
-            }, wgpu::Extent3d { width, height, depth_or_array_layers: 1 });
-            offset += pitch * u64::from(height);
+            }, wgpu::Extent3d { width: rect.width(), height: rect.height(), depth_or_array_layers: 1 });
+            offset += region.staging_bytes;
+        }
+        for (id, _) in &plan {
+            if let Some(texture) = self.storage.get_mut(*id) { texture.initialized = true; }
         }
         ring.unmap(index);
+        crate::pass_trace::note(|| format!("atlas_uploads n={} regions={} bytes={required} separate_bytes={separate}",
+            self.pending_uploads.len(), plan.len()));
+        crate::pass_trace::transfer(crate::pass_trace::Transfer::Atlas, plan.len() as u32, required);
+        crate::pass_trace::transfer(crate::pass_trace::Transfer::AtlasInit, init_regions, init_bytes);
         self.queue.submit([encoder.finish()]);
         ring.submitted(index);
         self.pending_uploads.clear();
         Ok(true)
     }
+
+    /// The copy regions for the pending uploads, per texture in the order the textures first
+    /// appear among them. Without merging, one region per upload.
+    fn plan_upload_regions(&self, separate: u64, budget: u64) -> Vec<(AtlasTextureId, UploadRegion)> {
+        let mut plan = Vec::new();
+        let mut textures: Vec<AtlasTextureId> = Vec::new();
+        for upload in &self.pending_uploads {
+            if self.storage.get(upload.id).is_some() && !textures.contains(&upload.id) {
+                textures.push(upload.id);
+            }
+        }
+        let mut total = separate;
+        for id in textures {
+            let texture = &self.storage[id];
+            let bpp = texture.bytes_per_pixel() as u64;
+            let rects: Vec<Rect> = self.pending_uploads.iter()
+                .filter(|upload| upload.id == id)
+                .map(|upload| Rect::of(upload.bounds))
+                .collect();
+            let regions = if self.merged_uploads {
+                let obstacles = if texture.shadow.is_some() {
+                    Vec::new()
+                } else {
+                    let span = rects.iter().copied().reduce(Rect::union).expect("texture has uploads");
+                    // Tiles uploaded in earlier frames hold texels the staging cannot reproduce.
+                    self.tiles_by_key.values()
+                        .filter(|tile| tile.texture_id == id)
+                        .map(|tile| Rect::of(tile.bounds))
+                        .filter(|rect| rect.intersects(span) && !rects.contains(rect))
+                        .collect()
+                };
+                merge_upload_regions(&rects, &obstacles, bpp, &mut total, budget)
+            } else {
+                rects
+            };
+            plan.extend(regions.into_iter().map(|rect| {
+                let pitch = staging_pitch(u64::from(rect.width()) * bpp);
+                (id, UploadRegion { rect, pitch, staging_bytes: pitch * u64::from(rect.height()) })
+            }));
+        }
+        plan
+    }
+}
+
+/// Tests read atlas textures back.
+const ATLAS_TEST_USAGE: wgpu::TextureUsages = if cfg!(test) { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() };
+const MIN_STAGING_BYTES: u64 = 512 * 1024;
+/// wgpu-core's zero buffer, which clears textures in copies of at most this size.
+const ZERO_BUFFER_BYTES: u64 = 512 * 1024;
+/// Textures up to this size keep a CPU copy, so that merged uploads can include texels of
+/// tiles uploaded in earlier frames: a 1024x1024 monochrome atlas, not a colour one.
+const SHADOW_MAX_BYTES: u64 = 1024 * 1024;
+
+fn staging_pitch(row: u64) -> u64 {
+    row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64)
+}
+
+fn texture_bytes(size: Size<DevicePixels>, format: wgpu::TextureFormat) -> u64 {
+    let bpp = format.block_copy_size(None).unwrap_or(4) as u64;
+    staging_pitch(size.width.0.max(0) as u64 * bpp) * size.height.0.max(0) as u64
+}
+
+struct UploadRegion {
+    rect: Rect,
+    pitch: u64,
+    staging_bytes: u64,
+}
+
+/// Half-open texel rectangle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rect {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+impl Rect {
+    fn of(bounds: Bounds<DevicePixels>) -> Self {
+        let x0 = bounds.origin.x.0.max(0) as u32;
+        let y0 = bounds.origin.y.0.max(0) as u32;
+        Self { x0, y0, x1: x0 + bounds.size.width.0.max(0) as u32, y1: y0 + bounds.size.height.0.max(0) as u32 }
+    }
+    fn width(self) -> u32 { self.x1 - self.x0 }
+    fn height(self) -> u32 { self.y1 - self.y0 }
+    fn union(self, other: Self) -> Self {
+        Self { x0: self.x0.min(other.x0), y0: self.y0.min(other.y0), x1: self.x1.max(other.x1), y1: self.y1.max(other.y1) }
+    }
+    fn intersects(self, other: Self) -> bool {
+        self.x0 < other.x1 && other.x0 < self.x1 && self.y0 < other.y1 && other.y0 < self.y1
+    }
+    fn contains(self, other: Self) -> bool {
+        self.x0 <= other.x0 && self.y0 <= other.y0 && other.x1 <= self.x1 && other.y1 <= self.y1
+    }
+    fn covers(self, width: u32, height: u32) -> bool {
+        self.x0 == 0 && self.y0 == 0 && self.x1 >= width && self.y1 >= height
+    }
+    fn staging_bytes(self, bpp: u64) -> u64 {
+        staging_pitch(u64::from(self.width()) * bpp) * u64::from(self.height())
+    }
+}
+
+/// Merges upload rectangles into fewer, larger copy regions. PowerVR's Vulkan driver runs
+/// one transfer job per copy region, each with a fixed cost of a few hundred microseconds,
+/// so a region that also copies unused texels is far cheaper than another region. A merged
+/// region never covers an obstacle (texels it cannot reproduce), and merging stops once the
+/// staging bytes of all regions, `total`, would exceed `budget`.
+fn merge_upload_regions(rects: &[Rect], obstacles: &[Rect], bpp: u64, total: &mut u64, budget: u64) -> Vec<Rect> {
+    let mut sorted = rects.to_vec();
+    sorted.sort_by_key(|rect| (rect.y0, rect.x0));
+    sorted.dedup();
+    let mut regions: Vec<Rect> = Vec::new();
+    let try_merge = |a: Rect, b: Rect, total: u64| -> Option<(Rect, u64)> {
+        let merged = a.union(b);
+        let next = (total + merged.staging_bytes(bpp)).checked_sub(a.staging_bytes(bpp) + b.staging_bytes(bpp))?;
+        (next <= budget && !obstacles.iter().any(|obstacle| obstacle.intersects(merged))).then_some((merged, next))
+    };
+    for rect in sorted {
+        if regions.iter().any(|region| region.contains(rect)) {
+            *total -= rect.staging_bytes(bpp);
+            continue;
+        }
+        let merged = regions.iter().enumerate().rev()
+            .find_map(|(index, region)| try_merge(*region, rect, *total).map(|merge| (index, merge)));
+        match merged {
+            Some((index, (region, next))) => { regions[index] = region; *total = next; }
+            None => regions.push(rect),
+        }
+    }
+    // A merge can make two regions mergeable that were not before.
+    'merge: loop {
+        for i in 0..regions.len() {
+            for j in i + 1..regions.len() {
+                if let Some((region, next)) = try_merge(regions[i], regions[j], *total) {
+                    regions[i] = region;
+                    regions.swap_remove(j);
+                    *total = next;
+                    continue 'merge;
+                }
+            }
+        }
+        break;
+    }
+    regions
 }
 
 #[derive(Default)]
@@ -410,6 +592,13 @@ impl WgpuAtlasStorage {
             .get(id.index as usize)
             .and_then(|t| t.as_ref())
     }
+
+    fn get_mut(&mut self, id: AtlasTextureId) -> Option<&mut WgpuAtlasTexture> {
+        self[id.kind]
+            .textures
+            .get_mut(id.index as usize)
+            .and_then(|t| t.as_mut())
+    }
 }
 
 impl ops::Index<AtlasTextureId> for WgpuAtlasStorage {
@@ -434,6 +623,10 @@ struct WgpuAtlasTexture {
     view: wgpu::TextureView,
     format: wgpu::TextureFormat,
     live_atlas_keys: u32,
+    /// The texels of every tile uploaded so far, rows packed without padding.
+    shadow: Option<Vec<u8>>,
+    /// Whether a copy has reached the texture, after which wgpu no longer zero-fills it.
+    initialized: bool,
 }
 
 impl WgpuAtlasTexture {
@@ -457,6 +650,54 @@ impl WgpuAtlasTexture {
             wgpu::TextureFormat::R8Unorm => 1,
             wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm => 4,
             _ => 4,
+        }
+    }
+
+    fn write_shadow(&mut self, bounds: Bounds<DevicePixels>, data: &[u8]) {
+        let bpp = self.bytes_per_pixel() as usize;
+        let stride = self.texture.width() as usize * bpp;
+        let Some(shadow) = self.shadow.as_mut() else { return; };
+        let rect = Rect::of(bounds);
+        let row = rect.width() as usize * bpp;
+        if row == 0 || data.len() != row * rect.height() as usize { return; }
+        for (y, source) in (rect.y0 as usize..).zip(data.chunks_exact(row)) {
+            let start = y * stride + rect.x0 as usize * bpp;
+            if let Some(target) = shadow.get_mut(start..start + row) {
+                target.copy_from_slice(source);
+            }
+        }
+    }
+
+    /// Fills `staging` with the rows of `rect` at the staging pitch: from the shadow when the
+    /// texture has one, else zeros overlaid with the pending uploads in order.
+    fn compose(&self, rect: Rect, uploads: &[PendingUpload], staging: &mut Vec<u8>) {
+        let bpp = self.bytes_per_pixel() as usize;
+        let row = rect.width() as usize * bpp;
+        let pitch = staging_pitch(row as u64) as usize;
+        staging.clear();
+        staging.resize(pitch * rect.height() as usize, 0);
+        if let Some(shadow) = &self.shadow {
+            let stride = self.texture.width() as usize * bpp;
+            for (y, target) in (rect.y0 as usize..).zip(staging.chunks_exact_mut(pitch)) {
+                let start = y * stride + rect.x0 as usize * bpp;
+                target[..row].copy_from_slice(&shadow[start..start + row]);
+            }
+            return;
+        }
+        for upload in uploads.iter().filter(|upload| upload.id == self.id) {
+            let source = Rect::of(upload.bounds);
+            if !source.intersects(rect) { continue; }
+            let clip = Rect {
+                x0: source.x0.max(rect.x0), y0: source.y0.max(rect.y0),
+                x1: source.x1.min(rect.x1), y1: source.y1.min(rect.y1),
+            };
+            let source_row = source.width() as usize * bpp;
+            let length = clip.width() as usize * bpp;
+            for y in clip.y0..clip.y1 {
+                let from = (y - source.y0) as usize * source_row + (clip.x0 - source.x0) as usize * bpp;
+                let to = (y - rect.y0) as usize * pitch + (clip.x0 - rect.x0) as usize * bpp;
+                staging[to..to + length].copy_from_slice(&upload.data[from..from + length]);
+            }
         }
     }
 
@@ -651,6 +892,154 @@ mod tests {
         let tile_b = insert(&big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
         Ok(())
+    }
+
+    fn read_texture(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, bpp: u32) -> Vec<u8> {
+        let row = texture.width() * bpp;
+        let pitch = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(pitch * texture.height()),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(pitch), rows_per_image: None },
+            },
+            texture.size(),
+        );
+        queue.submit([encoder.finish()]);
+        readback.slice(..).map_async(wgpu::MapMode::Read, |result| result.unwrap());
+        device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        let bytes = readback.slice(..).get_mapped_range();
+        bytes.chunks_exact(pitch as usize).flat_map(|line| &line[..row as usize]).copied().collect()
+    }
+
+    /// Inserts and removes glyph- and image-sized tiles over several frames, flushing each frame
+    /// the way external frames do, and returns every texture's texels with the live tiles.
+    fn render_atlas_frames(merged: bool) -> anyhow::Result<(Vec<(AtlasTextureId, Vec<u8>)>, Vec<(AtlasTile, Vec<u8>)>)> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device.clone(), queue.clone(), wgpu::TextureFormat::Bgra8Unorm);
+        atlas.set_merged_uploads(merged);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut random = move |range: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(range)) as u32
+        };
+        let mut live: Vec<(AtlasKey, AtlasTile, Vec<u8>)> = Vec::new();
+        let mut next_id = 0usize;
+        for _frame in 0..8 {
+            for _ in 0..40 {
+                if !live.is_empty() && random(5) == 0 {
+                    let (key, _, _) = live.swap_remove(random(live.len() as u32) as usize);
+                    atlas.remove(&key);
+                    continue;
+                }
+                next_id += 1;
+                let image = random(4) == 0;
+                let size = if image {
+                    gpui::size(DevicePixels(8 + random(90) as i32), DevicePixels(8 + random(90) as i32))
+                } else {
+                    gpui::size(DevicePixels(3 + random(30) as i32), DevicePixels(6 + random(4) as i32 * 8))
+                };
+                let key = if image {
+                    AtlasKey::Image(RenderImageParams { image_id: ImageId(next_id), frame_index: 0 })
+                } else {
+                    AtlasKey::Svg(gpui::RenderSvgParams { path: format!("{next_id}").into(), size })
+                };
+                let bpp = if image { 4 } else { 1 };
+                let bytes: Vec<u8> = (0..size.width.0 * size.height.0 * bpp).map(|_| random(255) as u8 + 1).collect();
+                let tile = atlas
+                    .get_or_insert_with(&key, &mut || Ok(Some((size, Cow::Owned(bytes.clone())))))?
+                    .expect("tile");
+                live.push((key, tile, bytes));
+            }
+            assert!(atlas.before_external_frame()?, "staging slot available");
+            device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None })?;
+        }
+        let lock = atlas.0.lock();
+        let mut textures = Vec::new();
+        for kind in [AtlasTextureKind::Monochrome, AtlasTextureKind::Polychrome] {
+            for texture in lock.storage[kind].textures.iter().flatten() {
+                assert_eq!(texture.shadow.is_some(), merged && kind == AtlasTextureKind::Monochrome);
+                let bpp = texture.bytes_per_pixel() as u32;
+                textures.push((texture.id, read_texture(&device, &queue, &texture.texture, bpp)));
+            }
+        }
+        Ok((textures, live.into_iter().map(|(_, tile, bytes)| (tile, bytes)).collect()))
+    }
+
+    #[test]
+    fn merged_uploads_write_the_same_texels_as_one_region_per_tile() -> anyhow::Result<()> {
+        let (regions, regions_tiles) = render_atlas_frames(false)?;
+        let (merged, merged_tiles) = render_atlas_frames(true)?;
+        assert_eq!(regions.len(), merged.len());
+        for ((tile, bytes), (merged_tile, _)) in regions_tiles.iter().zip(&merged_tiles) {
+            assert_eq!(tile, merged_tile, "allocation does not depend on the upload mode");
+            for (texels, label) in [(&regions, "regions"), (&merged, "merged")] {
+                let (_, texels) = texels.iter().find(|(id, _)| *id == tile.texture_id).unwrap();
+                let bpp = if tile.texture_id.kind == AtlasTextureKind::Monochrome { 1 } else { 4 };
+                let stride = 1024 * bpp;
+                let row = tile.bounds.size.width.0 as usize * bpp;
+                for (y, expected) in bytes.chunks_exact(row).enumerate() {
+                    let start = (tile.bounds.origin.y.0 as usize + y) * stride + tile.bounds.origin.x.0 as usize * bpp;
+                    let mut expected = expected.to_vec();
+                    if bpp == 4 {
+                        expected = swizzle_upload_data(&expected, wgpu::TextureFormat::Bgra8Unorm);
+                    }
+                    assert_eq!(&texels[start..start + row], &expected[..], "{label} tile {tile:?} row {y}");
+                }
+            }
+        }
+        // The CPU copy of a monochrome texture reproduces even texels of removed tiles.
+        for ((id, texels), (merged_id, merged_texels)) in regions.iter().zip(&merged) {
+            assert_eq!(id, merged_id);
+            if id.kind == AtlasTextureKind::Monochrome {
+                assert!(texels == merged_texels, "monochrome texture {id:?} differs");
+            }
+        }
+        Ok(())
+    }
+
+    fn rect(x0: u32, y0: u32, x1: u32, y1: u32) -> Rect {
+        Rect { x0, y0, x1, y1 }
+    }
+
+    #[test]
+    fn merged_regions_cover_uploads_and_avoid_obstacles() {
+        // Two shelves of new glyphs; an older glyph sits between them on the left.
+        let uploads = [rect(40, 0, 50, 16), rect(50, 0, 58, 16), rect(58, 0, 70, 12),
+            rect(30, 32, 40, 48), rect(40, 32, 52, 48)];
+        let obstacles = [rect(0, 16, 30, 32), rect(0, 0, 40, 16)];
+        let separate: u64 = uploads.iter().map(|rect| rect.staging_bytes(1)).sum();
+        let mut total = separate;
+        let regions = merge_upload_regions(&uploads, &obstacles, 1, &mut total, MIN_STAGING_BYTES);
+        assert!(regions.len() < uploads.len(), "{regions:?}");
+        for upload in uploads {
+            assert!(regions.iter().any(|region| region.contains(upload)), "{upload:?} in {regions:?}");
+        }
+        for region in &regions {
+            assert!(!obstacles.iter().any(|obstacle| obstacle.intersects(*region)), "{region:?}");
+        }
+        assert_eq!(total, regions.iter().map(|region| region.staging_bytes(1)).sum::<u64>());
+
+        // Without obstacles everything becomes one region, within the budget.
+        let mut total = separate;
+        let regions = merge_upload_regions(&uploads, &[], 1, &mut total, MIN_STAGING_BYTES);
+        assert_eq!(regions, vec![rect(30, 0, 70, 48)]);
+
+        // A budget no larger than the separate regions' staging allows no growth.
+        let far = [rect(0, 0, 4, 4), rect(1000, 1000, 1004, 1004)];
+        let separate: u64 = far.iter().map(|rect| rect.staging_bytes(4)).sum();
+        let mut total = separate;
+        assert_eq!(merge_upload_regions(&far, &[], 4, &mut total, separate), far.to_vec());
+        assert_eq!(total, separate);
     }
 
     #[test]

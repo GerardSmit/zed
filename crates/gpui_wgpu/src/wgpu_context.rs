@@ -340,6 +340,15 @@ impl WgpuContext {
         if enable_pipeline_cache && adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
             required_features |= wgpu::Features::PIPELINE_CACHE;
         }
+        // On unified memory the renderer can bind its mapped upload ring as
+        // instance storage instead of copying out of it (`RendererTuning`).
+        let unified_memory = matches!(
+            adapter.get_info().device_type,
+            wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu
+        );
+        if unified_memory && adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS) {
+            required_features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
+        }
         if dual_source_blending {
             required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
         } else {

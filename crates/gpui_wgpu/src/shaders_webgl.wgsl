@@ -163,6 +163,25 @@ fn load_quad(instance_id: u32) -> Quad {
     );
 }
 
+fn load_clamped_quad(instance_id: u32) -> ClampedQuad {
+    var cursor = instance_cursor(instance_id * 48u);
+    let raster = read_vec4_f32(&cursor);
+    return ClampedQuad(
+        raster,
+        Quad(
+            read_word(&cursor),
+            read_word(&cursor),
+            read_bounds(&cursor),
+            read_bounds(&cursor),
+            read_fade(&cursor),
+            read_background(&cursor),
+            read_hsla(&cursor),
+            read_corners(&cursor),
+            read_edges(&cursor),
+        ),
+    );
+}
+
 fn load_shadow(instance_id: u32) -> Shadow {
     var cursor = instance_cursor(instance_id * 32u);
     return Shadow(

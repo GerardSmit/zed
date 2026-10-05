@@ -3,23 +3,28 @@ use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
 pub(crate) struct UploadRing {
     slots: [Slot; 3],
     capacity: u64,
+    storage: bool,
 }
 struct Slot {
     buffer: wgpu::Buffer,
     state: Arc<AtomicU8>,
 }
 impl UploadRing {
-    pub(crate) fn new(device: &wgpu::Device, capacity: u64) -> Self {
-        Self { capacity, slots: std::array::from_fn(|_| Slot {
+    /// `storage` lets shaders read the slots directly, which needs
+    /// `Features::MAPPABLE_PRIMARY_BUFFERS`.
+    pub(crate) fn new(device: &wgpu::Device, capacity: u64, storage: bool) -> Self {
+        let mut usage = wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC;
+        if storage { usage |= wgpu::BufferUsages::STORAGE; }
+        Self { capacity, storage, slots: std::array::from_fn(|_| Slot {
             buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("gpui_persistent_upload"), size: capacity,
-                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                label: Some("gpui_persistent_upload"), size: capacity, usage,
                 mapped_at_creation: true,
             }),
             state: Arc::new(AtomicU8::new(0)),
         }) }
     }
     pub(crate) fn capacity(&self) -> u64 { self.capacity }
+    pub(crate) fn storage(&self) -> bool { self.storage }
     pub(crate) fn acquire(&self) -> Option<usize> {
         self.slots.iter().position(|slot| slot.state.load(Ordering::Acquire) == 0)
     }

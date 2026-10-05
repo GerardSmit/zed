@@ -6,6 +6,7 @@
 // buffer its own entry points read.
 
 @group(1) @binding(0) var<storage, read> b_quads: array<Quad>;
+@group(1) @binding(0) var<storage, read> b_clamped_quads: array<ClampedQuad>;
 @group(1) @binding(0) var<storage, read> b_shadows: array<Shadow>;
 @group(1) @binding(0) var<storage, read> b_shapes: array<Shape>;
 @group(1) @binding(0) var<storage, read> b_path_vertices: array<PathRasterizationVertex>;
@@ -16,6 +17,10 @@
 
 fn load_quad(instance_id: u32) -> Quad {
     return b_quads[instance_id];
+}
+
+fn load_clamped_quad(instance_id: u32) -> ClampedQuad {
+    return b_clamped_quads[instance_id];
 }
 
 fn load_shadow(instance_id: u32) -> Shadow {

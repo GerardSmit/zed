@@ -583,11 +583,14 @@ struct QuadVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) border_color: vec4<f32>,
     @location(1) @interpolate(flat) quad_id: u32,
-    // TODO: use `clip_distance` once Naga supports it
-    @location(2) clip_distances: vec4<f32>,
+    @location(2) @interpolate(flat) clip_edges: vec4<f32>,
     @location(3) @interpolate(flat) background_solid: vec4<f32>,
     @location(4) @interpolate(flat) background_color0: vec4<f32>,
     @location(5) @interpolate(flat) background_color1: vec4<f32>,
+    // Bounds origin and half size, and the largest corner radius and per-axis reduced border
+    // width, for `quad_interior`. Quads that are not solid and unfaded never qualify.
+    @location(6) @interpolate(flat) interior_frame: vec4<f32>,
+    @location(7) @interpolate(flat) interior_insets: vec3<f32>,
 }
 
 @vertex
@@ -609,24 +612,279 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.background_color1 = gradient.color1;
     out.border_color = hsla_to_rgba(quad.border_color);
     out.quad_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    out.clip_edges = edges_of(quad.content_mask);
+    let radii = quad.corner_radii;
+    let borders = quad.border_widths;
+    // `!(x > 0.0)` matches `fade_alpha`, which skips a fade unless its length is positive.
+    let eligible = quad.background.tag == 0u &&
+        !(quad.content_fade.top_len > 0.0) && !(quad.content_fade.bottom_len > 0.0);
+    out.interior_frame = vec4<f32>(quad.bounds.origin, quad.bounds.size / 2.0);
+    out.interior_insets = vec3<f32>(
+        max(max(radii.top_left, radii.top_right), max(radii.bottom_right, radii.bottom_left)),
+        select(vec2<f32>(1e30),
+            max(reduced_border(vec2<f32>(borders.left, borders.top)),
+                reduced_border(vec2<f32>(borders.right, borders.bottom))),
+            eligible));
     return out;
+}
+
+// `quad_color` replaces zero border widths by this, so that they draw no antialiasing.
+fn reduced_border(border: vec2<f32>) -> vec2<f32> {
+    return select(border, vec2<f32>(-0.5), border == vec2<f32>(0.0));
+}
+
+// Whether `quad_color` takes its background fast path at this fragment: within the inner edge
+// of the widest border on each axis and outside the largest corner radius on some axis. Uses
+// the same arithmetic on the same values, so a passing fragment gets exactly that result.
+fn quad_interior(input: QuadVarying) -> bool {
+    let center_to_point = input.position.xy - input.interior_frame.xy - input.interior_frame.zw;
+    let corner_to_point = abs(center_to_point) - input.interior_frame.zw;
+    let border = corner_to_point + input.interior_insets.yz;
+    let corner = corner_to_point + input.interior_insets.x;
+    return all(border < vec2<f32>(-0.5)) && any(corner < vec2<f32>(0.0));
+}
+
+// Left, top, right and bottom edges; the right and bottom ones as `to_device_position` computes
+// them.
+fn edges_of(bounds: Bounds) -> vec4<f32> {
+    return vec4<f32>(bounds.origin, bounds.size + bounds.origin);
+}
+
+// Whether a fragment lies outside a content mask given by `edges_of`; one on an edge is inside.
+// Quads test this exactly instead of interpolating clip distances, so that drawing one in parts
+// (`OpaqueQuadPlan`) changes no pixel on the edge of its mask.
+fn outside_clip(position: vec2<f32>, edges: vec4<f32>) -> bool {
+    return any(position < edges.xy) || any(position > edges.zw);
 }
 
 @fragment
 fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
-    let fade = fade_alpha(input.position.y, fade_vector(load_quad(input.quad_id).content_fade));
-    return apply_fade(quad_color(input), fade);
+    // Alpha clip first, since we don't have `clip_distance`.
+    if (outside_clip(input.position.xy, input.clip_edges)) {
+        return vec4<f32>(0.0);
+    }
+    if (quad_interior(input)) {
+        return blend_color(input.background_solid, 1.0);
+    }
+    let quad = load_quad(input.quad_id);
+    let fade = fade_alpha(input.position.y, fade_vector(quad.content_fade));
+    return apply_fade(quad_color(input, quad), fade);
 }
 
-fn quad_color(input: QuadVarying) -> vec4<f32> {
-    // Alpha clip first, since we don't have `clip_distance`.
+// Quads with a solid background, no border and no fade, drawn without `fs_quad`'s border,
+// gradient and fade code. `fs_quad_simple` repeats `quad_color`'s arithmetic for zero border
+// widths, so it writes the same pixels.
+struct SimpleQuadVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) clip_edges: vec4<f32>,
+    @location(1) @interpolate(flat) background: vec4<f32>,
+    @location(2) @interpolate(flat) border_color: vec4<f32>,
+    // Bounds origin and half size.
+    @location(3) @interpolate(flat) frame: vec4<f32>,
+    // Top left, top right, bottom right and bottom left corner radii.
+    @location(4) @interpolate(flat) corner_radii: vec4<f32>,
+}
+
+@vertex
+fn vs_quad_simple(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> SimpleQuadVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let quad = load_quad(instance_id);
+    return simple_quad_varying(unit_vertex * quad.bounds.size + quad.bounds.origin, quad);
+}
+
+// `vs_quad_simple`'s output at a vertex placed at `position`, in device pixels.
+fn simple_quad_varying(position: vec2<f32>, quad: Quad) -> SimpleQuadVarying {
+    var out = SimpleQuadVarying();
+    out.position = to_device_position_impl(position);
+    out.clip_edges = edges_of(quad.content_mask);
+    out.background = hsla_to_rgba(quad.background.solid);
+    out.border_color = hsla_to_rgba(quad.border_color);
+    out.frame = vec4<f32>(quad.bounds.origin, quad.bounds.size / 2.0);
+    let radii = quad.corner_radii;
+    out.corner_radii = vec4<f32>(radii.top_left, radii.top_right, radii.bottom_right, radii.bottom_left);
+    return out;
+}
+
+@fragment
+fn fs_quad_simple(input: SimpleQuadVarying) -> @location(0) vec4<f32> {
+    if (outside_clip(input.position.xy, input.clip_edges)) {
+        return vec4<f32>(0.0);
+    }
+    let background_color = input.background;
+    if (all(input.corner_radii == vec4<f32>(0.0))) {
+        return blend_color(background_color, 1.0);
+    }
+    let antialias_threshold = 0.5;
+    let half_size = input.frame.zw;
+    let center_to_point = input.position.xy - input.frame.xy - half_size;
+    let radii = input.corner_radii;
+    let corner_radius = pick_corner_radius(center_to_point, Corners(radii.x, radii.y, radii.z, radii.w));
+    let corner_to_point = abs(center_to_point) - half_size;
+    let corner_center_to_point = corner_to_point + corner_radius;
+    let is_near_rounded_corner =
+            corner_center_to_point.x >= 0 &&
+            corner_center_to_point.y >= 0;
+    // `quad_color`'s `reduced_border` is `-antialias_threshold` on both axes.
+    let reduced_border = -antialias_threshold;
+    let straight_border_inner_corner_to_point = corner_to_point + reduced_border;
+    let is_beyond_inner_straight_border =
+            straight_border_inner_corner_to_point.x > 0 ||
+            straight_border_inner_corner_to_point.y > 0;
+    let is_within_inner_straight_border =
+        straight_border_inner_corner_to_point.x < -antialias_threshold &&
+        straight_border_inner_corner_to_point.y < -antialias_threshold;
+    if (is_within_inner_straight_border && !is_near_rounded_corner) {
+        return blend_color(background_color, 1.0);
+    }
+    let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+    var inner_sdf = 0.0;
+    if (corner_center_to_point.x <= 0 || corner_center_to_point.y <= 0) {
+        inner_sdf = -max(straight_border_inner_corner_to_point.x,
+                         straight_border_inner_corner_to_point.y);
+    } else if (is_beyond_inner_straight_border) {
+        inner_sdf = -1.0;
+    } else {
+        inner_sdf = -(outer_sdf + reduced_border);
+    }
+    let border_sdf = max(inner_sdf, outer_sdf);
+    var color = background_color;
+    if (border_sdf < antialias_threshold) {
+        let blended_border = over(background_color, input.border_color);
+        color = mix(background_color, blended_border,
+                    saturate(antialias_threshold - inner_sdf));
+    }
+    return blend_color(color, saturate(antialias_threshold - outer_sdf));
+}
+
+// A simple quad drawn over `raster` only, a part of its bounds given by its left, top, right and
+// bottom edges in device pixels. Within it,
+// `vs_quad_clamped` with `fs_quad_simple` and `vs_quad_opaque` with `fs_quad_opaque` draw what
+// `vs_quad_simple` with `fs_quad_simple` would; see `OpaqueQuadPlan` in `wgpu_renderer.rs`.
+struct ClampedQuad {
+    raster: vec4<f32>,
+    quad: Quad,
+}
+
+fn clamped_quad_corner(unit_vertex: vec2<f32>, raster: vec4<f32>) -> vec2<f32> {
+    return select(raster.xy, raster.zw, unit_vertex > vec2<f32>(0.5));
+}
+
+@vertex
+fn vs_quad_clamped(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> SimpleQuadVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let clamped = load_clamped_quad(instance_id);
+    return simple_quad_varying(clamped_quad_corner(unit_vertex, clamped.raster), clamped.quad);
+}
+
+struct OpaqueQuadVarying {
+    @builtin(position) position: vec4<f32>,
+    // Already blended for the target's alpha mode, so the fragment shader reads no uniform.
+    @location(0) @interpolate(flat) background: vec4<f32>,
+}
+
+// The interior of an opaque quad, where `fs_quad_simple` returns the background unchanged.
+// Drawn without blending, so tile-based GPUs can drop the work it hides.
+@vertex
+fn vs_quad_opaque(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> OpaqueQuadVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let clamped = load_clamped_quad(instance_id);
+    var out = OpaqueQuadVarying();
+    out.position = to_device_position_impl(clamped_quad_corner(unit_vertex, clamped.raster));
+    out.background = blend_color(hsla_to_rgba(clamped.quad.background.solid), 1.0);
+    return out;
+}
+
+@fragment
+fn fs_quad_opaque(input: OpaqueQuadVarying) -> @location(0) vec4<f32> {
+    return input.background;
+}
+
+// Debug: viewport-sized rectangles, one per instance, in a colour that differs between
+// neighbouring instances.
+@vertex
+fn vs_fill(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> OpaqueQuadVarying {
+    var out = OpaqueQuadVarying();
+    out.position = vec4<f32>(f32(vertex_id % 2u) * 2.0 - 1.0, 1.0 - f32(vertex_id / 2u) * 2.0, 0.0, 1.0);
+    let shade = vec3<f32>(f32(instance_id & 1u), f32((instance_id >> 1u) & 1u), f32((instance_id >> 2u) & 1u));
+    out.background = vec4<f32>(0.25 + 0.5 * shade, 1.0);
+    return out;
+}
+
+@fragment
+fn fs_fill_const() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.25, 0.5, 0.75, 1.0);
+}
+
+// Debug: quads clipped to their content mask by the rasterizer and filled with their background
+// colour; borders, corners, gradients and fades are drawn wrong.
+@vertex
+fn vs_quad_flat(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> OpaqueQuadVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let quad = load_quad(instance_id);
+    let low = max(quad.bounds.origin, quad.content_mask.origin);
+    let high = max(low, min(quad.bounds.origin + quad.bounds.size,
+        quad.content_mask.origin + quad.content_mask.size));
+    var out = OpaqueQuadVarying();
+    out.position = to_device_position_impl(clamped_quad_corner(unit_vertex, vec4<f32>(low, high)));
+    out.background = blend_color(hsla_to_rgba(quad.background.solid), 1.0);
+    return out;
+}
+
+// Debug: `fs_quad`'s pipeline layout and varyings with a constant colour, to separate the cost
+// of its arithmetic from that of rasterization and varyings. Every varying is read, behind a
+// condition the compiler cannot fold, so none is optimized away.
+@fragment
+fn fs_quad_const(input: QuadVarying) -> @location(0) vec4<f32> {
+    if (outside_clip(input.position.xy, input.clip_edges)) {
+        return vec4<f32>(0.0);
+    }
+    let inputs = input.border_color + input.background_color0 + input.background_color1 +
+        input.interior_frame + vec4<f32>(input.interior_insets, f32(input.quad_id));
+    return select(input.background_solid, inputs, globals.viewport_size.x < 0.0);
+}
+
+// Debug: the fewest varyings a rounded quad needs, and only background and corner arithmetic.
+// Borders, gradients, fades and differing corner radii are drawn wrong.
+struct LeanQuadVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) clip_distances: vec4<f32>,
+    @location(1) @interpolate(flat) background: vec4<f32>,
+    // Bounds origin and half size.
+    @location(2) @interpolate(flat) frame: vec4<f32>,
+    @location(3) @interpolate(flat) corner_radius: f32,
+}
+
+@vertex
+fn vs_quad_lean(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> LeanQuadVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let quad = load_quad(instance_id);
+    var out = LeanQuadVarying();
+    out.position = to_device_position(unit_vertex, quad.bounds);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    out.background = hsla_to_rgba(quad.background.solid);
+    out.frame = vec4<f32>(quad.bounds.origin, quad.bounds.size / 2.0);
+    let radii = quad.corner_radii;
+    out.corner_radius =
+        max(max(radii.top_left, radii.top_right), max(radii.bottom_right, radii.bottom_left));
+    return out;
+}
+
+@fragment
+fn fs_quad_lean(input: LeanQuadVarying) -> @location(0) vec4<f32> {
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
+    let center_to_point = input.position.xy - input.frame.xy - input.frame.zw;
+    let corner_to_point = abs(center_to_point) - input.frame.zw;
+    let corner_center_to_point = corner_to_point + input.corner_radius;
+    if (all(corner_to_point < vec2<f32>(-0.5)) && any(corner_center_to_point < vec2<f32>(0.0))) {
+        return blend_color(input.background, 1.0);
+    }
+    let outer_sdf = quad_sdf_impl(corner_center_to_point, input.corner_radius);
+    return blend_color(input.background, saturate(0.5 - outer_sdf));
+}
 
-    let quad = load_quad(input.quad_id);
-
+fn quad_color(input: QuadVarying, quad: Quad) -> vec4<f32> {
     let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
         input.background_solid, input.background_color0, input.background_color1);
 
