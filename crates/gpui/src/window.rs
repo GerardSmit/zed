@@ -542,6 +542,13 @@ impl std::fmt::Debug for FocusHandle {
 }
 
 impl FocusHandle {
+    /// A number unique to this handle among live handles, for ordering handles stably across
+    /// frames (element ids derived from handles are order-sensitive).
+    pub fn order_key(&self) -> u64 {
+        use slotmap::Key;
+        self.id.data().as_ffi()
+    }
+
     pub(crate) fn new(handles: &Arc<FocusMap>) -> Self {
         let id = handles.write().insert(FocusRef {
             ref_count: AtomicUsize::new(1),
@@ -1011,6 +1018,7 @@ pub(crate) struct Frame {
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
+    pub(crate) debug_bounds_log: Vec<(String, Bounds<Pixels>)>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) next_inspector_instance_ids: FxHashMap<Rc<crate::InspectorElementPath>, usize>,
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -1037,6 +1045,7 @@ pub(crate) struct PaintIndex {
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     window_control_hitboxes_index: usize,
+    debug_bounds_index: usize,
     line_layout_index: LineLayoutIndex,
 }
 
@@ -1061,6 +1070,7 @@ impl Frame {
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
+            debug_bounds_log: Vec::new(),
 
             #[cfg(any(feature = "inspector", debug_assertions))]
             next_inspector_instance_ids: FxHashMap::default(),
@@ -1091,6 +1101,7 @@ impl Frame {
         #[cfg(any(test, feature = "test-support"))]
         {
             self.debug_bounds.clear();
+            self.debug_bounds_log.clear();
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -4040,6 +4051,7 @@ impl Window {
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
+            debug_bounds_index: self.next_frame.debug_bounds_log.len(),
             line_layout_index: self.text_system.layout_index(),
         }
     }
@@ -4083,6 +4095,18 @@ impl Window {
                 .iter()
                 .cloned(),
         );
+
+        #[cfg(any(test, feature = "test-support"))]
+        for (selector, bounds) in
+            &self.rendered_frame.debug_bounds_log[range.start.debug_bounds_index..range.end.debug_bounds_index]
+        {
+            self.next_frame
+                .debug_bounds
+                .insert(selector.clone(), *bounds);
+            self.next_frame
+                .debug_bounds_log
+                .push((selector.clone(), *bounds));
+        }
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);

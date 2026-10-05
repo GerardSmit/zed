@@ -2459,6 +2459,10 @@ impl Interactivity {
                         .next_frame
                         .debug_bounds
                         .insert(debug_selector.clone(), bounds);
+                    window
+                        .next_frame
+                        .debug_bounds_log
+                        .push((debug_selector.clone(), bounds));
                 }
 
                 self.paint_hover_group_handler(window, cx);
