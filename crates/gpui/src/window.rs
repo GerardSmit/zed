@@ -14,7 +14,7 @@ use crate::{
     Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Radians, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, ScrollDelta, Shadow,
     SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
@@ -5067,6 +5067,41 @@ impl Window {
         font_size: Pixels,
         color: Hsla,
     ) -> Result<()> {
+        self.paint_glyph_transformed(origin, font_id, glyph_id, font_size, color, None)
+    }
+
+    /// Paints a single glyph as [`Window::paint_glyph`] does, turned clockwise by `angle` around
+    /// `pivot` (a point in the same coordinates as `origin`). The glyph is drawn as a grayscale
+    /// sprite, never with subpixel coverage, because that is only correct for upright text.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_glyph_rotated(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        pivot: Point<Pixels>,
+        angle: Radians,
+    ) -> Result<()> {
+        let scale_factor = self.scale_factor();
+        let transformation = TransformationMatrix::unit()
+            .translate(pivot.scale(scale_factor))
+            .rotate(angle)
+            .translate(pivot.scale(-scale_factor));
+        self.paint_glyph_transformed(origin, font_id, glyph_id, font_size, color, Some(transformation))
+    }
+
+    fn paint_glyph_transformed(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        transformation: Option<TransformationMatrix>,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
@@ -5084,7 +5119,8 @@ impl Window {
             (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
         );
         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
-        let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
+        let subpixel_rendering = transformation.is_none()
+            && self.should_use_subpixel_rendering(font_id, font_size);
         let dilation = self.text_system().glyph_dilation_for_color(color);
         let params = RenderGlyphParams {
             font_id,
@@ -5131,7 +5167,7 @@ impl Window {
                     content_mask,
                     color: color.opacity(element_opacity),
                     tile,
-                    transformation: TransformationMatrix::unit(),
+                    transformation: transformation.unwrap_or_else(TransformationMatrix::unit),
                 });
             }
         }
