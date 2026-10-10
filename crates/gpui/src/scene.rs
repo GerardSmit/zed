@@ -248,10 +248,12 @@ impl Scene {
         for s in &mut self.monochrome_sprites {
             shift(&mut s.bounds, offset);
             shift_mask(&mut s.content_mask, offset);
+            s.transformation.shift_pivot(offset);
         }
         for s in &mut self.subpixel_sprites {
             shift(&mut s.bounds, offset);
             shift_mask(&mut s.content_mask, offset);
+            s.transformation.shift_pivot(offset);
         }
         for s in &mut self.polychrome_sprites {
             shift(&mut s.bounds, offset);
@@ -365,6 +367,18 @@ impl Primitive {
     fn raster_bounds(&self) -> Bounds<ScaledPixels> {
         match self {
             Self::Shadow(shadow) => shadow.raster_bounds(),
+            // A transformed sprite rasterizes (and the shaders clip) its transformed corners,
+            // not its upright box: clip bands and culling must see the same footprint, or a
+            // rotated glyph is cut to its unrotated rectangle. A non-finite transform paints
+            // nothing, so it is culled.
+            Self::MonochromeSprite(sprite) => sprite
+                .transformation
+                .transformed_aabb(sprite.bounds)
+                .unwrap_or_default(),
+            Self::SubpixelSprite(sprite) => sprite
+                .transformation
+                .transformed_aabb(sprite.bounds)
+                .unwrap_or_default(),
             _ => *self.bounds(),
         }
     }
@@ -1152,6 +1166,20 @@ impl TransformationMatrix {
         }
     }
 
+    /// Keep a transformation applied to geometry that moved by `offset` moving with it: the
+    /// geometry turns about a pivot that moves too, so `M(p + o)` must land on `M(p) + o`,
+    /// which adds `o - R·o` to the translation. A no-op for the unit matrix.
+    pub(crate) fn shift_pivot(&mut self, offset: Point<ScaledPixels>) {
+        if *self == Self::unit() {
+            return;
+        }
+        let o = [offset.x.0, offset.y.0];
+        for (i, cell) in self.translation.iter_mut().enumerate() {
+            let turned: f32 = (0..2).map(|k| self.rotation_scale[i][k] * o[k]).sum();
+            *cell += o[i] - turned;
+        }
+    }
+
     /// Apply transformation to a point, mainly useful for debugging
     pub fn apply(&self, point: Point<Pixels>) -> Point<Pixels> {
         let input = [point.x.0, point.y.0];
@@ -1162,6 +1190,43 @@ impl TransformationMatrix {
             }
         }
         Point::new(output[0].into(), output[1].into())
+    }
+
+    /// The axis-aligned box that `bounds` covers once this transformation is applied — what
+    /// the shaders actually rasterize and clip for a transformed sprite. The unit matrix
+    /// returns `bounds` unchanged, bit for bit. `None` when a transformed corner is not finite.
+    pub(crate) fn transformed_aabb(
+        &self,
+        bounds: Bounds<ScaledPixels>,
+    ) -> Option<Bounds<ScaledPixels>> {
+        if *self == Self::unit() {
+            return Some(bounds);
+        }
+        let transform_point = |x: ScaledPixels, y: ScaledPixels| {
+            self.apply(point(Pixels(x.0), Pixels(y.0)))
+                .map(|value| ScaledPixels(value.0))
+        };
+        let corners = [
+            transform_point(bounds.left(), bounds.top()),
+            transform_point(bounds.right(), bounds.top()),
+            transform_point(bounds.left(), bounds.bottom()),
+            transform_point(bounds.right(), bounds.bottom()),
+        ];
+        if corners
+            .iter()
+            .any(|point| !point.x.0.is_finite() || !point.y.0.is_finite())
+        {
+            return None;
+        }
+        let mut minimum = corners[0];
+        let mut maximum = corners[0];
+        for corner in &corners[1..] {
+            minimum.x = minimum.x.min(corner.x);
+            minimum.y = minimum.y.min(corner.y);
+            maximum.x = maximum.x.max(corner.x);
+            maximum.y = maximum.y.max(corner.y);
+        }
+        Some(Bounds::from_corners(minimum, maximum))
     }
 }
 
@@ -1503,6 +1568,161 @@ mod tests {
             }
             .encode(),
             (6, [0., 1., 0., 0.])
+        );
+    }
+
+    fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            Size {
+                width: ScaledPixels(width),
+                height: ScaledPixels(height),
+            },
+        )
+    }
+
+    fn sprite(
+        bounds: Bounds<ScaledPixels>,
+        transformation: TransformationMatrix,
+    ) -> MonochromeSprite {
+        MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask {
+                bounds: scaled_bounds(0., 0., 1000., 1000.),
+                ..Default::default()
+            },
+            color: Hsla::default(),
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: crate::AtlasTextureKind::Monochrome,
+                },
+                tile_id: crate::TileId(0),
+                padding: 0,
+                bounds: Bounds::default(),
+            },
+            transformation,
+        }
+    }
+
+    /// Bands of a rounded clip, split at `split_y` the way a rounded container's clip is.
+    fn rounded_clip_bands(split_y: f32) -> Vec<Bounds<ScaledPixels>> {
+        vec![
+            scaled_bounds(0., 0., 1000., split_y),
+            scaled_bounds(0., split_y, 1000., 1000. - split_y),
+        ]
+    }
+
+    #[test]
+    fn shifting_a_rotated_transformation_moves_its_pivot_with_the_geometry() {
+        let pivot = point(ScaledPixels(300.), ScaledPixels(200.));
+        let mut turned = TransformationMatrix::unit()
+            .translate(pivot)
+            .rotate(Radians(std::f32::consts::FRAC_PI_4))
+            .translate(point(ScaledPixels(-pivot.x.0), ScaledPixels(-pivot.y.0)));
+        let corner = point(Pixels(310.), Pixels(190.));
+        let before = turned.apply(corner);
+        let offset = point(ScaledPixels(-120.), ScaledPixels(45.));
+        turned.shift_pivot(offset);
+        let after = turned.apply(point(corner.x + Pixels(offset.x.0), corner.y + Pixels(offset.y.0)));
+        assert!((after.x.0 - (before.x.0 + offset.x.0)).abs() < 1e-3, "{before:?} -> {after:?}");
+        assert!((after.y.0 - (before.y.0 + offset.y.0)).abs() < 1e-3, "{before:?} -> {after:?}");
+
+        let mut unit = TransformationMatrix::unit();
+        unit.shift_pivot(offset);
+        assert_eq!(unit, TransformationMatrix::unit());
+    }
+
+    #[test]
+    fn rotated_sprite_under_a_rounded_clip_keeps_its_transformed_footprint() {
+        // A watermark glyph rotated 45° about a pivot far from its own box, as
+        // `Window::paint_glyph_rotated` builds it.
+        let pivot = point(ScaledPixels(100.), ScaledPixels(100.));
+        let transformation = TransformationMatrix::unit()
+            .translate(pivot)
+            .rotate(Radians(std::f32::consts::FRAC_PI_4))
+            .translate(point(ScaledPixels(-pivot.x.0), ScaledPixels(-pivot.y.0)));
+        let upright = scaled_bounds(500., 100., 20., 30.);
+
+        // The footprint the shader draws: the rotated corners' bounding box, computed
+        // independently of `transformed_aabb`.
+        let (sin, cos) = std::f32::consts::FRAC_PI_4.sin_cos();
+        let rotate = |x: f32, y: f32| {
+            let (dx, dy) = (x - pivot.x.0, y - pivot.y.0);
+            (pivot.x.0 + cos * dx - sin * dy, pivot.y.0 + sin * dx + cos * dy)
+        };
+        let corners = [
+            rotate(500., 100.),
+            rotate(520., 100.),
+            rotate(500., 130.),
+            rotate(520., 130.),
+        ];
+        let min_x = corners.iter().map(|c| c.0).fold(f32::MAX, f32::min);
+        let max_x = corners.iter().map(|c| c.0).fold(f32::MIN, f32::max);
+        let min_y = corners.iter().map(|c| c.1).fold(f32::MAX, f32::min);
+        let max_y = corners.iter().map(|c| c.1).fold(f32::MIN, f32::max);
+        // Far from the upright box: the old clip would have culled or cut every pixel.
+        assert!(min_y > upright.bottom().0 + 100., "{min_y}");
+
+        let split_y = (min_y + max_y) / 2.;
+        let mut scene = Scene::default();
+        scene.push_rounded_clip(rounded_clip_bands(split_y));
+        scene.insert_primitive(sprite(upright, transformation));
+        scene.pop_rounded_clip();
+
+        // The sprite straddles the band split, so it is stored once per band, each copy
+        // clipped to its band's slice of the transformed footprint.
+        assert_eq!(scene.monochrome_sprites.len(), 2);
+        let masks: Vec<_> = scene
+            .monochrome_sprites
+            .iter()
+            .map(|sprite| sprite.content_mask.bounds)
+            .collect();
+        let union = masks[0].union(&masks[1]);
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        assert!(close(union.left().0, min_x), "{union:?}");
+        assert!(close(union.right().0, max_x), "{union:?}");
+        assert!(close(union.top().0, min_y), "{union:?}");
+        assert!(close(union.bottom().0, max_y), "{union:?}");
+        for (x, y) in corners {
+            assert!(
+                masks.iter().any(|mask| mask.left().0 - 1e-3 <= x
+                    && x <= mask.right().0 + 1e-3
+                    && mask.top().0 - 1e-3 <= y
+                    && y <= mask.bottom().0 + 1e-3),
+                "corner ({x}, {y}) clipped away by {masks:?}"
+            );
+        }
+        for mask in &masks {
+            assert!(mask.intersect(&upright).is_empty(), "{mask:?}");
+        }
+    }
+
+    #[test]
+    fn unrotated_sprite_under_a_rounded_clip_is_clipped_to_its_own_bounds() {
+        let upright = scaled_bounds(500., 100., 20., 30.);
+        let mut scene = Scene::default();
+        scene.push_rounded_clip(rounded_clip_bands(115.));
+        scene.insert_primitive(sprite(upright, TransformationMatrix::unit()));
+        scene.pop_rounded_clip();
+
+        let masks: Vec<_> = scene
+            .monochrome_sprites
+            .iter()
+            .map(|sprite| sprite.content_mask.bounds)
+            .collect();
+        assert_eq!(
+            masks,
+            vec![
+                upright.intersect(&scaled_bounds(0., 0., 1000., 115.)),
+                upright.intersect(&scaled_bounds(0., 115., 1000., 885.)),
+            ]
+        );
+        assert_eq!(
+            TransformationMatrix::unit().transformed_aabb(upright),
+            Some(upright)
         );
     }
 }

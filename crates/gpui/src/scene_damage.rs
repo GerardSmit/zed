@@ -194,31 +194,10 @@ fn sprite_footprint(
     mask: ContentMask<ScaledPixels>,
     transform: TransformationMatrix,
 ) -> Bounds<ScaledPixels> {
-    let transform_point = |x: ScaledPixels, y: ScaledPixels| {
-        let point = transform.apply(point(Pixels(x.0), Pixels(y.0)));
-        point.map(|value| ScaledPixels(value.0))
-    };
-    let corners = [
-        transform_point(bounds.left(), bounds.top()),
-        transform_point(bounds.right(), bounds.top()),
-        transform_point(bounds.left(), bounds.bottom()),
-        transform_point(bounds.right(), bounds.bottom()),
-    ];
-    if corners
-        .iter()
-        .any(|point| !point.x.0.is_finite() || !point.y.0.is_finite())
-    {
-        return invalid_bounds();
+    match transform.transformed_aabb(bounds) {
+        Some(transformed) => footprint(transformed, mask),
+        None => invalid_bounds(),
     }
-    let mut minimum = corners[0];
-    let mut maximum = corners[0];
-    for corner in &corners[1..] {
-        minimum.x = minimum.x.min(corner.x);
-        minimum.y = minimum.y.min(corner.y);
-        maximum.x = maximum.x.max(corner.x);
-        maximum.y = maximum.y.max(corner.y);
-    }
-    footprint(Bounds::from_corners(minimum, maximum), mask)
 }
 
 const MAX_CONTENT_COMPARISONS: usize = 1 << 20;
@@ -1205,9 +1184,11 @@ mod tests {
         old.insert_primitive(shape(60.));
         old.insert_primitive(quad(80.));
         old.finish();
+        // None of the four overlap, so the bounds tree gives them one draw order and the two
+        // quads share a batch; overlap is what would split them around the shapes.
         assert_eq!(
             old.batches().map(|batch| batch.label()).collect::<Vec<_>>(),
-            ["quads (1)", "shapes (2)", "quads (1)"]
+            ["quads (2)", "shapes (2)"]
         );
 
         let mut new = Scene::default();
