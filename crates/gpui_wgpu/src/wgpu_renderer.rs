@@ -182,6 +182,9 @@ struct BackdropBinding {
 /// Mirrors DirectX's `LAYER_EVICT_FRAMES`.
 const LAYER_EVICT_FRAMES: u32 = 3;
 
+/// Offscreen target sizes whose viewport globals are kept.
+const OFFSCREEN_GLOBALS_LIMIT: usize = 16;
+
 /// One cached offscreen texture for a layered view.
 struct LayerTexture {
     _texture: wgpu::Texture,
@@ -527,6 +530,8 @@ struct WgpuResources {
     retained_frame: Option<RetainedFrame>,
     /// [`RendererTuning::depth_buffer`] attachments by size.
     scene_depth: HashMap<(u32, u32), wgpu::TextureView>,
+    /// Viewport globals of [`WgpuRenderer::draw_offscreen_damage`] targets by size.
+    offscreen_globals: HashMap<(u32, u32), wgpu::BindGroup>,
 }
 
 impl WgpuResources {
@@ -1075,6 +1080,7 @@ impl WgpuRenderer {
             backdrop_textures: None,
             retained_frame: None,
             scene_depth: HashMap::new(),
+            offscreen_globals: HashMap::new(),
         };
 
         let frame_timings = if resources.surface.is_none() {
@@ -2083,6 +2089,9 @@ impl WgpuRenderer {
 
         if new_alpha_mode != self.surface_config.alpha_mode {
             self.invalidate_retained_pixels();
+            if let Some(resources) = self.resources.as_mut() {
+                resources.offscreen_globals.clear();
+            }
             self.surface_config.alpha_mode = new_alpha_mode;
             let surface_config = self.surface_config.clone();
             let Some(resources) = self.resources.as_ref() else {
@@ -2404,12 +2413,7 @@ impl WgpuRenderer {
         view: &wgpu::TextureView,
         damage: SceneDamage,
     ) -> anyhow::Result<wgpu::SubmissionIndex> {
-        anyhow::ensure!(view.texture() == target, "External view belongs to another target");
-        anyhow::ensure!(
-            self.resources().surface.is_none(),
-            "Renderer owns a window surface"
-        );
-        anyhow::ensure!(!self.device_lost(), "External-target device lost");
+        self.ensure_external_ready(target, view)?;
         anyhow::ensure!(
             target.format() == self.surface_config.format
                 && target.width() == self.surface_config.width
@@ -2422,6 +2426,97 @@ impl WgpuRenderer {
                     .contains(wgpu::TextureUsages::RENDER_ATTACHMENT),
             "External target does not match renderer configuration"
         );
+        let viewport = self.viewport_size();
+        self.draw_external_prepared(scene, target, view, viewport, None, damage)
+    }
+
+    /// Like [`Self::draw_external_damage`] for a `target` of any size up to the device's
+    /// `max_texture_dimension_2d`, so one renderer and its sprite atlas can draw the desktop
+    /// and any number of window textures. `target` must be a single-sample 2D texture with
+    /// `RENDER_ATTACHMENT` usage whose format equals the renderer's pipeline format
+    /// (`surface_config.format`, the format the renderer was created with); `view` must be a
+    /// view of it. `damage` is in `target` pixels and has the semantics of
+    /// [`Self::draw_external_damage`]: damaged rectangles are redrawn (as `@area=` labelled
+    /// passes when area passes are tuned on) and every other pixel is loaded unchanged, so a
+    /// target that has never been drawn needs [`SceneDamage::Full`]. Backdrop blur surfaces
+    /// are not drawn into offscreen targets. Layers share the renderer's layer cache, which
+    /// each external or offscreen draw prunes to the layers its own scene references.
+    pub fn draw_offscreen_damage(
+        &mut self,
+        scene: &Scene,
+        target: &wgpu::Texture,
+        view: &wgpu::TextureView,
+        damage: SceneDamage,
+    ) -> anyhow::Result<wgpu::SubmissionIndex> {
+        self.ensure_external_ready(target, view)?;
+        let (width, height) = (target.width(), target.height());
+        let limit = self.resources().device.limits().max_texture_dimension_2d;
+        anyhow::ensure!(
+            target.format() == self.surface_config.format
+                && width > 0
+                && height > 0
+                && width <= limit
+                && height <= limit
+                && width <= i32::MAX as u32
+                && height <= i32::MAX as u32
+                && target.depth_or_array_layers() == 1
+                && target.sample_count() == 1
+                && target.dimension() == wgpu::TextureDimension::D2
+                && target
+                    .usage()
+                    .contains(wgpu::TextureUsages::RENDER_ATTACHMENT),
+            "Offscreen target does not match renderer format or device limits"
+        );
+        let viewport = Size {
+            width: DevicePixels(width as i32),
+            height: DevicePixels(height as i32),
+        };
+        let globals = self.offscreen_globals(width, height);
+        self.draw_external_prepared(scene, target, view, viewport, Some(globals), damage)
+    }
+
+    fn ensure_external_ready(
+        &self,
+        target: &wgpu::Texture,
+        view: &wgpu::TextureView,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(view.texture() == target, "External view belongs to another target");
+        anyhow::ensure!(
+            self.resources().surface.is_none(),
+            "Renderer owns a window surface"
+        );
+        anyhow::ensure!(!self.device_lost(), "External-target device lost");
+        Ok(())
+    }
+
+    /// Viewport globals for a target of `width` by `height`, kept for the last few sizes.
+    fn offscreen_globals(&mut self, width: u32, height: u32) -> wgpu::BindGroup {
+        let gamma_offset = self.gamma_offset;
+        let premultiplied_alpha =
+            self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+        let resources = self.resources_mut();
+        if let Some(globals) = resources.offscreen_globals.get(&(width, height)) {
+            return globals.clone();
+        }
+        if resources.offscreen_globals.len() >= OFFSCREEN_GLOBALS_LIMIT {
+            resources.offscreen_globals.clear();
+        }
+        let globals =
+            Self::viewport_globals(resources, gamma_offset, width, height, premultiplied_alpha);
+        resources.offscreen_globals.insert((width, height), globals.clone());
+        globals
+    }
+
+    /// `globals` of `None` are the renderer's own surface-sized globals.
+    fn draw_external_prepared(
+        &mut self,
+        scene: &Scene,
+        target: &wgpu::Texture,
+        view: &wgpu::TextureView,
+        viewport: Size<DevicePixels>,
+        globals: Option<wgpu::BindGroup>,
+        damage: SceneDamage,
+    ) -> anyhow::Result<wgpu::SubmissionIndex> {
         if let Some(error) = self.last_error.lock().unwrap().take() {
             anyhow::bail!("GPU error during external frame: {error}");
         }
@@ -2432,7 +2527,7 @@ impl WgpuRenderer {
             self.instance_upload_slot = None;
             return Err(error);
         }
-        let submission = match self.record_external_frame(scene, target, view, damage) {
+        let submission = match self.record_external_frame(scene, target, view, viewport, globals, damage) {
             Ok(submission) => submission,
             Err(error) => {
                 self.instance_upload_encoder = None;
@@ -2492,10 +2587,12 @@ impl WgpuRenderer {
     }
 
     fn record_external_frame(&mut self, scene: &Scene, target: &wgpu::Texture,
-        view: &wgpu::TextureView, damage: SceneDamage) -> Result<wgpu::SubmissionIndex> {
+        view: &wgpu::TextureView, viewport: Size<DevicePixels>, globals: Option<wgpu::BindGroup>,
+        damage: SceneDamage) -> Result<wgpu::SubmissionIndex> {
         if let Some(textures) = &self.resources().backdrop_textures { textures.next_binding.set(0); }
         for layer in self.resources().layer_textures.values() { layer.next_composite.set(0); }
-        let blurs_backdrop = self.backdrop_blur_supported && scene.surfaces.iter()
+        // Backdrop textures are surface sized, so only surface-sized targets blur.
+        let blurs_backdrop = globals.is_none() && self.backdrop_blur_supported && scene.surfaces.iter()
             .any(|surface| matches!(surface.source, PaintSurfaceSource::BackdropBlur(_)));
         anyhow::ensure!(!blurs_backdrop || target.usage().contains(wgpu::TextureUsages::COPY_SRC),
             "Backdrop blur requires a readable external target");
@@ -2509,12 +2606,15 @@ impl WgpuRenderer {
         if let (Some(timings), Some(index)) = (&self.frame_timings, timing) {
             timings.intermediate_end(index, &mut encoder);
         }
-        let globals = self.resources().globals_bind_group.clone();
+        let globals = match globals {
+            Some(globals) => globals,
+            None => self.resources().globals_bind_group.clone(),
+        };
         // Paint directly into the scanout image; retaining the root would add a
         // second full-screen color pass. Backdrop blur samples pixels outside
         // the damage, so it repaints everything.
         let damage = if blurs_backdrop { SceneDamage::Full } else { damage };
-        self.encode_scene(scene, damage, self.viewport_size(), target, view,
+        self.encode_scene(scene, damage, viewport, target, view,
             &globals, blurs_backdrop, &mut instance_offset, &mut encoder)?;
         if let (Some(timings), Some(index)) = (&self.frame_timings, timing) {
             timings.end(index, &mut encoder);
