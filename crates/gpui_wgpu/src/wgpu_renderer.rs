@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, BackdropBlur, Background, BorderStyle, Bounds, ContentFade, DevicePixels,
     GpuSpecs, LayerId, PaintSurface, PaintSurfaceSource, Path, Point, PrimitiveBatch, Quad,
-    ScaledPixels, Scene, SceneDamage, Size, get_gamma_correction_ratios,
+    ScaledPixels, Scene, SceneDamage, Shadow, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -572,6 +572,7 @@ pub struct WgpuRenderer {
     resources: Option<WgpuResources>,
     staging_scene: Scene,
     opaque_plan: OpaqueQuadPlan,
+    shadow_split: ShadowSplit,
     surface_config: wgpu::SurfaceConfiguration,
     atlas: Arc<WgpuAtlas>,
     gamma_offset: u64,
@@ -1092,6 +1093,7 @@ impl WgpuRenderer {
             resources: Some(resources),
             staging_scene: Scene::default(),
             opaque_plan: OpaqueQuadPlan::default(),
+            shadow_split: ShadowSplit::default(),
             surface_config,
             atlas,
             gamma_offset,
@@ -2812,7 +2814,8 @@ impl WgpuRenderer {
                 }
                 crate::pass_trace::note(|| self.opaque_plan.summary());
             }
-            let instance_bindings = self.write_instances(scene, instance_offset, opaque_quads)?;
+            let instance_bindings =
+                self.write_instances(scene, instance_offset, opaque_quads, !blurs_backdrop)?;
             self.prepare_layer_surfaces(&scene.surfaces)?;
             // Backdrop blurs copy the frame between draws, which needs the split encoding.
             if self.tuning.merged_scene_passes && !blurs_backdrop {
@@ -2950,7 +2953,7 @@ impl WgpuRenderer {
             PrimitiveBatch::Shadows(range) => self.draw_instances(
                 &instance_bindings.shadows,
                 &pipelines.shadows,
-                instance_range(range),
+                self.shadow_split.instance_range(range),
                 globals,
                 pass,
             ),
@@ -3607,7 +3610,17 @@ impl WgpuRenderer {
         scene: &Scene,
         instance_offset: &mut u64,
         opaque_quads: bool,
+        split_shadows: bool,
     ) -> Result<InstanceBindings> {
+        let mut shadow_split = std::mem::take(&mut self.shadow_split);
+        shadow_split.plan(scene, split_shadows);
+        let shadows = self.write_instance_binding(
+            "shadows_bind_group",
+            instance_offset,
+            &shadow_split.instances,
+        );
+        self.shadow_split = shadow_split;
+        let shadows = shadows?;
         let opaque = if opaque_quads {
             let plan = std::mem::take(&mut self.opaque_plan);
             let bindings = self
@@ -3632,11 +3645,7 @@ impl WgpuRenderer {
                 instance_offset,
                 &scene.quads,
             )?,
-            shadows: self.write_instance_binding(
-                "shadows_bind_group",
-                instance_offset,
-                &scene.shadows,
-            )?,
+            shadows,
             shapes: self.write_instance_binding(
                 "shapes_bind_group",
                 instance_offset,
@@ -4747,6 +4756,120 @@ fn rim(bounds: DeviceRect, interior: DeviceRect) -> [DeviceRect; 4] {
     ]
 }
 
+/// The pixel-aligned opaque interior of a simple quad, which hides whatever is drawn before it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OpaqueCover {
+    order: u32,
+    interior: DeviceRect,
+}
+
+/// The covers of `quads`, which are in draw order.
+fn opaque_covers(quads: &[Quad], covers: &mut Vec<OpaqueCover>) {
+    covers.clear();
+    covers.extend(quads.iter().filter(|quad| is_simple_quad(quad)).filter_map(|quad| {
+        let interior = opaque_interior(quad, OPAQUE_INTERIOR_MIN_AREA)?;
+        Some(OpaqueCover { order: quad.order, interior })
+    }));
+}
+
+/// The rectangle `vs_shadow` rasters before clamping it to the content mask.
+fn shadow_raster(shadow: &Shadow) -> DeviceRect {
+    if shadow.inset != 0 {
+        DeviceRect::of(shadow.element_bounds)
+    } else {
+        DeviceRect::of(shadow.bounds).inflate(3. * shadow.blur_radius.0)
+    }
+}
+
+/// `bounds` whose right and bottom edges, computed as the shaders do from origin and size, are
+/// exactly those of `rect`.
+fn bounds_of_rect(rect: DeviceRect) -> Option<Bounds<ScaledPixels>> {
+    let extent = |start: f32, end: f32| {
+        let size = end - start;
+        [size, size.next_down(), size.next_up()]
+            .into_iter()
+            .find(|size| size.is_finite() && size + start == end)
+    };
+    Some(Bounds {
+        origin: gpui::point(ScaledPixels(rect.left), ScaledPixels(rect.top)),
+        size: gpui::size(
+            ScaledPixels(extent(rect.left, rect.right)?),
+            ScaledPixels(extent(rect.top, rect.bottom)?),
+        ),
+    })
+}
+
+/// Appends to `parts` the shadows that draw what `shadow` draws, except where the opaque
+/// interior of a quad drawn after it covers every pixel: the shadow's content mask is cut into
+/// the rim around that interior, and parts that raster nothing are dropped. Appends `shadow`
+/// itself when no such quad overlaps it. `covers` are in draw order.
+fn split_shadow(shadow: &Shadow, covers: &[OpaqueCover], parts: &mut Vec<Shadow>) {
+    let mask = DeviceRect::of(shadow.content_mask.bounds);
+    let raster = shadow_raster(shadow);
+    let overlap = |cover: &OpaqueCover| cover.interior.intersect(mask).intersect(raster).area();
+    let later = covers.partition_point(|cover| cover.order <= shadow.order);
+    let best = covers
+        .get(later..)
+        .unwrap_or_default()
+        .iter()
+        .map(|cover| (overlap(cover), cover.interior))
+        .filter(|(area, _)| *area >= f64::from(OPAQUE_INTERIOR_MIN_AREA))
+        .max_by(|first, second| first.0.total_cmp(&second.0));
+    let finite = mask.edges().iter().chain(raster.edges().iter()).all(|edge| edge.is_finite());
+    let Some((_, interior)) = best.filter(|_| finite) else {
+        parts.push(shadow.clone());
+        return;
+    };
+    let rim_parts = rim(mask, interior.intersect(mask));
+    let start = parts.len();
+    for part in rim_parts {
+        if !part.overlaps(raster.inflate(1.)) {
+            continue;
+        }
+        let Some(bounds) = bounds_of_rect(part) else {
+            parts.truncate(start);
+            parts.push(shadow.clone());
+            return;
+        };
+        let mut copy = shadow.clone();
+        copy.content_mask.bounds = bounds;
+        parts.push(copy);
+    }
+}
+
+/// The shadows of a scene as drawn: [`split_shadow`] applied to each, in draw order.
+#[derive(Default)]
+struct ShadowSplit {
+    covers: Vec<OpaqueCover>,
+    instances: Vec<Shadow>,
+    /// The index in `instances` of each scene shadow's first part, and `instances.len()`.
+    starts: Vec<u32>,
+}
+
+impl ShadowSplit {
+    fn plan(&mut self, scene: &Scene, enabled: bool) {
+        self.instances.clear();
+        self.starts.clear();
+        self.covers.clear();
+        if enabled && !scene.shadows.is_empty() {
+            opaque_covers(&scene.quads, &mut self.covers);
+        }
+        for shadow in &scene.shadows {
+            self.starts.push(self.instances.len() as u32);
+            split_shadow(shadow, &self.covers, &mut self.instances);
+        }
+        self.starts.push(self.instances.len() as u32);
+    }
+
+    /// The instances drawing the scene shadows in `range`.
+    fn instance_range(&self, range: Range<usize>) -> Range<u32> {
+        match (self.starts.get(range.start), self.starts.get(range.end)) {
+            (Some(&start), Some(&end)) => start..end,
+            _ => 0..0,
+        }
+    }
+}
+
 /// How [`RendererTuning::opaque_quads`] draws the simple-quad runs of a scene. Each run becomes
 /// segments, drawn in order. A split segment draws the opaque interiors of its quads first, then
 /// the rest of every quad in it blended, in quad order. It ends before a quad whose interior
@@ -4976,8 +5099,8 @@ fn draw_opaque_quad_batch(
 }
 
 /// Primitive counts and covered areas of what a frame draws within its damage rectangles, in
-/// device pixels, for `pass_trace`. `quad_raster_px` is what quads rasterize (their bounds),
-/// `quad_px` what survives their content masks; `opaque_px` is the part of that from quads with
+/// device pixels, for `pass_trace`. `quad_raster_px` is what quads rasterize (their bounds
+/// within a pixel of their content masks), `quad_px` what survives the masks; `opaque_px` is the part of that from quads with
 /// an opaque solid background and no fade, and `interior_px` its part beyond corner radii.
 fn overdraw_summary(scene: &Scene, rects: impl Iterator<Item = Bounds<DevicePixels>>) -> String {
     #[derive(Default)]
@@ -4991,6 +5114,10 @@ fn overdraw_summary(scene: &Scene, rects: impl Iterator<Item = Bounds<DevicePixe
             self.area += bounds.intersect(DeviceRect::of(mask)).intersect(damage).area();
         }
     }
+    let mut covers = Vec::new();
+    opaque_covers(&scene.quads, &mut covers);
+    let mut parts = Vec::new();
+    let mut split_px = 0.;
     let mut damage_px = 0.;
     let (mut quads, mut quad_raster_px, mut opaque_px, mut interior_px) = (Kind::default(), 0., 0., 0.);
     let mut others: [(&str, Kind); 8] = [
@@ -5013,7 +5140,7 @@ fn overdraw_summary(scene: &Scene, rects: impl Iterator<Item = Bounds<DevicePixe
                         let bounds = DeviceRect::of(quad.bounds);
                         let mask = DeviceRect::of(quad.content_mask.bounds);
                         quads.add(bounds, quad.content_mask.bounds, damage);
-                        quad_raster_px += bounds.intersect(damage).area();
+                        quad_raster_px += bounds.intersect(mask.inflate(1.)).intersect(damage).area();
                         let fade = &quad.content_mask.fade;
                         if fade.top_len.0 > 0. || fade.bottom_len.0 > 0. {
                             continue;
@@ -5028,6 +5155,18 @@ fn overdraw_summary(scene: &Scene, rects: impl Iterator<Item = Bounds<DevicePixe
                 }
                 PrimitiveBatch::Shadows(range) => {
                     for shadow in &scene.shadows[range] {
+                        parts.clear();
+                        split_shadow(shadow, &covers, &mut parts);
+                        let raster = shadow_raster(shadow);
+                        split_px += parts
+                            .iter()
+                            .map(|part| {
+                                raster
+                                    .intersect(DeviceRect::of(part.content_mask.bounds))
+                                    .intersect(damage)
+                                    .area()
+                            })
+                            .sum::<f64>();
                         let margin = if shadow.inset != 0 { 0. } else { 3. * shadow.blur_radius.0 };
                         let bounds = DeviceRect::of(if shadow.inset != 0 { shadow.element_bounds } else { shadow.bounds });
                         others[0].1.add(bounds.inflate(margin), shadow.content_mask.bounds, damage);
@@ -5088,6 +5227,7 @@ fn overdraw_summary(scene: &Scene, rects: impl Iterator<Item = Bounds<DevicePixe
     for (name, kind) in &others {
         line.push_str(&format!(" {name}={}/{:.0}", kind.count, kind.area));
     }
+    line.push_str(&format!(" shadow_split_px={split_px:.0}"));
     line
 }
 
@@ -5643,6 +5783,136 @@ mod tests {
             corner_radii,
             border_widths: Default::default(),
         }
+    }
+
+    fn test_shadow(order: u32, bounds: Bounds<ScaledPixels>, mask: Bounds<ScaledPixels>) -> Shadow {
+        Shadow {
+            order,
+            blur_radius: ScaledPixels(10.),
+            bounds,
+            corner_radii: Default::default(),
+            content_mask: gpui::ContentMask { bounds: mask, fade: Default::default() },
+            color: gpui::hsla(0., 0., 0., 0.5),
+            element_bounds: bounds,
+            element_corner_radii: Default::default(),
+            inset: 0,
+            pad: 0,
+        }
+    }
+
+    fn cover_test_quad(order: u32, bounds: Bounds<ScaledPixels>) -> Quad {
+        let mut seed = 3;
+        let mut quad = test_quad(&mut seed);
+        quad.order = order;
+        quad.bounds = bounds;
+        quad.content_mask = gpui::ContentMask { bounds, fade: Default::default() };
+        quad.corner_radii = Default::default();
+        quad.background = gpui::hsla(0.3, 0.5, 0.5, 1.).into();
+        quad
+    }
+
+    fn pixel_bounds(left: f32, top: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            gpui::point(ScaledPixels(left), ScaledPixels(top)),
+            gpui::size(ScaledPixels(width), ScaledPixels(height)),
+        )
+    }
+
+    #[test]
+    fn shadow_split_tiles_the_mask_around_a_later_opaque_quad() {
+        let mask = pixel_bounds(0., 0., 400., 300.);
+        let shadow = test_shadow(5, pixel_bounds(60., 50., 200., 150.), mask);
+        let quad = cover_test_quad(9, pixel_bounds(60., 50., 200., 150.));
+        let mut covers = Vec::new();
+        opaque_covers(&[quad.clone()], &mut covers);
+        let cover = covers[0].interior;
+
+        let mut parts = Vec::new();
+        split_shadow(&shadow, &covers, &mut parts);
+        assert_eq!(parts.len(), 4);
+        let rects: Vec<DeviceRect> =
+            parts.iter().map(|part| DeviceRect::of(part.content_mask.bounds)).collect();
+        let mask_rect = DeviceRect::of(mask);
+        let total: f64 = rects.iter().map(|rect| rect.area()).sum::<f64>() + cover.area();
+        assert_eq!(total, mask_rect.area());
+        for (index, rect) in rects.iter().enumerate() {
+            assert!(!rect.overlaps(cover));
+            for other in &rects[index + 1..] {
+                assert!(!rect.overlaps(*other));
+            }
+        }
+        for part in &parts {
+            assert_eq!(part.bounds, shadow.bounds);
+            assert_eq!(part.order, shadow.order);
+        }
+    }
+
+    #[test]
+    fn shadow_split_drops_empty_and_unreached_parts() {
+        let mask = pixel_bounds(60., 50., 200., 150.);
+        let shadow = test_shadow(5, pixel_bounds(60., 50., 200., 150.), mask);
+        let quad = cover_test_quad(9, pixel_bounds(0., 0., 400., 300.));
+        let mut covers = Vec::new();
+        opaque_covers(&[quad], &mut covers);
+        let mut parts = Vec::new();
+        split_shadow(&shadow, &covers, &mut parts);
+        assert!(parts.is_empty());
+
+        let mask = pixel_bounds(0., 0., 400., 300.);
+        let shadow = test_shadow(5, pixel_bounds(60., 50., 200., 150.), mask);
+        let quad = cover_test_quad(9, pixel_bounds(40., 20., 200., 400.));
+        opaque_covers(&[quad], &mut covers);
+        split_shadow(&shadow, &covers, &mut parts);
+        assert!(!parts.is_empty() && parts.len() < 4);
+        let cover = covers[0].interior;
+        for part in &parts {
+            assert!(!DeviceRect::of(part.content_mask.bounds).overlaps(cover));
+        }
+    }
+
+    #[test]
+    fn shadow_split_needs_a_later_overlapping_opaque_quad() {
+        let mask = pixel_bounds(0., 0., 400., 300.);
+        let shadow = test_shadow(5, pixel_bounds(60., 50., 200., 150.), mask);
+        let mut covers = Vec::new();
+        let mut parts = Vec::new();
+
+        opaque_covers(&[cover_test_quad(5, pixel_bounds(60., 50., 200., 150.))], &mut covers);
+        split_shadow(&shadow, &covers, &mut parts);
+        assert_eq!(parts, [shadow.clone()]);
+
+        parts.clear();
+        opaque_covers(&[cover_test_quad(2, pixel_bounds(60., 50., 200., 150.))], &mut covers);
+        split_shadow(&shadow, &covers, &mut parts);
+        assert_eq!(parts, [shadow.clone()]);
+
+        parts.clear();
+        opaque_covers(&[cover_test_quad(9, pixel_bounds(1000., 50., 200., 150.))], &mut covers);
+        split_shadow(&shadow, &covers, &mut parts);
+        assert_eq!(parts, [shadow.clone()]);
+
+        parts.clear();
+        opaque_covers(&[cover_test_quad(9, pixel_bounds(60., 50., 20., 20.))], &mut covers);
+        split_shadow(&shadow, &covers, &mut parts);
+        assert_eq!(parts, [shadow]);
+    }
+
+    #[test]
+    fn shadow_split_instance_ranges_follow_the_scene_shadows() {
+        let mask = pixel_bounds(0., 0., 400., 300.);
+        let mut scene = Scene::default();
+        scene.shadows.push(test_shadow(1, pixel_bounds(60., 50., 200., 150.), mask));
+        scene.shadows.push(test_shadow(2, pixel_bounds(60., 50., 200., 150.), mask));
+        scene.shadows.push(test_shadow(30, pixel_bounds(60., 50., 200., 150.), mask));
+        scene.quads.push(cover_test_quad(10, pixel_bounds(60., 50., 200., 150.)));
+        let mut split = ShadowSplit::default();
+        split.plan(&scene, true);
+        assert_eq!(split.instance_range(0..2), 0..8);
+        assert_eq!(split.instance_range(2..3), 8..9);
+        assert_eq!(split.instance_range(0..3), 0..9);
+        assert_eq!(split.instance_range(3..9), 0..0);
+        split.plan(&scene, false);
+        assert_eq!(split.instance_range(0..3), 0..3);
     }
 
     #[test]

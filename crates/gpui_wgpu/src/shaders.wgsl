@@ -599,7 +599,11 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     let quad = load_quad(instance_id);
 
     var out = QuadVarying();
-    out.position = to_device_position(unit_vertex, quad.bounds);
+    // Every fragment outside the content mask is discarded, so raster only what it keeps. The
+    // inflation keeps pixels whose centres lie on the mask's edge, which `outside_clip` accepts.
+    let mask = edges_of(quad.content_mask);
+    let position = unit_vertex * vec2<f32>(quad.bounds.size) + quad.bounds.origin;
+    out.position = to_device_position_impl(clamp(position, mask.xy - 1.0, mask.zw + 1.0));
 
     let gradient = prepare_gradient_color(
         quad.background.tag,
@@ -1284,8 +1288,7 @@ struct ShadowVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) color: vec4<f32>,
     @location(1) @interpolate(flat) shadow_id: u32,
-    //TODO: use `clip_distance` once Naga supports it
-    @location(3) clip_distances: vec4<f32>,
+    @location(3) @interpolate(flat) clip_edges: vec4<f32>,
 }
 
 @vertex
@@ -1305,17 +1308,21 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
     }
 
     var out = ShadowVarying();
-    out.position = to_device_position(unit_vertex, geometry);
+    // Every fragment outside the content mask is discarded, so raster only what it keeps. The
+    // inflation keeps pixels whose centres lie on the mask's edge, which `outside_clip` accepts.
+    let mask = edges_of(shadow.content_mask);
+    let position = unit_vertex * vec2<f32>(geometry.size) + geometry.origin;
+    out.position = to_device_position_impl(clamp(position, mask.xy - 1.0, mask.zw + 1.0));
     out.color = hsla_to_rgba(shadow.color);
     out.shadow_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask);
+    out.clip_edges = mask;
     return out;
 }
 
 @fragment
 fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     // Alpha clip first, since we don't have `clip_distance`.
-    if (any(input.clip_distances < vec4<f32>(0.0))) {
+    if (outside_clip(input.position.xy, input.clip_edges)) {
         return vec4<f32>(0.0);
     }
 
