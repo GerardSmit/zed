@@ -1876,7 +1876,7 @@ struct PolySpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) sprite_id: u32,
-    @location(3) clip_distances: vec4<f32>,
+    @location(3) @interpolate(flat) clip_edges: vec4<f32>,
 }
 
 @vertex
@@ -1885,10 +1885,18 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     let sprite = load_poly_sprite(instance_id);
 
     var out = PolySpriteVarying();
-    out.position = to_device_position(unit_vertex, sprite.bounds);
-    out.tile_position = to_tile_position(unit_vertex, sprite.tile);
+    // Every fragment outside the content mask is discarded, so raster only what it keeps. The
+    // inflation keeps pixels whose centres lie on the mask's edge, which `outside_clip` accepts.
+    // The texture coordinate follows the clamped vertex.
+    let mask = edges_of(sprite.content_mask);
+    let size = vec2<f32>(sprite.bounds.size);
+    let position = unit_vertex * size + sprite.bounds.origin;
+    let clamped = clamp(position, mask.xy - 1.0, mask.zw + 1.0);
+    out.position = to_device_position_impl(clamped);
+    let clamped_unit = select((clamped - sprite.bounds.origin) / size, unit_vertex, size == vec2<f32>(0.0));
+    out.tile_position = to_tile_position(clamped_unit, sprite.tile);
     out.sprite_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    out.clip_edges = mask;
     return out;
 }
 
@@ -1896,7 +1904,7 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     let sample = textureSample(t_sprite, s_sprite, input.tile_position);
     // Alpha clip after using the derivatives.
-    if (any(input.clip_distances < vec4<f32>(0.0))) {
+    if (outside_clip(input.position.xy, input.clip_edges)) {
         return vec4<f32>(0.0);
     }
 

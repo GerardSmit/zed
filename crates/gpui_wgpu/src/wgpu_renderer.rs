@@ -5120,6 +5120,7 @@ fn overdraw_summary(scene: &Scene, rects: impl Iterator<Item = Bounds<DevicePixe
     let mut split_px = 0.;
     let mut damage_px = 0.;
     let (mut quads, mut quad_raster_px, mut opaque_px, mut interior_px) = (Kind::default(), 0., 0., 0.);
+    let mut poly_raster_px = 0.;
     let mut others: [(&str, Kind); 8] = [
         ("shadows", Kind::default()),
         ("shapes", Kind::default()),
@@ -5199,7 +5200,12 @@ fn overdraw_summary(scene: &Scene, rects: impl Iterator<Item = Bounds<DevicePixe
                 }
                 PrimitiveBatch::PolychromeSprites { range, .. } => {
                     for sprite in &scene.polychrome_sprites[range] {
-                        others[6].1.add(DeviceRect::of(sprite.bounds), sprite.content_mask.bounds, damage);
+                        let bounds = DeviceRect::of(sprite.bounds);
+                        others[6].1.add(bounds, sprite.content_mask.bounds, damage);
+                        poly_raster_px += bounds
+                            .intersect(DeviceRect::of(sprite.content_mask.bounds).inflate(1.))
+                            .intersect(damage)
+                            .area();
                     }
                 }
                 PrimitiveBatch::Surfaces(range) => {
@@ -5227,7 +5233,7 @@ fn overdraw_summary(scene: &Scene, rects: impl Iterator<Item = Bounds<DevicePixe
     for (name, kind) in &others {
         line.push_str(&format!(" {name}={}/{:.0}", kind.count, kind.area));
     }
-    line.push_str(&format!(" shadow_split_px={split_px:.0}"));
+    line.push_str(&format!(" poly_raster_px={poly_raster_px:.0} shadow_split_px={split_px:.0}"));
     line
 }
 
