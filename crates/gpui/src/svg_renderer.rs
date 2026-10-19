@@ -5,17 +5,19 @@ use crate::{
 use image::Frame;
 use resvg::tiny_skia::Pixmap;
 use smallvec::SmallVec;
-use std::{
-    hash::Hash,
-    sync::{Arc, LazyLock, OnceLock},
-};
+#[cfg(feature = "svg-text")]
+use std::sync::{LazyLock, OnceLock};
+use std::{hash::Hash, sync::Arc};
 
+#[cfg(feature = "svg-text")]
 #[cfg(target_os = "macos")]
 const EMOJI_FONT_FAMILIES: &[&str] = &["Apple Color Emoji", ".AppleColorEmojiUI"];
 
+#[cfg(feature = "svg-text")]
 #[cfg(target_os = "windows")]
 const EMOJI_FONT_FAMILIES: &[&str] = &["Segoe UI Emoji", "Segoe UI Symbol"];
 
+#[cfg(feature = "svg-text")]
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 const EMOJI_FONT_FAMILIES: &[&str] = &[
     "Noto Color Emoji",
@@ -24,6 +26,7 @@ const EMOJI_FONT_FAMILIES: &[&str] = &[
     "JoyPixels",
 ];
 
+#[cfg(feature = "svg-text")]
 #[cfg(not(any(
     target_os = "macos",
     target_os = "windows",
@@ -32,13 +35,109 @@ const EMOJI_FONT_FAMILIES: &[&str] = &[
 )))]
 const EMOJI_FONT_FAMILIES: &[&str] = &[];
 
+#[cfg(feature = "svg-text")]
+// Unicode `Emoji_Presentation` code point ranges (inclusive, sorted), from regex-syntax's
+// Unicode tables, so the check needs no regex engine.
+const EMOJI_PRESENTATION_RANGES: &[(u32, u32)] = &[
+    (0x231A, 0x231B),
+    (0x23E9, 0x23EC),
+    (0x23F0, 0x23F0),
+    (0x23F3, 0x23F3),
+    (0x25FD, 0x25FE),
+    (0x2614, 0x2615),
+    (0x2648, 0x2653),
+    (0x267F, 0x267F),
+    (0x2693, 0x2693),
+    (0x26A1, 0x26A1),
+    (0x26AA, 0x26AB),
+    (0x26BD, 0x26BE),
+    (0x26C4, 0x26C5),
+    (0x26CE, 0x26CE),
+    (0x26D4, 0x26D4),
+    (0x26EA, 0x26EA),
+    (0x26F2, 0x26F3),
+    (0x26F5, 0x26F5),
+    (0x26FA, 0x26FA),
+    (0x26FD, 0x26FD),
+    (0x2705, 0x2705),
+    (0x270A, 0x270B),
+    (0x2728, 0x2728),
+    (0x274C, 0x274C),
+    (0x274E, 0x274E),
+    (0x2753, 0x2755),
+    (0x2757, 0x2757),
+    (0x2795, 0x2797),
+    (0x27B0, 0x27B0),
+    (0x27BF, 0x27BF),
+    (0x2B1B, 0x2B1C),
+    (0x2B50, 0x2B50),
+    (0x2B55, 0x2B55),
+    (0x1F004, 0x1F004),
+    (0x1F0CF, 0x1F0CF),
+    (0x1F18E, 0x1F18E),
+    (0x1F191, 0x1F19A),
+    (0x1F1E6, 0x1F1FF),
+    (0x1F201, 0x1F201),
+    (0x1F21A, 0x1F21A),
+    (0x1F22F, 0x1F22F),
+    (0x1F232, 0x1F236),
+    (0x1F238, 0x1F23A),
+    (0x1F250, 0x1F251),
+    (0x1F300, 0x1F320),
+    (0x1F32D, 0x1F335),
+    (0x1F337, 0x1F37C),
+    (0x1F37E, 0x1F393),
+    (0x1F3A0, 0x1F3CA),
+    (0x1F3CF, 0x1F3D3),
+    (0x1F3E0, 0x1F3F0),
+    (0x1F3F4, 0x1F3F4),
+    (0x1F3F8, 0x1F43E),
+    (0x1F440, 0x1F440),
+    (0x1F442, 0x1F4FC),
+    (0x1F4FF, 0x1F53D),
+    (0x1F54B, 0x1F54E),
+    (0x1F550, 0x1F567),
+    (0x1F57A, 0x1F57A),
+    (0x1F595, 0x1F596),
+    (0x1F5A4, 0x1F5A4),
+    (0x1F5FB, 0x1F64F),
+    (0x1F680, 0x1F6C5),
+    (0x1F6CC, 0x1F6CC),
+    (0x1F6D0, 0x1F6D2),
+    (0x1F6D5, 0x1F6D7),
+    (0x1F6DC, 0x1F6DF),
+    (0x1F6EB, 0x1F6EC),
+    (0x1F6F4, 0x1F6FC),
+    (0x1F7E0, 0x1F7EB),
+    (0x1F7F0, 0x1F7F0),
+    (0x1F90C, 0x1F93A),
+    (0x1F93C, 0x1F945),
+    (0x1F947, 0x1F9FF),
+    (0x1FA70, 0x1FA7C),
+    (0x1FA80, 0x1FA89),
+    (0x1FA8F, 0x1FAC6),
+    (0x1FACE, 0x1FADC),
+    (0x1FADF, 0x1FAE9),
+    (0x1FAF0, 0x1FAF8),
+];
+
+#[cfg(feature = "svg-text")]
 fn is_emoji_presentation(c: char) -> bool {
-    static EMOJI_PRESENTATION_REGEX: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new("\\p{Emoji_Presentation}").unwrap());
-    let mut buf = [0u8; 4];
-    EMOJI_PRESENTATION_REGEX.is_match(c.encode_utf8(&mut buf))
+    let c = c as u32;
+    EMOJI_PRESENTATION_RANGES
+        .binary_search_by(|&(start, end)| {
+            if end < c {
+                std::cmp::Ordering::Less
+            } else if start > c {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
+#[cfg(feature = "svg-text")]
 fn font_has_char(db: &usvg::fontdb::Database, id: usvg::fontdb::ID, ch: char) -> bool {
     db.with_face_data(id, |font_data, face_index| {
         ttf_parser::Face::parse(font_data, face_index)
@@ -49,6 +148,7 @@ fn font_has_char(db: &usvg::fontdb::Database, id: usvg::fontdb::ID, ch: char) ->
     .unwrap_or(false)
 }
 
+#[cfg(feature = "svg-text")]
 fn select_emoji_font(
     ch: char,
     fonts: &[usvg::fontdb::ID],
@@ -122,6 +222,15 @@ impl From<f32> for SvgSize {
 impl SvgRenderer {
     /// Creates a new SVG renderer with the provided asset source.
     pub fn new(asset_source: Arc<dyn AssetSource>) -> Self {
+        let options = Self::usvg_options(asset_source.clone());
+        Self {
+            asset_source,
+            usvg_options: Arc::new(options),
+        }
+    }
+
+    #[cfg(feature = "svg-text")]
+    fn usvg_options(asset_source: Arc<dyn AssetSource>) -> usvg::Options<'static> {
         static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
             let mut db = usvg::fontdb::Database::new();
             db.load_system_fonts();
@@ -180,10 +289,12 @@ impl SvgRenderer {
             },
             ..Default::default()
         };
-        Self {
-            asset_source,
-            usvg_options: Arc::new(options),
-        }
+        options
+    }
+
+    #[cfg(not(feature = "svg-text"))]
+    fn usvg_options(_asset_source: Arc<dyn AssetSource>) -> usvg::Options<'static> {
+        usvg::Options::default()
     }
 
     /// Parses SVG data into a [`ParsedSvg`] that can be rasterized at any scale.
@@ -308,6 +419,7 @@ fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Erro
     Ok(pixmap)
 }
 
+#[cfg(feature = "svg-text")]
 fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Database) {
     let font_paths = [
         "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
@@ -322,6 +434,7 @@ fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Dat
     }
 }
 
+#[cfg(feature = "svg-text")]
 // fontdb defaults generic families to Microsoft fonts ("Arial", "Times New Roman")
 // which aren't installed on most Linux systems. fontconfig normally overrides these,
 // but when it fails the defaults remain and all generic family queries return None.
@@ -358,10 +471,13 @@ fn fix_generic_font_families(db: &mut usvg::fontdb::Database) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "svg-text")]
     use usvg::fontdb::{Database, Family, Query};
 
+    #[cfg(feature = "svg-text")]
     const IBM_PLEX_REGULAR: &[u8] =
         include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+    #[cfg(feature = "svg-text")]
     const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
 
     #[test]
@@ -392,6 +508,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "svg-text")]
     fn db_with_bundled_fonts() -> Database {
         let mut db = Database::new();
         db.load_font_data(IBM_PLEX_REGULAR.to_vec());
@@ -399,6 +516,7 @@ mod tests {
         db
     }
 
+    #[cfg(feature = "svg-text")]
     #[test]
     fn text_with_split_glyph_clusters_in_mixed_fonts_does_not_panic() {
         let mut db = Database::new();
@@ -424,6 +542,7 @@ mod tests {
             .expect("SVG with mixed-font text should parse");
     }
 
+    #[cfg(feature = "svg-text")]
     #[test]
     fn test_is_emoji_presentation() {
         let cases = [
@@ -455,6 +574,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "svg-text")]
     #[test]
     fn fix_generic_font_families_sets_all_families() {
         let mut db = db_with_bundled_fonts();
@@ -480,6 +600,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "svg-text")]
     #[test]
     fn test_select_emoji_font_skips_family_without_glyph() {
         let mut db = db_with_bundled_fonts();
@@ -507,6 +628,7 @@ mod tests {
         assert!(font_has_char(&db, selected, '│'));
     }
 
+    #[cfg(feature = "svg-text")]
     #[test]
     fn fix_generic_font_families_monospace_resolves_to_lilex() {
         let mut db = db_with_bundled_fonts();

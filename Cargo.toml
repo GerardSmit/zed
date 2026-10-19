@@ -358,7 +358,7 @@ git_ui = { path = "crates/git_ui" }
 git_ui_core = { path = "crates/git_ui_core" }
 go_to_line = { path = "crates/go_to_line" }
 google_ai = { path = "crates/google_ai" }
-gpui = { path = "crates/gpui", default-features = false }
+gpui = { path = "crates/gpui", default-features = false, features = ["svg-text"] }
 gpui_apple = { path = "crates/gpui_apple" }
 gpui_linux = { path = "crates/gpui_linux", default-features = false }
 gpui_macos = { path = "crates/gpui_macos", default-features = false }
@@ -642,23 +642,13 @@ httparse = "1.10"
 human_bytes = "0.4.1"
 idna = "1.0"
 ignore = "0.4.22"
-# image's default features minus "avif", which only adds an encoder (rav1e);
-# decoding AVIF would additionally need the non-default "avif-native" feature.
+# Only the codecs Bitnest decodes; the rest of image's defaults (exr, tiff, ico, hdr, pnm,
+# qoi, tga, dds, ff, rayon) are dropped to keep app binaries small.
 image = { version = "0.25.1", default-features = false, features = [
     "bmp",
-    "dds",
-    "exr",
-    "ff",
     "gif",
-    "hdr",
-    "ico",
     "jpeg",
     "png",
-    "pnm",
-    "qoi",
-    "rayon",
-    "tga",
-    "tiff",
     "webp",
 ] }
 imara-diff = "0.2.0"
@@ -778,12 +768,7 @@ reqwest = { git = "https://github.com/zed-industries/reqwest.git", rev = "33bc76
     "socks",
     "stream",
 ], package = "zed-reqwest", version = "0.12.15-zed" }
-resvg = { version = "0.46.0", default-features = false, features = [
-    "text",
-    "system-fonts",
-    "memmap-fonts",
-    "raster-images",
-] }
+resvg = { version = "0.46.0", default-features = false, features = ["raster-images"] }
 rsa = "0.9.6"
 runtimelib = { version = "1.4.0", default-features = false, features = [
     "async-dispatcher-runtime", "aws-lc-rs"

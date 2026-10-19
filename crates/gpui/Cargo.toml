@@ -41,6 +41,9 @@ screen-capture = [
 windows-manifest = ["dep:embed-resource"]
 profiler = ["dep:hdrhistogram"]
 stacker = ["dep:stacksafe"]
+# Text in SVGs: resvg's text support with the system fonts. Without it `<text>` is ignored and
+# the font database, emoji fallback and ttf-parser lookups are not compiled in.
+svg-text = ["resvg/text", "resvg/system-fonts", "resvg/memmap-fonts"]
 
 [lib]
 path = "src/gpui.rs"
@@ -76,7 +79,6 @@ chrono.workspace = true
 profiling.workspace = true
 rand.workspace = true
 raw-window-handle.workspace = true
-regex.workspace = true
 refineable.workspace = true
 scheduler.workspace = true
 resvg.workspace = true
