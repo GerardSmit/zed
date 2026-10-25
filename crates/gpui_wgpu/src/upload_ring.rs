@@ -40,6 +40,10 @@ impl UploadRing {
         mapped.slice(start..end).copy_from_slice(bytes);
         Ok(())
     }
+    /// The whole mapping of slot `index`, for writing rows in place; drop it before `unmap`.
+    pub(crate) fn mapped(&self, index: usize) -> wgpu::BufferViewMut {
+        self.slots[index].buffer.get_mapped_range_mut(..)
+    }
     pub(crate) fn buffer(&self, index: usize) -> &wgpu::Buffer { &self.slots[index].buffer }
     pub(crate) fn unmap(&self, index: usize) { self.slots[index].buffer.unmap(); }
     pub(crate) fn submitted(&self, index: usize) {

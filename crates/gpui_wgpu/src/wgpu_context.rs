@@ -349,6 +349,9 @@ impl WgpuContext {
         if unified_memory && adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS) {
             required_features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
         }
+        if adapter.features().contains(wgpu::Features::PASSTHROUGH_SHADERS) {
+            required_features |= wgpu::Features::PASSTHROUGH_SHADERS;
+        }
         if dual_source_blending {
             required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
         } else {

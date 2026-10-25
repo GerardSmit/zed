@@ -38,6 +38,8 @@ struct WgpuAtlasState {
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     pending_uploads: Vec<PendingUpload>,
     upload_ring: Option<crate::upload_ring::UploadRing>,
+    /// Flushes in a row that needed a quarter of a large ring or less.
+    oversized_flushes: u32,
     merged_uploads: bool,
 }
 
@@ -61,6 +63,7 @@ impl WgpuAtlas {
             tiles_by_key: Default::default(),
             pending_uploads: Vec::new(),
             upload_ring: None,
+            oversized_flushes: 0,
             merged_uploads: false,
         }))
     }
@@ -148,10 +151,14 @@ impl PlatformAtlas for WgpuAtlas {
             let Some((size, bytes)) = build()? else {
                 return Ok(None);
             };
+            let format = lock.format_of(key.texture_kind());
+            let data = try_swizzle_upload_data(&bytes, format)
+                .context("out of memory for an atlas upload")?;
+            drop(bytes);
             let tile = lock
                 .allocate(size, key.texture_kind())
                 .context("failed to allocate")?;
-            lock.upload_texture(tile.texture_id, tile.bounds, &bytes);
+            lock.upload_texture(tile.texture_id, tile.bounds, data);
             lock.tiles_by_key.insert(key.clone(), tile);
             Ok(Some(tile))
         }
@@ -207,6 +214,13 @@ impl WgpuAtlasState {
         texture.allocate(size)
     }
 
+    fn format_of(&self, kind: AtlasTextureKind) -> wgpu::TextureFormat {
+        match kind {
+            AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
+            AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => self.color_texture_format,
+        }
+    }
+
     fn push_texture(
         &mut self,
         min_size: Size<DevicePixels>,
@@ -223,10 +237,7 @@ impl WgpuAtlasState {
         };
 
         let size = min_size.min(&max_atlas_size).max(&DEFAULT_ATLAS_SIZE);
-        let format = match kind {
-            AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
-            AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => self.color_texture_format,
-        };
+        let format = self.format_of(kind);
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("atlas"),
@@ -283,12 +294,7 @@ impl WgpuAtlasState {
         }
     }
 
-    fn upload_texture(&mut self, id: AtlasTextureId, bounds: Bounds<DevicePixels>, bytes: &[u8]) {
-        let data = self
-            .storage
-            .get(id)
-            .map(|texture| swizzle_upload_data(bytes, texture.format))
-            .unwrap_or_else(|| bytes.to_vec());
+    fn upload_texture(&mut self, id: AtlasTextureId, bounds: Bounds<DevicePixels>, data: Vec<u8>) {
         if let Some(texture) = self.storage.get_mut(id) {
             texture.write_shadow(bounds, &data);
         }
@@ -357,6 +363,16 @@ impl WgpuAtlasState {
         let budget = separate.max(ring_capacity).max(MIN_STAGING_BYTES);
         let plan = self.plan_upload_regions(separate, budget);
         let required = plan.iter().map(|(_, region)| region.staging_bytes).sum::<u64>();
+        let wanted = required.max(MIN_STAGING_BYTES).checked_next_power_of_two().unwrap_or(u64::MAX);
+        if self.upload_ring.as_ref().is_some_and(|ring| ring.capacity() > LARGE_RING_BYTES && ring.capacity() / 4 >= wanted) {
+            self.oversized_flushes += 1;
+            if self.oversized_flushes >= OVERSIZED_FLUSHES {
+                self.upload_ring = None;
+                self.oversized_flushes = 0;
+            }
+        } else {
+            self.oversized_flushes = 0;
+        }
         if self.upload_ring.as_ref().is_none_or(|ring| ring.capacity() < required) {
             let capacity = required.max(MIN_STAGING_BYTES).checked_next_power_of_two().context("Atlas staging capacity overflow")?;
             anyhow::ensure!(capacity <= self.device.limits().max_buffer_size, "Atlas staging exceeds device limit");
@@ -369,14 +385,13 @@ impl WgpuAtlasState {
             label: Some("gpui_atlas_uploads"),
         });
         let mut offset = 0;
-        let mut staging = Vec::new();
+        let mut mapped = ring.mapped(index);
         let mut init_regions = 0;
         let mut init_bytes = 0;
         for (position, (id, region)) in plan.iter().enumerate() {
             let texture = &self.storage[*id];
             let rect = region.rect;
-            texture.compose(rect, &self.pending_uploads, &mut staging);
-            ring.write(index, offset, &staging)?;
+            texture.compose(rect, &self.pending_uploads, &mut mapped, offset as usize);
             let first = plan[..position].iter().all(|(earlier, _)| earlier != id);
             if first && !texture.initialized && !rect.covers(texture.texture.width(), texture.texture.height()) {
                 // wgpu zero-fills the whole texture before the first copy that leaves texels
@@ -401,6 +416,7 @@ impl WgpuAtlasState {
         for (id, _) in &plan {
             if let Some(texture) = self.storage.get_mut(*id) { texture.initialized = true; }
         }
+        drop(mapped);
         ring.unmap(index);
         crate::pass_trace::note(|| format!("atlas_uploads n={} regions={} bytes={required} separate_bytes={separate}",
             self.pending_uploads.len(), plan.len()));
@@ -458,6 +474,10 @@ impl WgpuAtlasState {
 /// Tests read atlas textures back.
 const ATLAS_TEST_USAGE: wgpu::TextureUsages = if cfg!(test) { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() };
 const MIN_STAGING_BYTES: u64 = 512 * 1024;
+/// A staging ring bigger than this goes back to the size the uploads need after they stay small
+/// for `OVERSIZED_FLUSHES` flushes: one frame-sized image otherwise leaves three large buffers.
+const LARGE_RING_BYTES: u64 = 4 * 1024 * 1024;
+const OVERSIZED_FLUSHES: u32 = 64;
 /// wgpu-core's zero buffer, which clears textures in copies of at most this size.
 const ZERO_BUFFER_BYTES: u64 = 512 * 1024;
 /// Textures up to this size keep a CPU copy, so that merged uploads can include texels of
@@ -668,21 +688,24 @@ impl WgpuAtlasTexture {
         }
     }
 
-    /// Fills `staging` with the rows of `rect` at the staging pitch: from the shadow when the
-    /// texture has one, else zeros overlaid with the pending uploads in order.
-    fn compose(&self, rect: Rect, uploads: &[PendingUpload], staging: &mut Vec<u8>) {
+    /// Writes the rows of `rect` at the staging pitch into `target` from `offset`: from the
+    /// shadow when the texture has one, else from the pending uploads in order over zeros.
+    /// The staging is written in place, so a large upload is not copied through a temporary.
+    fn compose(&self, rect: Rect, uploads: &[PendingUpload], target: &mut wgpu::BufferViewMut, offset: usize) {
         let bpp = self.bytes_per_pixel() as usize;
         let row = rect.width() as usize * bpp;
         let pitch = staging_pitch(row as u64) as usize;
-        staging.clear();
-        staging.resize(pitch * rect.height() as usize, 0);
         if let Some(shadow) = &self.shadow {
             let stride = self.texture.width() as usize * bpp;
-            for (y, target) in (rect.y0 as usize..).zip(staging.chunks_exact_mut(pitch)) {
+            for (index, y) in (rect.y0 as usize..rect.y1 as usize).enumerate() {
                 let start = y * stride + rect.x0 as usize * bpp;
-                target[..row].copy_from_slice(&shadow[start..start + row]);
+                target.slice(offset + index * pitch..offset + index * pitch + row).copy_from_slice(&shadow[start..start + row]);
             }
             return;
+        }
+        let covered = uploads.iter().any(|upload| upload.id == self.id && Rect::of(upload.bounds).contains(rect));
+        if !covered {
+            target.slice(offset..offset + pitch * rect.height() as usize).fill(0);
         }
         for upload in uploads.iter().filter(|upload| upload.id == self.id) {
             let source = Rect::of(upload.bounds);
@@ -695,8 +718,8 @@ impl WgpuAtlasTexture {
             let length = clip.width() as usize * bpp;
             for y in clip.y0..clip.y1 {
                 let from = (y - source.y0) as usize * source_row + (clip.x0 - source.x0) as usize * bpp;
-                let to = (y - rect.y0) as usize * pitch + (clip.x0 - rect.x0) as usize * bpp;
-                staging[to..to + length].copy_from_slice(&upload.data[from..from + length]);
+                let to = offset + (y - rect.y0) as usize * pitch + (clip.x0 - rect.x0) as usize * bpp;
+                target.slice(to..to + length).copy_from_slice(&upload.data[from..from + length]);
             }
         }
     }
@@ -710,17 +733,23 @@ impl WgpuAtlasTexture {
     }
 }
 
-fn swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Vec<u8> {
-    match format {
-        wgpu::TextureFormat::Rgba8Unorm => {
-            let mut data = bytes.to_vec();
-            for pixel in data.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-            }
-            data
+/// The upload bytes in the texture's channel order, or `None` when the heap has no room: a
+/// frame-sized image is then dropped instead of aborting the kernel.
+fn try_swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Option<Vec<u8>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(bytes.len()).ok()?;
+    data.extend_from_slice(bytes);
+    if format == wgpu::TextureFormat::Rgba8Unorm {
+        for pixel in data.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
         }
-        _ => bytes.to_vec(),
     }
+    Some(data)
+}
+
+#[cfg(test)]
+fn swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Vec<u8> {
+    try_swizzle_upload_data(bytes, format).expect("allocation")
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]

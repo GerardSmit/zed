@@ -44,6 +44,98 @@ const SUBPIXEL_SHADERS: &str = concat!(
     include_str!("shaders_subpixel.wgsl"),
 );
 
+/// Build-time SPIR-V for one shader variant: `(entry point, little-endian words)`, one module per
+/// entry point.
+pub type PrecompiledShaderSet = &'static [(&'static str, &'static [u8])];
+
+static PRECOMPILED_SHADERS: std::sync::OnceLock<(PrecompiledShaderSet, PrecompiledShaderSet)> =
+    std::sync::OnceLock::new();
+
+/// Registers SPIR-V compiled from the storage-buffer and subpixel shader variants. Renderers on
+/// devices with `PASSTHROUGH_SHADERS` and unchecked shader runtime checks create their modules
+/// from it instead of parsing and validating WGSL. Entry points missing from a set fall back to
+/// WGSL.
+pub fn set_precompiled_shaders(storage: PrecompiledShaderSet, subpixel: PrecompiledShaderSet) {
+    PRECOMPILED_SHADERS.get_or_init(|| (storage, subpixel));
+}
+
+/// The modules of one shader variant, created per entry point on first use.
+struct ShaderStages<'a> {
+    device: &'a wgpu::Device,
+    label: &'static str,
+    source: &'static str,
+    precompiled: PrecompiledShaderSet,
+    trusted: bool,
+    whole: std::cell::OnceCell<wgpu::ShaderModule>,
+    entries: RefCell<HashMap<String, wgpu::ShaderModule>>,
+}
+
+impl<'a> ShaderStages<'a> {
+    fn new(
+        device: &'a wgpu::Device,
+        label: &'static str,
+        source: &'static str,
+        precompiled: PrecompiledShaderSet,
+        shader_runtime_checks: bool,
+    ) -> Self {
+        let passthrough = device.features().contains(wgpu::Features::PASSTHROUGH_SHADERS);
+        Self {
+            device,
+            label,
+            source,
+            precompiled: if passthrough && !shader_runtime_checks { precompiled } else { &[] },
+            trusted: !shader_runtime_checks,
+            whole: Default::default(),
+            entries: Default::default(),
+        }
+    }
+
+    fn whole(&self) -> &wgpu::ShaderModule {
+        self.whole.get_or_init(|| {
+            let descriptor = wgpu::ShaderModuleDescriptor {
+                label: Some(self.label),
+                source: wgpu::ShaderSource::Wgsl(self.source.into()),
+            };
+            if self.trusted {
+                // SAFETY: storage indices come from draw ranges sized to the renderer's own
+                // instance arrays, and the shaders' loops have constant or data-bounded trip
+                // counts.
+                unsafe {
+                    self.device
+                        .create_shader_module_trusted(descriptor, wgpu::ShaderRuntimeChecks::unchecked())
+                }
+            } else {
+                self.device.create_shader_module(descriptor)
+            }
+        })
+    }
+
+    fn module(&self, entry_point: &str) -> wgpu::ShaderModule {
+        let Some((_, bytes)) = self.precompiled.iter().find(|(name, _)| *name == entry_point) else {
+            return self.whole().clone();
+        };
+        self.entries
+            .borrow_mut()
+            .entry(entry_point.to_owned())
+            .or_insert_with(|| {
+                let words: Vec<u32> = bytes
+                    .chunks_exact(4)
+                    .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                    .collect();
+                // SAFETY: the words were produced by naga from this variant's WGSL for the
+                // entry point and validated there; the trusted WGSL path skips the same checks.
+                unsafe {
+                    self.device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
+                        label: Some(entry_point),
+                        spirv: Some(words.into()),
+                        ..Default::default()
+                    })
+                }
+            })
+            .clone()
+    }
+}
+
 fn least_common_multiple(left: u64, right: u64) -> u64 {
     let mut first = left;
     let mut second = right;
@@ -615,6 +707,8 @@ pub struct WgpuRenderer {
 
 const FRAME_UNIFORMS_SIZE: usize =
     std::mem::size_of::<GlobalParams>() + std::mem::size_of::<GammaParams>();
+
+static SUBMIT_NANOSECONDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug)]
 pub struct UploadUnavailable;
@@ -1428,25 +1522,14 @@ impl WgpuRenderer {
         } else {
             STORAGE_BUFFER_SHADERS
         };
-        let create_module = |descriptor: wgpu::ShaderModuleDescriptor<'_>| {
-            if shader_runtime_checks {
-                device.create_shader_module(descriptor)
-            } else {
-                // SAFETY: storage indices come from draw ranges sized to the renderer's own
-                // instance arrays, and the shaders' loops have constant or data-bounded trip
-                // counts.
-                unsafe {
-                    device.create_shader_module_trusted(
-                        descriptor,
-                        wgpu::ShaderRuntimeChecks::unchecked(),
-                    )
-                }
-            }
-        };
-        let shader_module = create_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gpui_shaders"),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
-        });
+        let precompiled = PRECOMPILED_SHADERS.get().copied().unwrap_or((&[], &[]));
+        let shader_module = ShaderStages::new(
+            device,
+            "gpui_shaders",
+            shader_source,
+            if uses_webgl_instance_data { &[] } else { precompiled.0 },
+            shader_runtime_checks,
+        );
 
         let frame_pipeline = |fragment: &str, layouts: &[Option<&wgpu::BindGroupLayout>]| {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1458,13 +1541,13 @@ impl WgpuRenderer {
                 label: Some(fragment),
                 layout: Some(&layout),
                 vertex: wgpu::VertexState {
-                    module: &shader_module,
+                    module: &shader_module.module("vs_frame"),
                     entry_point: Some("vs_frame"),
                     buffers: &[],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
-                    module: &shader_module,
+                    module: &shader_module.module(fragment),
                     entry_point: Some(fragment),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: surface_format,
@@ -1486,14 +1569,9 @@ impl WgpuRenderer {
         let frame_clear = frame_pipeline("fs_clear_frame", &[]);
         let frame_present = frame_pipeline("fs_frame", &[Some(&layouts.texture)]);
 
-        let subpixel_shader_module = if dual_source_blending {
-            Some(create_module(wgpu::ShaderModuleDescriptor {
-                label: Some("gpui_subpixel_shaders"),
-                source: wgpu::ShaderSource::Wgsl(SUBPIXEL_SHADERS.into()),
-            }))
-        } else {
-            None
-        };
+        let subpixel_shader_module = dual_source_blending.then(|| {
+            ShaderStages::new(device, "gpui_subpixel_shaders", SUBPIXEL_SHADERS, precompiled.1, shader_runtime_checks)
+        });
 
         let blend_mode = match alpha_mode {
             wgpu::CompositeAlphaMode::PreMultiplied => {
@@ -1517,7 +1595,7 @@ impl WgpuRenderer {
                                topology: wgpu::PrimitiveTopology,
                                color_targets: &[Option<wgpu::ColorTargetState>],
                                sample_count: u32,
-                               module: &wgpu::ShaderModule| {
+                               module: &ShaderStages| {
             let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
             bind_group_layouts.extend(texture_layout.map(Some));
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1545,13 +1623,13 @@ impl WgpuRenderer {
                 label: Some(name),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
-                    module,
+                    module: &module.module(vs_entry),
                     entry_point: Some(vs_entry),
                     buffers: &[],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
-                    module,
+                    module: &module.module(fs_entry),
                     entry_point: Some(fs_entry),
                     targets: color_targets,
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -2633,7 +2711,9 @@ impl WgpuRenderer {
         ring.unmap(slot);
         crate::pass_trace::note(|| format!("instance_uploads bytes={} direct={}",
             self.instance_upload_offset, ring.storage()));
+        let submit_started = std::time::Instant::now();
         let submission = self.resources().queue.submit([uploads.finish(), encoder.finish()]);
+        SUBMIT_NANOSECONDS.fetch_add(submit_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, std::sync::atomic::Ordering::Relaxed);
         ring.submitted(slot);
         if let Some(uniforms) = self.pending_frame_uniforms.take() {
             self.frame_uniforms = Some(uniforms);
@@ -2642,6 +2722,11 @@ impl WgpuRenderer {
             timings.submitted(index);
         }
         Ok(submission)
+    }
+
+    /// Time spent in `Queue::submit` by external frames since the last call.
+    pub fn take_submit_nanoseconds() -> u64 {
+        SUBMIT_NANOSECONDS.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn take_gpu_frame_timings(&mut self) -> crate::GpuFrameTimings {

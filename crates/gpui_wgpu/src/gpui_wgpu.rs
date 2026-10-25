@@ -11,4 +11,4 @@ pub use frame_timings::{GpuFrameTimings, GpuPassTimings};
 pub use wgpu;
 pub use wgpu_atlas::*;
 pub use wgpu_context::*;
-pub use wgpu_renderer::{DrawFilter, GpuContext, RendererTuning, WgpuRenderer, WgpuSurfaceConfig, UploadUnavailable};
+pub use wgpu_renderer::{DrawFilter, GpuContext, PrecompiledShaderSet, set_precompiled_shaders, RendererTuning, WgpuRenderer, WgpuSurfaceConfig, UploadUnavailable};
