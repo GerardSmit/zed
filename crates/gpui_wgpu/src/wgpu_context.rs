@@ -416,7 +416,18 @@ impl WgpuContext {
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
             })
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?;
+            .map_err(|e| {
+                // wgpu's error alone ("Parent device is lost") does not say which
+                // driver or request failed, which board bring-up needs.
+                let info = adapter.get_info();
+                anyhow::anyhow!(
+                    "Failed to create wgpu device: {e} (adapter {:?} {:?}, driver {:?} {:?}, features {required_features:?})",
+                    info.name,
+                    info.device_type,
+                    info.driver,
+                    info.driver_info,
+                )
+            })?;
 
         Ok((
             device,
