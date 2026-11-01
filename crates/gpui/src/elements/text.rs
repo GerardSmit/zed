@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
+    hash::{Hash as _, Hasher as _},
     mem,
     ops::{Deref, DerefMut, Range},
     rc::Rc,
@@ -654,7 +655,24 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
-        window.request_measured_layout(Default::default(), {
+        let key = {
+            let mut hasher = collections::FxHasher::default();
+            text.hash(&mut hasher);
+            for run in &runs {
+                (run.len, &run.font).hash(&mut hasher);
+            }
+            (text_style.font(), font_size, line_height).hash(&mut hasher);
+            (text_style.white_space == WhiteSpace::Normal).hash(&mut hasher);
+            match &text_style.text_overflow {
+                None => 0u8.hash(&mut hasher),
+                Some(TextOverflow::Truncate(affix)) => (1u8, affix).hash(&mut hasher),
+                Some(TextOverflow::TruncateStart(affix)) => (2u8, affix).hash(&mut hasher),
+                Some(TextOverflow::TruncateMiddle(affix)) => (3u8, affix).hash(&mut hasher),
+            }
+            text_style.line_clamp.hash(&mut hasher);
+            hasher.finish()
+        };
+        window.request_keyed_measured_layout(Default::default(), Some(key), {
             let element_state = self.clone();
 
             move |known_dimensions, available_space, window, cx| {

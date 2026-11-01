@@ -5766,6 +5766,24 @@ impl Window {
         F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
             + 'static,
     {
+        self.request_keyed_measured_layout(style, None, measure)
+    }
+
+    /// Like [`Self::request_measured_layout`], but `key` identifies everything
+    /// the measured size depends on besides the constraints passed to `measure`.
+    /// While the key and style stay the same between frames, the previous
+    /// frame's layout is reused; `measure` is then called once with the
+    /// reused size instead of being asked to measure.
+    pub fn request_keyed_measured_layout<F>(
+        &mut self,
+        style: Style,
+        key: Option<u64>,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+            + 'static,
+    {
         self.invalidator.debug_assert_prepaint();
 
         let rem_size = self.rem_size();
@@ -5773,7 +5791,7 @@ impl Window {
         self.layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure)
+            .request_measured_layout(style, rem_size, scale_factor, key, measure)
     }
 
     /// Compute the layout for the given id within the given available space.

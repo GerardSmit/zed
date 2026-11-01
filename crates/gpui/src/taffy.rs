@@ -7,7 +7,11 @@ use crate::{
     },
 };
 use collections::{FxHashMap, FxHashSet};
-use std::{fmt::Debug, ops::Range};
+use std::{
+    fmt::Debug,
+    hash::{Hash as _, Hasher as _},
+    ops::Range,
+};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
@@ -28,8 +32,24 @@ type NodeMeasureFn = StackSafe<Box<MeasureFn>>;
 struct NodeContext {
     measure: NodeMeasureFn,
 }
+
+/// The taffy tree is kept between frames so taffy's per-node layout caches
+/// survive: the n-th node requested in a frame reuses the n-th node of the
+/// previous frame and is only marked dirty when its style, children or
+/// measure key changed. A frame that only scrolls then lays out nothing.
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
+    previous_frame_nodes: Vec<LayoutId>,
+    requested_nodes: Vec<LayoutId>,
+    requested_node_set: FxHashSet<LayoutId>,
+    measure_keys: FxHashMap<LayoutId, u64>,
+    /// Keyed measured leaves of this frame. Their elements paint what their
+    /// measure function was last called with, which with cached layouts can
+    /// be an intrinsic-size probe or no call at all, so after layout they are
+    /// measured again at their final width when the last call differed.
+    keyed_leaves: Vec<LayoutId>,
+    /// The known width (in device pixels) of each leaf's last measure call.
+    measured_widths: FxHashMap<LayoutId, Option<f32>>,
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
@@ -45,6 +65,12 @@ impl TaffyLayoutEngine {
         taffy.disable_rounding();
         TaffyLayoutEngine {
             taffy,
+            previous_frame_nodes: Vec::new(),
+            requested_nodes: Vec::new(),
+            requested_node_set: FxHashSet::default(),
+            measure_keys: FxHashMap::default(),
+            keyed_leaves: Vec::new(),
+            measured_widths: FxHashMap::default(),
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
@@ -53,7 +79,14 @@ impl TaffyLayoutEngine {
     }
 
     pub fn clear(&mut self) {
-        self.taffy.clear();
+        let claimed = self.requested_nodes.len().min(self.previous_frame_nodes.len());
+        for node in self.previous_frame_nodes.split_off(claimed) {
+            self.remove_node(node);
+        }
+        self.previous_frame_nodes = std::mem::take(&mut self.requested_nodes);
+        self.requested_node_set.clear();
+        self.keyed_leaves.clear();
+        self.measured_widths.clear();
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
@@ -67,26 +100,37 @@ impl TaffyLayoutEngine {
         children: &[LayoutId],
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
+        let children = LayoutId::to_taffy_slice(children);
 
-        if children.is_empty() {
+        let node = match self.claim_previous_node(false) {
+            Some(node) => {
+                self.update_style(node, taffy_style);
+                node
+            }
+            None => self.taffy.new_leaf(taffy_style).expect(EXPECT_MESSAGE).into(),
+        };
+        let unchanged = self.taffy.child_count(node.0) == children.len()
+            && children.iter().enumerate().all(|(index, child)| {
+                self.taffy.child_at_index(node.0, index).ok() == Some(*child)
+            });
+        if !unchanged {
+            // Unlike `new_with_children`, this also detaches the children
+            // from the parents they had in the previous frame.
             self.taffy
-                .new_leaf(taffy_style)
-                .expect(EXPECT_MESSAGE)
-                .into()
-        } else {
-            self.taffy
-                // This is safe because LayoutId is repr(transparent) to taffy::tree::NodeId.
-                .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
-                .expect(EXPECT_MESSAGE)
-                .into()
+                .set_children(node.0, children)
+                .expect(EXPECT_MESSAGE);
         }
+        self.push_requested(node)
     }
 
+    /// `key` identifies everything the measure function's result depends on;
+    /// a leaf without one is measured again every frame.
     pub fn request_measured_layout(
         &mut self,
         style: Style,
         rem_size: Pixels,
         scale_factor: f32,
+        key: Option<u64>,
         measure: impl FnMut(
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
@@ -99,11 +143,85 @@ impl TaffyLayoutEngine {
         let measure = Box::new(measure) as Box<MeasureFn>;
         #[cfg(feature = "stacker")]
         let measure = StackSafe::new(measure);
+        let context = NodeContext { measure };
+        let key = key.map(|key| {
+            let mut hasher = collections::FxHasher::default();
+            (key, rem_size, scale_factor.to_bits()).hash(&mut hasher);
+            hasher.finish()
+        });
 
+        let node = match self.claim_previous_node(true) {
+            Some(node) => {
+                self.update_style(node, taffy_style);
+                if let Some(slot) = self.taffy.get_node_context_mut(node.0) {
+                    *slot = context;
+                }
+                let previous_key = match key {
+                    Some(key) => self.measure_keys.insert(node, key),
+                    None => self.measure_keys.remove(&node),
+                };
+                if key.is_none() || previous_key != key {
+                    self.taffy.mark_dirty(node.0).expect(EXPECT_MESSAGE);
+                }
+                node
+            }
+            None => {
+                let node = LayoutId::from(
+                    self.taffy
+                        .new_leaf_with_context(taffy_style, context)
+                        .expect(EXPECT_MESSAGE),
+                );
+                if let Some(key) = key {
+                    self.measure_keys.insert(node, key);
+                }
+                node
+            }
+        };
+        if key.is_some() {
+            self.keyed_leaves.push(node);
+        }
+        self.push_requested(node)
+    }
+
+    fn claim_previous_node(&mut self, measured: bool) -> Option<LayoutId> {
+        let node = *self.previous_frame_nodes.get(self.requested_nodes.len())?;
+        if self.taffy.get_node_context(node.0).is_some() == measured {
+            Some(node)
+        } else {
+            self.remove_node(node);
+            None
+        }
+    }
+
+    fn push_requested(&mut self, node: LayoutId) -> LayoutId {
+        self.requested_nodes.push(node);
+        self.requested_node_set.insert(node);
+        node
+    }
+
+    fn update_style(&mut self, node: LayoutId, style: taffy::Style) {
+        if *self.taffy.style(node.0).expect(EXPECT_MESSAGE) != style {
+            self.taffy.set_style(node.0, style).expect(EXPECT_MESSAGE);
+        }
+    }
+
+    fn remove_node(&mut self, node: LayoutId) {
+        // `TaffyTree::remove` takes the node out of its parent's children
+        // without invalidating the parent's cached layout.
+        if let Some(parent) = self.taffy.parent(node.0) {
+            self.taffy.mark_dirty(parent).expect(EXPECT_MESSAGE);
+        }
+        self.taffy.remove(node.0).expect(EXPECT_MESSAGE);
+        self.measure_keys.remove(&node);
+    }
+
+    /// A node reused from the previous frame can still point at a parent this
+    /// frame has not requested (yet); until then it is a root.
+    fn requested_parent(&self, id: LayoutId) -> Option<LayoutId> {
         self.taffy
-            .new_leaf_with_context(taffy_style, NodeContext { measure })
-            .expect(EXPECT_MESSAGE)
-            .into()
+            .parent(id.0)
+            .map(LayoutId::from)
+            .filter(|parent| self.requested_node_set.contains(parent))
     }
 
     /// Treats any `auto` dimension of the given node's style as filling `size`.
@@ -232,14 +350,16 @@ impl TaffyLayoutEngine {
             transform(available_space.height),
         );
 
+        let measured_widths = &mut self.measured_widths;
         self.taffy
             .compute_layout_with_measure(
                 id.into(),
                 available_space.into(),
-                |known_dimensions, available_space, _id, node_context, _style| {
+                |known_dimensions, available_space, node_id, node_context, _style| {
                     let Some(node_context) = node_context else {
                         return taffy::geometry::Size::default();
                     };
+                    measured_widths.insert(LayoutId(node_id), known_dimensions.width);
 
                     let known_dimensions = Size {
                         width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
@@ -265,6 +385,42 @@ impl TaffyLayoutEngine {
                 },
             )
             .expect(EXPECT_MESSAGE);
+
+        let (laid_out, elsewhere): (Vec<LayoutId>, Vec<LayoutId>) = std::mem::take(&mut self.keyed_leaves)
+            .into_iter()
+            .partition(|node| self.descends_from(*node, id));
+        self.keyed_leaves = elsewhere;
+        for node in laid_out {
+            let layout_size = self.taffy.layout(node.0).expect(EXPECT_MESSAGE).size;
+            if self.measured_widths.get(&node) == Some(&Some(layout_size.width)) {
+                continue;
+            }
+            self.measured_widths.insert(node, Some(layout_size.width));
+            let width = Pixels(layout_size.width / scale_factor);
+            let height = Pixels(layout_size.height / scale_factor);
+            if let Some(node_context) = self.taffy.get_node_context_mut(node.0) {
+                (node_context.measure)(
+                    size(Some(width), Some(height)),
+                    size(
+                        AvailableSpace::Definite(width),
+                        AvailableSpace::Definite(height),
+                    ),
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn descends_from(&self, node: LayoutId, root: LayoutId) -> bool {
+        let mut current = Some(node);
+        while let Some(ancestor) = current {
+            if ancestor == root {
+                return true;
+            }
+            current = self.requested_parent(ancestor);
+        }
+        false
     }
 
     // Pixel snapping
@@ -350,11 +506,10 @@ impl TaffyLayoutEngine {
         let layout = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE);
         let layout_location = layout.location;
         let layout_size = layout.size;
-        let parent = self.taffy.parent(id.0);
+        let parent = self.requested_parent(id);
 
         let absolute_outer_origin = match parent {
             Some(parent_id) => {
-                let parent_id = LayoutId::from(parent_id);
                 self.layout_bounds(parent_id, scale_factor);
                 let parent_origin = *self
                     .absolute_outer_origins

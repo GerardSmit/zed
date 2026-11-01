@@ -349,7 +349,10 @@ impl WgpuContext {
         if unified_memory && adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS) {
             required_features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
         }
-        if adapter.features().contains(wgpu::Features::PASSTHROUGH_SHADERS) {
+        // The precompiled shaders are SPIR-V, which only Vulkan takes.
+        if adapter.features().contains(wgpu::Features::PASSTHROUGH_SHADERS)
+            && adapter.get_info().backend == wgpu::Backend::Vulkan
+        {
             required_features |= wgpu::Features::PASSTHROUGH_SHADERS;
         }
         if dual_source_blending {
