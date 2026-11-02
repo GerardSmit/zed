@@ -1024,6 +1024,15 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    pub(crate) live_painters: FxHashMap<crate::LiveId, LivePainter>,
+}
+
+#[derive(Clone)]
+pub(crate) struct LivePainter {
+    bounds: Bounds<Pixels>,
+    content_mask: ContentMask<Pixels>,
+    opacity: f32,
+    paint: Rc<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>,
 }
 
 #[derive(Clone, Default)]
@@ -1078,6 +1087,7 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            live_painters: FxHashMap::default(),
         }
     }
 
@@ -1096,6 +1106,7 @@ impl Frame {
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
+        self.live_painters.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -1389,6 +1400,10 @@ pub struct Window {
     scroll_capture: Option<Vec<ScrollTargetKey>>,
     dispatching_scroll: bool,
     pub(crate) refreshing: bool,
+    live_dirty: FxHashSet<crate::LiveId>,
+    /// The invalidator's update count right after [`Self::refresh_live`] made the window dirty;
+    /// when it still matches at draw time, nothing but live elements changed.
+    live_update_count: Option<usize>,
     /// Nesting depth of [`Window::with_uncached_views`].
     pub(crate) uncached_views: usize,
     /// Set by the app while the user is interactively resizing the *layout* (dragging a dock/panel
@@ -2109,6 +2124,8 @@ impl Window {
                     .map_or_else(GestureTuning::default, |gestures| gestures.tuning()),
             ),
             refreshing: false,
+            live_dirty: FxHashSet::default(),
+            live_update_count: None,
             uncached_views: 0,
             resizing_layout: false,
             activation_observers: SubscriberSet::new(),
@@ -2372,6 +2389,80 @@ impl Window {
         if self.invalidator.not_drawing() {
             self.invalidator.set_dirty(true);
         }
+    }
+
+    /// Paints live element `id` again on the next frame (see [`Self::paint_live`]). When
+    /// nothing else changed, that frame renders no view and patches only this element.
+    pub fn refresh_live(&mut self, id: crate::LiveId) {
+        self.live_dirty.insert(id);
+        if !self.invalidator.not_drawing() {
+            return;
+        }
+        let count = self.invalidator.update_count();
+        if !self.invalidator.is_dirty() || self.live_update_count == Some(count) {
+            self.invalidator.set_dirty(true);
+            self.live_update_count = Some(self.invalidator.update_count());
+        }
+    }
+
+    /// Whether the last frame painted live element `id`, so [`Self::refresh_live`] reaches it.
+    pub fn has_live(&self, id: crate::LiveId) -> bool {
+        self.rendered_frame.live_painters.contains_key(&id)
+    }
+
+    /// Paints `paint` at `bounds` so that [`Self::refresh_live`] can paint it again alone,
+    /// with the content mask and opacity it has now. `paint` must only insert primitives
+    /// (no text shaping, hitboxes or listeners) and they are clipped to `bounds`. `id` is
+    /// unique in the window. Inside a layer or another live element it paints as usual.
+    pub fn paint_live(
+        &mut self,
+        id: crate::LiveId,
+        bounds: Bounds<Pixels>,
+        paint: Rc<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>,
+        cx: &mut App,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let mask = ContentMask { bounds, ..Default::default() }.intersect(&self.content_mask());
+        self.content_mask_stack.push(mask);
+        let scaled = self.snapped_content_mask().bounds;
+        let order = (!scaled.is_empty())
+            .then(|| self.next_frame.scene.begin_live(scaled))
+            .flatten();
+        paint(bounds, self, cx);
+        self.content_mask_stack.pop();
+        if let Some(order) = order {
+            self.next_frame.scene.end_live(id, scaled, order);
+            let opacity = self.element_opacity;
+            self.next_frame.live_painters.insert(
+                id,
+                LivePainter { bounds, content_mask: mask, opacity, paint },
+            );
+        }
+    }
+
+    fn repaint_live(&mut self, cx: &mut App) {
+        let ids: SmallVec<[crate::LiveId; 16]> = self.live_dirty.drain().collect();
+        mem::swap(&mut self.next_frame.scene, &mut self.rendered_frame.scene);
+        self.invalidator.set_phase(DrawPhase::Paint);
+        let opacity = self.element_opacity;
+        for id in ids {
+            let Some(painter) = self.rendered_frame.live_painters.get(&id).cloned() else {
+                continue;
+            };
+            if !self.next_frame.scene.begin_patch(id) {
+                continue;
+            }
+            self.content_mask_stack.push(painter.content_mask);
+            self.element_opacity = painter.opacity;
+            (painter.paint)(painter.bounds, self, cx);
+            self.element_opacity = opacity;
+            self.content_mask_stack.pop();
+            self.next_frame.scene.end_patch(id);
+        }
+        self.next_frame.scene.finish();
+        mem::swap(&mut self.next_frame.scene, &mut self.rendered_frame.scene);
+        self.invalidator.set_phase(DrawPhase::None);
+        self.needs_present.set(true);
     }
 
     /// Mark the start/end of an interactive *layout* resize — dragging a dock/panel divider, as
@@ -3379,11 +3470,20 @@ impl Window {
         // This ensures that multiple test Apps have isolated arenas.
         let arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
+        let live_only = !self.refreshing
+            && !self.live_dirty.is_empty()
+            && self.live_update_count == Some(self.invalidator.update_count());
+        self.live_update_count = None;
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
+
+        if live_only && self.dirty_views.is_empty() {
+            self.repaint_live(cx);
+            return arena_scope.exit(&cx.element_arena);
+        }
 
         // Restore the previously-used input handler.
         // Place it back into a None slot (left by a previous .take()) so that
@@ -3497,6 +3597,9 @@ impl Window {
         // resulting focus events.
         if self.focus != focus_before_listeners {
             self.refresh();
+        }
+        if !self.live_dirty.is_empty() {
+            self.repaint_live(cx);
         }
         self.needs_present.set(true);
 
@@ -4114,6 +4217,11 @@ impl Window {
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
         );
+        for id in mem::take(&mut self.next_frame.scene.replayed_live) {
+            if let Some(painter) = self.rendered_frame.live_painters.get(&id) {
+                self.next_frame.live_painters.insert(id, painter.clone());
+            }
+        }
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -5810,6 +5918,19 @@ impl Window {
         let mut layout_engine = self.layout_engine.take().unwrap();
         layout_engine.compute_layout(layout_id, available_space, self, cx);
         self.layout_engine = Some(layout_engine);
+    }
+
+    pub(crate) fn requested_layout_count(&self) -> usize {
+        self.layout_engine.as_ref().unwrap().requested_count()
+    }
+
+    pub(crate) fn requested_layouts_since(&self, start: usize) -> Vec<LayoutId> {
+        self.layout_engine.as_ref().unwrap().requested_since(start)
+    }
+
+    /// Keeps the layout nodes of a cached view that replays this frame.
+    pub(crate) fn carry_layouts(&mut self, nodes: &[LayoutId]) {
+        self.layout_engine.as_mut().unwrap().carry(nodes);
     }
 
     /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by

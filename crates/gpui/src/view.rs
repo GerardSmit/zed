@@ -331,6 +331,9 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    /// The layout nodes the view's content requested when it last rendered,
+    /// kept while it replays so they still fit it when it renders again.
+    layout_nodes: Vec<LayoutId>,
     /// For layer views (`is_layer`): the scale factor at which the offscreen texture was last
     /// rendered. `None` means never rendered. A content-unchanged frame at the same scale composites
     /// the existing texture instead of re-rendering (the resize fast path).
@@ -470,6 +473,7 @@ impl<V: View> Element for ViewElement<V> {
                                         || (state.cache_key.bounds != bounds && !resizing)
                                 });
                             if !needs_render && let Some(mut element_state) = element_state {
+                                window.carry_layouts(&element_state.layout_nodes);
                                 let prepaint_start = window.prepaint_index();
                                 window.reuse_prepaint(element_state.prepaint_range.clone());
                                 cx.entities
@@ -487,6 +491,7 @@ impl<V: View> Element for ViewElement<V> {
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
                         {
+                            window.carry_layouts(&element_state.layout_nodes);
                             let prepaint_start = window.prepaint_index();
                             window.reuse_prepaint(element_state.prepaint_range.clone());
                             cx.entities
@@ -499,6 +504,7 @@ impl<V: View> Element for ViewElement<V> {
 
                         let refreshing = mem::replace(&mut window.refreshing, true);
                         let prepaint_start = window.prepaint_index();
+                        let mut layout_nodes = Vec::new();
                         let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                             let mut element = self
                                 .view
@@ -506,7 +512,9 @@ impl<V: View> Element for ViewElement<V> {
                                 .unwrap()
                                 .render(window, cx)
                                 .into_any_element();
+                            let layout_start = window.requested_layout_count();
                             element.layout_as_root(bounds.size.into(), window, cx);
+                            layout_nodes = window.requested_layouts_since(layout_start);
                             element.prepaint_at(bounds.origin, window, cx);
                             element
                         });
@@ -518,6 +526,7 @@ impl<V: View> Element for ViewElement<V> {
                             Some(element),
                             ViewElementState {
                                 accessed_entities,
+                                layout_nodes,
                                 prepaint_range: prepaint_start..prepaint_end,
                                 paint_range: PaintIndex::default()..PaintIndex::default(),
                                 cache_key: ViewElementCacheKey {

@@ -34,12 +34,20 @@ struct NodeContext {
 }
 
 /// The taffy tree is kept between frames so taffy's per-node layout caches
-/// survive: the n-th node requested in a frame reuses the n-th node of the
+/// survive: a node requested in a frame reuses the next unclaimed node of the
 /// previous frame and is only marked dirty when its style, children or
 /// measure key changed. A frame that only scrolls then lays out nothing.
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
     previous_frame_nodes: Vec<LayoutId>,
+    /// The next node of `previous_frame_nodes` a request may claim.
+    previous_cursor: usize,
+    /// Previous nodes the cursor passed without claiming them.
+    skipped_nodes: Vec<LayoutId>,
+    /// The style a root was requested with before it was stretched to the
+    /// window, by node, this frame and the previous one.
+    unstretched_styles: FxHashMap<LayoutId, taffy::Style>,
+    previous_unstretched_styles: FxHashMap<LayoutId, taffy::Style>,
     requested_nodes: Vec<LayoutId>,
     requested_node_set: FxHashSet<LayoutId>,
     measure_keys: FxHashMap<LayoutId, u64>,
@@ -50,6 +58,12 @@ pub struct TaffyLayoutEngine {
     keyed_leaves: Vec<LayoutId>,
     /// The known width (in device pixels) of each leaf's last measure call.
     measured_widths: FxHashMap<LayoutId, Option<f32>>,
+    /// What taffy asked each measured leaf since it was last dirtied, with the answers. Taffy
+    /// holds the answers in its caches, up the leaf's ancestors too.
+    measure_queries: FxHashMap<LayoutId, Option<Vec<MeasureQuery>>>,
+    /// Keyed leaves whose key changed: before they are dirtied, which re-lays out every
+    /// ancestor, their queries are asked again, and they stay clean if no answer changed.
+    remeasure: Vec<LayoutId>,
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
@@ -57,7 +71,46 @@ pub struct TaffyLayoutEngine {
     layout_bounds_scratch_space: Vec<LayoutId>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct MeasureQuery {
+    known: TaffySize<Option<f32>>,
+    available: TaffySize<TaffyAvailableSpace>,
+    answer: TaffySize<f32>,
+}
+
+/// Calls a leaf's measure function with taffy's device-pixel query and snaps its answer.
+fn measure_in_device_pixels(
+    context: &mut NodeContext,
+    known: TaffySize<Option<f32>>,
+    available: TaffySize<TaffyAvailableSpace>,
+    scale_factor: f32,
+    window: &mut Window,
+    cx: &mut App,
+) -> TaffySize<f32> {
+    let known = Size {
+        width: known.width.map(|e| Pixels(e / scale_factor)),
+        height: known.height.map(|e| Pixels(e / scale_factor)),
+    };
+    let available: Size<AvailableSpace> = available.into();
+    let untransform = |ev: AvailableSpace| match ev {
+        AvailableSpace::Definite(pixels) => AvailableSpace::Definite(Pixels(pixels.0 / scale_factor)),
+        AvailableSpace::MinContent => AvailableSpace::MinContent,
+        AvailableSpace::MaxContent => AvailableSpace::MaxContent,
+    };
+    let available = size(untransform(available.width), untransform(available.height));
+    let measured: Size<Pixels> = (context.measure)(known, available, window, cx);
+    snap_measured_size_to_device_pixels(measured, scale_factor).into()
+}
+
+/// Queries kept per measured leaf: more than taffy's cache holds, which a resize can churn.
+const MAX_MEASURE_QUERIES: usize = 24;
+
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
+
+/// How far past the cursor a request looks for its previous node.
+const CLAIM_LOOKAHEAD: usize = 256;
+/// How far past the cursor a leaf looks.
+const LEAF_LOOKAHEAD: usize = 16;
 
 impl TaffyLayoutEngine {
     pub fn new() -> Self {
@@ -66,11 +119,17 @@ impl TaffyLayoutEngine {
         TaffyLayoutEngine {
             taffy,
             previous_frame_nodes: Vec::new(),
+            previous_cursor: 0,
+            skipped_nodes: Vec::new(),
+            unstretched_styles: FxHashMap::default(),
+            previous_unstretched_styles: FxHashMap::default(),
             requested_nodes: Vec::new(),
             requested_node_set: FxHashSet::default(),
             measure_keys: FxHashMap::default(),
             keyed_leaves: Vec::new(),
             measured_widths: FxHashMap::default(),
+            measure_queries: FxHashMap::default(),
+            remeasure: Vec::new(),
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
@@ -79,11 +138,21 @@ impl TaffyLayoutEngine {
     }
 
     pub fn clear(&mut self) {
-        let claimed = self.requested_nodes.len().min(self.previous_frame_nodes.len());
-        for node in self.previous_frame_nodes.split_off(claimed) {
-            self.remove_node(node);
+        // Leaves no layout asked again this frame are measured afresh when one does.
+        for node in std::mem::take(&mut self.remeasure) {
+            if self.taffy.style(node.0).is_ok() {
+                self.dirty_measured(node);
+            }
+        }
+        let unclaimed = self.previous_frame_nodes.split_off(self.previous_cursor.min(self.previous_frame_nodes.len()));
+        for node in std::mem::take(&mut self.skipped_nodes).into_iter().chain(unclaimed) {
+            if !self.requested_node_set.contains(&node) {
+                self.remove_node(node);
+            }
         }
         self.previous_frame_nodes = std::mem::take(&mut self.requested_nodes);
+        self.previous_cursor = 0;
+        self.previous_unstretched_styles = std::mem::take(&mut self.unstretched_styles);
         self.requested_node_set.clear();
         self.keyed_leaves.clear();
         self.measured_widths.clear();
@@ -102,7 +171,7 @@ impl TaffyLayoutEngine {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
         let children = LayoutId::to_taffy_slice(children);
 
-        let node = match self.claim_previous_node(false) {
+        let node = match self.claim_previous_node(false, &taffy_style, children) {
             Some(node) => {
                 self.update_style(node, taffy_style);
                 node
@@ -150,7 +219,7 @@ impl TaffyLayoutEngine {
             hasher.finish()
         });
 
-        let node = match self.claim_previous_node(true) {
+        let node = match self.claim_previous_node(true, &taffy_style, &[]) {
             Some(node) => {
                 self.update_style(node, taffy_style);
                 if let Some(slot) = self.taffy.get_node_context_mut(node.0) {
@@ -160,8 +229,10 @@ impl TaffyLayoutEngine {
                     Some(key) => self.measure_keys.insert(node, key),
                     None => self.measure_keys.remove(&node),
                 };
-                if key.is_none() || previous_key != key {
-                    self.taffy.mark_dirty(node.0).expect(EXPECT_MESSAGE);
+                if key.is_some() && previous_key.is_some() && previous_key != key && self.measure_queries.get(&node).is_some_and(Option::is_some) {
+                    self.remeasure.push(node);
+                } else if key.is_none() || previous_key != key {
+                    self.dirty_measured(node);
                 }
                 node
             }
@@ -183,13 +254,64 @@ impl TaffyLayoutEngine {
         self.push_requested(node)
     }
 
-    fn claim_previous_node(&mut self, measured: bool) -> Option<LayoutId> {
-        let node = *self.previous_frame_nodes.get(self.requested_nodes.len())?;
-        if self.taffy.get_node_context(node.0).is_some() == measured {
-            Some(node)
-        } else {
-            self.remove_node(node);
-            None
+    /// The previous frame's node at the cursor, or the next one that is
+    /// plainly the same when that one differs: a part of the window that moved
+    /// between the main layout and a cached view's own leaves a gap, and the
+    /// nodes after it would otherwise each claim another's and lay out again.
+    /// With no match a new node is made and the cursor stays.
+    fn claim_previous_node(
+        &mut self,
+        measured: bool,
+        style: &taffy::Style,
+        children: &[taffy::NodeId],
+    ) -> Option<LayoutId> {
+        while let Some(node) = self.previous_frame_nodes.get(self.previous_cursor)
+            && self.requested_node_set.contains(node)
+        {
+            self.previous_cursor += 1;
+        }
+        let start = self.previous_cursor;
+        // Past the cursor a leaf matches by style only, which many nodes share,
+        // so it looks just a little way; a node with children must also have
+        // the same ones, which names it, and looks further.
+        let lookahead = if children.is_empty() { LEAF_LOOKAHEAD } else { CLAIM_LOOKAHEAD };
+        let end = self.previous_frame_nodes.len().min(start + lookahead);
+        let fits = |engine: &Self, index: usize| {
+            let node = engine.previous_frame_nodes[index];
+            !engine.requested_node_set.contains(&node)
+                && engine.taffy.get_node_context(node.0).is_some() == measured
+                && engine
+                    .previous_unstretched_styles
+                    .get(&node)
+                    .map_or_else(|| engine.taffy.style(node.0).is_ok_and(|previous| previous == style), |previous| previous == style)
+                && (index == start
+                    || children.is_empty()
+                    || engine.taffy.children(node.0).is_ok_and(|previous| previous == children))
+        };
+        let found = (start..end).find(|&index| fits(self, index))?;
+        self.skipped_nodes.extend_from_slice(&self.previous_frame_nodes[start..found]);
+        self.previous_cursor = found + 1;
+        Some(self.previous_frame_nodes[found])
+    }
+
+    /// How many nodes this frame has requested so far.
+    pub fn requested_count(&self) -> usize {
+        self.requested_nodes.len()
+    }
+
+    /// The nodes requested since [`Self::requested_count`] returned `start`.
+    pub fn requested_since(&self, start: usize) -> Vec<LayoutId> {
+        self.requested_nodes.get(start..).unwrap_or_default().to_vec()
+    }
+
+    /// Keeps the nodes a cached view laid out when it last rendered: it
+    /// replays this frame and requests none, and they stay where they were for
+    /// the frame it renders again.
+    pub fn carry(&mut self, nodes: &[LayoutId]) {
+        for &node in nodes {
+            if !self.requested_node_set.contains(&node) && self.taffy.style(node.0).is_ok() {
+                self.push_requested(node);
+            }
         }
     }
 
@@ -205,6 +327,36 @@ impl TaffyLayoutEngine {
         }
     }
 
+    fn dirty_measured(&mut self, node: LayoutId) {
+        self.measure_queries.remove(&node);
+        self.taffy.mark_dirty(node.0).expect(EXPECT_MESSAGE);
+    }
+
+    /// Asks each leaf in `remeasure` what taffy asked it before, with its new measure
+    /// function, and dirties those that answer differently.
+    fn remeasure_changed_leaves(&mut self, window: &mut Window, cx: &mut App) {
+        let scale_factor = window.scale_factor();
+        for node in std::mem::take(&mut self.remeasure) {
+            let Some(Some(mut queries)) = self.measure_queries.remove(&node) else {
+                self.taffy.mark_dirty(node.0).expect(EXPECT_MESSAGE);
+                continue;
+            };
+            let Some(context) = self.taffy.get_node_context_mut(node.0) else { continue };
+            let same = queries.iter_mut().all(|query| {
+                let answer = measure_in_device_pixels(context, query.known, query.available, scale_factor, window, cx);
+                std::mem::replace(&mut query.answer, answer) == answer
+            });
+            if same {
+                self.measure_queries.insert(node, Some(queries));
+                // Its element keeps what it was last measured with; the final-width pass after
+                // layout measures it again.
+                self.measured_widths.remove(&node);
+            } else {
+                self.taffy.mark_dirty(node.0).expect(EXPECT_MESSAGE);
+            }
+        }
+    }
+
     fn remove_node(&mut self, node: LayoutId) {
         // `TaffyTree::remove` takes the node out of its parent's children
         // without invalidating the parent's cached layout.
@@ -213,6 +365,7 @@ impl TaffyLayoutEngine {
         }
         self.taffy.remove(node.0).expect(EXPECT_MESSAGE);
         self.measure_keys.remove(&node);
+        self.measure_queries.remove(&node);
     }
 
     /// A node reused from the previous frame can still point at a parent this
@@ -242,6 +395,7 @@ impl TaffyLayoutEngine {
         if !stretch_width && !stretch_height {
             return;
         }
+        self.unstretched_styles.insert(id, style.clone());
         let mut style = style.clone();
         if stretch_width {
             style.size.width =
@@ -251,7 +405,7 @@ impl TaffyLayoutEngine {
             style.size.height =
                 taffy::style::Dimension::length(round_to_device_pixel(size.height.0, scale_factor));
         }
-        self.taffy.set_style(id.0, style).expect(EXPECT_MESSAGE);
+        self.update_style(id, style);
     }
 
     // Used to understand performance
@@ -350,7 +504,9 @@ impl TaffyLayoutEngine {
             transform(available_space.height),
         );
 
+        self.remeasure_changed_leaves(window, cx);
         let measured_widths = &mut self.measured_widths;
+        let measure_queries = &mut self.measure_queries;
         self.taffy
             .compute_layout_with_measure(
                 id.into(),
@@ -360,28 +516,18 @@ impl TaffyLayoutEngine {
                         return taffy::geometry::Size::default();
                     };
                     measured_widths.insert(LayoutId(node_id), known_dimensions.width);
-
-                    let known_dimensions = Size {
-                        width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
-                        height: known_dimensions.height.map(|e| Pixels(e / scale_factor)),
-                    };
-
-                    let available_space: Size<AvailableSpace> = available_space.into();
-                    let untransform = |ev: AvailableSpace| match ev {
-                        AvailableSpace::Definite(pixels) => {
-                            AvailableSpace::Definite(Pixels(pixels.0 / scale_factor))
+                    let answer = measure_in_device_pixels(node_context, known_dimensions, available_space, scale_factor, window, cx);
+                    let entry = measure_queries.entry(LayoutId(node_id)).or_insert_with(|| Some(Vec::new()));
+                    if let Some(queries) = entry {
+                        let query = MeasureQuery { known: known_dimensions, available: available_space, answer };
+                        match queries.iter().position(|asked| asked.known == query.known && asked.available == query.available) {
+                            Some(at) => queries[at] = query,
+                            // Past this many the leaf is dirtied on a key change, as without them.
+                            None if queries.len() >= MAX_MEASURE_QUERIES => *entry = None,
+                            None => queries.push(query),
                         }
-                        AvailableSpace::MinContent => AvailableSpace::MinContent,
-                        AvailableSpace::MaxContent => AvailableSpace::MaxContent,
-                    };
-                    let available_space = size(
-                        untransform(available_space.width),
-                        untransform(available_space.height),
-                    );
-
-                    let measured_size: Size<Pixels> =
-                        (node_context.measure)(known_dimensions, available_space, window, cx);
-                    snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                    }
+                    answer
                 },
             )
             .expect(EXPECT_MESSAGE);

@@ -26,6 +26,17 @@ pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
 
+/// Names an element whose primitives can be painted again alone (see `Window::paint_live`).
+pub type LiveId = u64;
+
+/// The primitives a live element painted, under the one draw order it holds.
+pub(crate) struct LiveContent {
+    bounds: Bounds<ScaledPixels>,
+    order: DrawOrder,
+    rounded_clips: Vec<Vec<Bounds<ScaledPixels>>>,
+    primitives: Vec<Primitive>,
+}
+
 /// A boolean stored as a `u32` so that GPU-facing structs contain no
 /// compiler-inserted padding bytes, which would be undefined behavior to
 /// reinterpret as `&[u8]` when writing instance buffers. Guaranteed to be
@@ -66,6 +77,12 @@ pub struct Scene {
     /// `SurfaceSource::Layer(id)`. See `Window::paint_layer`.
     pub layers: Vec<SceneLayer>,
     damage_scratch: damage::DamageScratch,
+    /// Live elements' primitives; `paint_operations` holds a `Live` marker in their place.
+    live: collections::FxHashMap<LiveId, LiveContent>,
+    /// Collects a live element's primitives while it paints.
+    live_capture: Option<Vec<Primitive>>,
+    /// Live elements met by [`Self::replay`] since the window last took them.
+    pub(crate) replayed_live: Vec<LiveId>,
 }
 
 /// One cached render layer captured during a frame's paint (see [`Scene::layers`]).
@@ -108,6 +125,9 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.layers.clear();
+        self.live.clear();
+        self.live_capture = None;
+        self.replayed_live.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -115,6 +135,12 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        // A live element is one layer: what it paints keeps its order, to be replaced together.
+        if self.live_capture.is_some() {
+            let order = *self.layer_stack.last().expect("a live element is a layer");
+            self.layer_stack.push(order);
+            return;
+        }
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
         self.paint_operations
@@ -123,7 +149,9 @@ impl Scene {
 
     pub fn pop_layer(&mut self) {
         self.layer_stack.pop();
-        self.paint_operations.push(PaintOperation::EndLayer);
+        if self.live_capture.is_none() {
+            self.paint_operations.push(PaintOperation::EndLayer);
+        }
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
@@ -202,8 +230,62 @@ impl Scene {
                 self.surfaces.push(surface.clone());
             }
         }
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
+        match &mut self.live_capture {
+            Some(capture) => capture.push(primitive),
+            None => self.paint_operations.push(PaintOperation::Primitive(primitive)),
+        }
+    }
+
+    /// Starts a live element at `bounds`: what is inserted until [`Self::end_live`] gets one
+    /// draw order and is kept apart, to be replaced by [`Self::begin_patch`]. `None` inside a
+    /// layer or another live element, where it paints as usual.
+    pub(crate) fn begin_live(&mut self, bounds: Bounds<ScaledPixels>) -> Option<DrawOrder> {
+        if !self.layer_stack.is_empty() || self.live_capture.is_some() {
+            return None;
+        }
+        let order = self.primitive_bounds.insert(bounds);
+        self.layer_stack.push(order);
+        self.live_capture = Some(Vec::new());
+        Some(order)
+    }
+
+    pub(crate) fn end_live(&mut self, id: LiveId, bounds: Bounds<ScaledPixels>, order: DrawOrder) {
+        self.layer_stack.pop();
+        let primitives = self.live_capture.take().unwrap_or_default();
+        self.paint_operations.push(PaintOperation::Live(id));
+        let rounded_clips = self.rounded_clips.clone();
+        self.live.insert(id, LiveContent { bounds, order, rounded_clips, primitives });
+    }
+
+    /// Takes live element `id`'s primitives out of the finished scene; those inserted until
+    /// [`Self::end_patch`] replace them. False when the scene has no such element.
+    pub(crate) fn begin_patch(&mut self, id: LiveId) -> bool {
+        let Some(content) = self.live.get(&id) else { return false };
+        let (order, bounds) = (content.order, content.bounds);
+        // No other primitive with this order overlaps the element: one inserted after it over
+        // its bounds got a higher order, and one before it a lower.
+        macro_rules! remove {
+            ($($list:ident),*) => {$(
+                self.$list.retain(|primitive| {
+                    primitive.order != order || !primitive.bounds.intersect(&primitive.content_mask.bounds).intersects(&bounds)
+                });
+            )*};
+        }
+        remove!(shadows, quads, shapes, paths, underlines, monochrome_sprites, subpixel_sprites, polychrome_sprites, surfaces);
+        self.rounded_clips = content.rounded_clips.clone();
+        self.layer_stack.push(order);
+        self.live_capture = Some(Vec::new());
+        self.damage = std::mem::take(&mut self.damage).union(SceneDamage::Partial(bounds));
+        true
+    }
+
+    pub(crate) fn end_patch(&mut self, id: LiveId) {
+        self.layer_stack.pop();
+        self.rounded_clips.clear();
+        let primitives = self.live_capture.take().unwrap_or_default();
+        if let Some(content) = self.live.get_mut(&id) {
+            content.primitives = primitives;
+        }
     }
 
     /// Shift every primitive in this scene by `offset`. Used to convert a captured layer sub-scene
@@ -271,6 +353,18 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::Live(id) => {
+                    let Some(content) = prev_scene.live.get(id) else { continue };
+                    let Some(order) = self.begin_live(content.bounds) else { continue };
+                    for primitive in &content.primitives {
+                        self.insert_unclipped_primitive(primitive.clone());
+                    }
+                    self.layer_stack.pop();
+                    let primitives = self.live_capture.take().unwrap_or_default();
+                    self.paint_operations.push(PaintOperation::Live(*id));
+                    self.live.insert(*id, LiveContent { bounds: content.bounds, order, rounded_clips: content.rounded_clips.clone(), primitives });
+                    self.replayed_live.push(*id);
+                }
             }
         }
     }
@@ -346,6 +440,8 @@ pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    /// A live element's primitives, kept in `Scene::live`.
+    Live(LiveId),
 }
 
 #[derive(Clone)]
