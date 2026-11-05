@@ -4993,6 +4993,7 @@ impl Window {
         kind: crate::EffectKind,
         time: f32,
         color: crate::Rgba,
+        stops: [crate::Rgba; 4],
         levels: &[f32; crate::EFFECT_LEVELS],
     ) {
         use crate::{PaintSurface, PaintSurfaceSource, SurfaceEffect};
@@ -5014,6 +5015,7 @@ impl Window {
                 kind,
                 time,
                 color,
+                stops,
                 levels: levels.map(|level| level.clamp(0., 1.)),
                 corner_radii: corner_radii.scale(scale_factor),
                 opacity,
@@ -5058,6 +5060,7 @@ impl Window {
                 kind,
                 time: 0.,
                 color,
+                stops: [color; 4],
                 levels: [0.; crate::EFFECT_LEVELS],
                 corner_radii: corner_radii.scale(scale_factor),
                 opacity,

@@ -246,6 +246,7 @@ struct EffectParams {
     kind: u32,
     _pad: u32,
     levels: [[f32; 4]; 8],
+    stops: [[f32; 4]; 4],
 }
 
 impl EffectParams {
@@ -272,6 +273,7 @@ impl EffectParams {
             },
             _pad: 0,
             levels,
+            stops: effect.stops.map(|stop| [stop.r, stop.g, stop.b, stop.a]),
         }
     }
 }

@@ -1463,8 +1463,10 @@ pub struct SurfaceEffect {
     pub kind: EffectKind,
     /// Seconds since the effect started; wraps when the element wants it to.
     pub time: f32,
-    /// The colour the shader draws in.
+    /// The colour the shader draws in, for its opacity.
     pub color: crate::Rgba,
+    /// The colours across the fill, left to right.
+    pub stops: [crate::Rgba; 4],
     /// Levels from 0 to 1, lowest pitch first.
     pub levels: [f32; EFFECT_LEVELS],
     /// Corner radii of the filled shape, in device pixels.

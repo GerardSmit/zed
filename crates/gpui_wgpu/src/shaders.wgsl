@@ -2153,7 +2153,7 @@ fn fs_backdrop_composite(input: BackdropVarying) -> @location(0) vec4<f32> {
 
 // --- effects --- //
 //
-// A built-in animated fill (`gpui::SurfaceEffect`): bars, rings or an aurora in one colour that
+// A built-in animated fill (`gpui::SurfaceEffect`): bars, rings or an aurora in colours that
 // follow 32 levels (a sound's spectrum, lowest pitch first) at `time` seconds. Drawn through the
 // element's rounded corners, content mask and fade like the backdrop composite.
 
@@ -2168,6 +2168,7 @@ struct EffectParams {
     kind: u32,
     _pad: u32,
     levels: array<vec4<f32>, 8>,
+    stops: array<vec4<f32>, 4>,
 }
 
 @group(1) @binding(0) var<uniform> effect: EffectParams;
@@ -2201,6 +2202,13 @@ fn effect_energy(first: u32, count: u32) -> f32 {
     return sum / f32(count);
 }
 
+// The colour at `x` across the fill, between its four stops.
+fn effect_tint(x: f32) -> vec3<f32> {
+    let at = saturate(x) * 3.0;
+    let low = min(u32(at), 2u);
+    return mix(effect.stops[low].rgb, effect.stops[low + 1u].rgb, at - f32(low));
+}
+
 // A bar per level from the bottom edge, brighter at the top, over a glow that follows the bass.
 fn effect_bars(uv: vec2<f32>) -> vec4<f32> {
     let column = uv.x * 32.0;
@@ -2212,7 +2220,7 @@ fn effect_bars(uv: vec2<f32>) -> vec4<f32> {
     let bar = edge * step(rise, height);
     let shade = 0.45 + 0.55 * rise / max(height, 0.001);
     let glow = (0.10 + 0.30 * effect_energy(0u, 4u)) * exp(-rise * 4.0);
-    return vec4<f32>(effect.color.rgb, clamp(bar * 0.85 * shade + glow, 0.0, 1.0));
+    return vec4<f32>(effect_tint(uv.x), clamp(bar * 0.85 * shade + glow, 0.0, 1.0));
 }
 
 // Rings around the centre: each swells with the bass and lights with its own band.
@@ -2230,7 +2238,7 @@ fn effect_rings(position: vec2<f32>) -> vec4<f32> {
         light += (1.0 - smoothstep(width * 0.5, width * 1.5, abs(radius - place))) * (0.25 + 0.75 * level);
     }
     light += (0.08 + 0.25 * bass) * exp(-radius * 5.0);
-    return vec4<f32>(effect.color.rgb, clamp(light, 0.0, 1.0));
+    return vec4<f32>(effect_tint((position.x - effect.bounds.origin.x) / max(size.x, 1.0)), clamp(light, 0.0, 1.0));
 }
 
 // Slow curtains of light drifting sideways; louder music makes them wider and brighter.
@@ -2252,7 +2260,7 @@ fn effect_aurora(uv: vec2<f32>) -> vec4<f32> {
         light += band;
         tint += band * k * 0.5;
     }
-    let lifted = mix(effect.color.rgb, vec3<f32>(1.0), clamp(tint * 0.25, 0.0, 0.45));
+    let lifted = mix(effect_tint(uv.x), vec3<f32>(1.0), clamp(tint * 0.25, 0.0, 0.45));
     return vec4<f32>(lifted, clamp(light * 0.8, 0.0, 1.0));
 }
 
