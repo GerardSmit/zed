@@ -1705,7 +1705,7 @@ impl MetalRenderer {
                     );
                     video_textures = Some((y_texture, cb_cr_texture));
                 }
-                PaintSurfaceSource::BackdropBlur(_) => continue,
+                PaintSurfaceSource::BackdropBlur(_) | PaintSurfaceSource::Effect(_) => continue,
                 PaintSurfaceSource::Layer(id) => {
                     let Some(layer) = self.cached_layers.get(&id.0) else {
                         continue;

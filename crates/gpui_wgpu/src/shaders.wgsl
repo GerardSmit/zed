@@ -2150,3 +2150,127 @@ fn fs_backdrop_composite(input: BackdropVarying) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(blurred.rgb, blurred.a * coverage);
 }
+
+// --- effects --- //
+//
+// A built-in animated fill (`gpui::SurfaceEffect`): bars, rings or an aurora in one colour that
+// follow 32 levels (a sound's spectrum, lowest pitch first) at `time` seconds. Drawn through the
+// element's rounded corners, content mask and fade like the backdrop composite.
+
+struct EffectParams {
+    bounds: Bounds,
+    content_mask: Bounds,
+    content_fade: ContentFade,
+    corner_radii: Corners,
+    color: vec4<f32>,
+    time: f32,
+    opacity: f32,
+    kind: u32,
+    _pad: u32,
+    levels: array<vec4<f32>, 8>,
+}
+
+@group(1) @binding(0) var<uniform> effect: EffectParams;
+
+struct EffectVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) clip_distances: vec4<f32>,
+    @location(1) local: vec2<f32>,
+}
+
+@vertex
+fn vs_effect(@builtin(vertex_index) vertex_id: u32) -> EffectVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    var out = EffectVarying();
+    out.position = to_device_position(unit_vertex, effect.bounds);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, effect.bounds, effect.content_mask);
+    out.local = unit_vertex;
+    return out;
+}
+
+fn effect_level(index: u32) -> f32 {
+    let i = min(index, 31u);
+    return effect.levels[i / 4u][i % 4u];
+}
+
+fn effect_energy(first: u32, count: u32) -> f32 {
+    var sum = 0.0;
+    for (var i = 0u; i < count; i++) {
+        sum += effect_level(first + i);
+    }
+    return sum / f32(count);
+}
+
+// A bar per level from the bottom edge, brighter at the top, over a glow that follows the bass.
+fn effect_bars(uv: vec2<f32>) -> vec4<f32> {
+    let column = uv.x * 32.0;
+    let index = u32(clamp(floor(column), 0.0, 31.0));
+    let within = fract(column);
+    let height = 0.04 + effect_level(index) * 0.86;
+    let rise = 1.0 - uv.y;
+    let edge = smoothstep(0.08, 0.16, within) * (1.0 - smoothstep(0.84, 0.92, within));
+    let bar = edge * step(rise, height);
+    let shade = 0.45 + 0.55 * rise / max(height, 0.001);
+    let glow = (0.10 + 0.30 * effect_energy(0u, 4u)) * exp(-rise * 4.0);
+    return vec4<f32>(effect.color.rgb, clamp(bar * 0.85 * shade + glow, 0.0, 1.0));
+}
+
+// Rings around the centre: each swells with the bass and lights with its own band.
+fn effect_rings(position: vec2<f32>) -> vec4<f32> {
+    let size = effect.bounds.size;
+    let scale = max(min(size.x, size.y), 1.0);
+    let point = (position - (effect.bounds.origin + size * 0.5)) / scale;
+    let radius = length(point);
+    let bass = effect_energy(0u, 4u);
+    var light = 0.0;
+    for (var ring = 0u; ring < 8u; ring++) {
+        let level = effect_level(ring * 4u + 1u);
+        let place = 0.06 + f32(ring) * 0.075 + bass * 0.06 + 0.008 * sin(effect.time * 0.8 + f32(ring));
+        let width = 0.004 + level * 0.012;
+        light += (1.0 - smoothstep(width * 0.5, width * 1.5, abs(radius - place))) * (0.25 + 0.75 * level);
+    }
+    light += (0.08 + 0.25 * bass) * exp(-radius * 5.0);
+    return vec4<f32>(effect.color.rgb, clamp(light, 0.0, 1.0));
+}
+
+// Slow curtains of light drifting sideways; louder music makes them wider and brighter.
+fn effect_aurora(uv: vec2<f32>) -> vec4<f32> {
+    let energy = effect_energy(0u, 32u);
+    let bass = effect_energy(0u, 6u);
+    let t = effect.time;
+    var light = 0.0;
+    var tint = 0.0;
+    for (var layer = 0u; layer < 3u; layer++) {
+        let k = f32(layer);
+        let centre = 0.3 + 0.16 * k
+            + 0.08 * sin(uv.x * (2.5 + k) + t * (0.21 + 0.07 * k))
+            + 0.04 * sin(uv.x * (7.0 - k) - t * (0.43 + 0.05 * k));
+        let width = 0.05 + 0.08 * energy + 0.04 * bass;
+        let curtain = exp(-pow((uv.y - centre) / width, 2.0));
+        let shimmer = 0.75 + 0.25 * sin(uv.x * 40.0 + t * 2.0 + k * 2.1);
+        let band = curtain * shimmer * (0.25 + 0.9 * effect_level(layer * 9u + 2u));
+        light += band;
+        tint += band * k * 0.5;
+    }
+    let lifted = mix(effect.color.rgb, vec3<f32>(1.0), clamp(tint * 0.25, 0.0, 0.45));
+    return vec4<f32>(lifted, clamp(light * 0.8, 0.0, 1.0));
+}
+
+@fragment
+fn fs_effect(input: EffectVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    var color: vec4<f32>;
+    switch effect.kind {
+        case 1u: { color = effect_rings(input.position.xy); }
+        case 2u: { color = effect_aurora(input.local); }
+        case 3u: { color = vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+        default: { color = effect_bars(input.local); }
+    }
+    let distance = quad_sdf(input.position.xy, effect.bounds, effect.corner_radii);
+    let coverage = saturate(0.5 - distance)
+        * fade_alpha(input.position.y, fade_vector(effect.content_fade))
+        * effect.opacity * effect.color.a;
+    return blend_color(color, coverage);
+}

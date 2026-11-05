@@ -3,7 +3,7 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, BackdropBlur, Background, BorderStyle, Bounds, ContentFade, DevicePixels,
-    GpuSpecs, LayerId, PaintSurface, PaintSurfaceSource, Path, Point, PrimitiveBatch, Quad,
+    EffectKind, GpuSpecs, LayerId, PaintSurface, PaintSurfaceSource, Path, Point, PrimitiveBatch, Quad,
     ScaledPixels, Scene, SceneDamage, Shadow, Size, get_gamma_correction_ratios,
 };
 use log::warn;
@@ -60,8 +60,8 @@ pub fn set_precompiled_shaders(storage: PrecompiledShaderSet, subpixel: Precompi
 }
 
 /// The modules of one shader variant, created per entry point on first use.
-struct ShaderStages<'a> {
-    device: &'a wgpu::Device,
+struct ShaderStages {
+    device: wgpu::Device,
     label: &'static str,
     source: &'static str,
     precompiled: PrecompiledShaderSet,
@@ -70,9 +70,9 @@ struct ShaderStages<'a> {
     entries: RefCell<HashMap<String, wgpu::ShaderModule>>,
 }
 
-impl<'a> ShaderStages<'a> {
+impl ShaderStages {
     fn new(
-        device: &'a wgpu::Device,
+        device: &wgpu::Device,
         label: &'static str,
         source: &'static str,
         precompiled: PrecompiledShaderSet,
@@ -80,7 +80,7 @@ impl<'a> ShaderStages<'a> {
     ) -> Self {
         let passthrough = device.features().contains(wgpu::Features::PASSTHROUGH_SHADERS);
         Self {
-            device,
+            device: device.clone(),
             label,
             source,
             precompiled: if passthrough && !shader_runtime_checks { precompiled } else { &[] },
@@ -231,6 +231,51 @@ struct BackdropParams {
     _pad: f32,
 }
 
+/// Uniform block of an effect (`EffectParams` in the shader).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct EffectParams {
+    bounds: PodBounds,
+    content_mask: PodBounds,
+    content_fade: [f32; 4],
+    /// Top left, top right, bottom right, bottom left.
+    corner_radii: [f32; 4],
+    color: [f32; 4],
+    time: f32,
+    opacity: f32,
+    kind: u32,
+    _pad: u32,
+    levels: [[f32; 4]; 8],
+}
+
+impl EffectParams {
+    fn new(surface: &PaintSurface, effect: &gpui::SurfaceEffect) -> Self {
+        let fade = surface.content_mask.fade;
+        let radii = effect.corner_radii;
+        let mut levels = [[0.0; 4]; 8];
+        for (index, level) in effect.levels.iter().take(32).enumerate() {
+            levels[index / 4][index % 4] = *level;
+        }
+        Self {
+            bounds: surface.bounds.into(),
+            content_mask: surface.content_mask.bounds.into(),
+            content_fade: [fade.top.0, fade.top_len.0, fade.bottom.0, fade.bottom_len.0],
+            corner_radii: [radii.top_left.0, radii.top_right.0, radii.bottom_right.0, radii.bottom_left.0],
+            color: [effect.color.r, effect.color.g, effect.color.b, effect.color.a],
+            time: effect.time,
+            opacity: effect.opacity,
+            kind: match effect.kind {
+                _ if effect.layer.is_some() => 3,
+                EffectKind::Bars => 0,
+                EffectKind::Rings => 1,
+                EffectKind::Aurora => 2,
+            },
+            _pad: 0,
+            levels,
+        }
+    }
+}
+
 /// The largest factor a backdrop is downsampled by before it is blurred. The blur textures are
 /// sized for the smallest, 2.
 const BACKDROP_MAX_DOWNSCALE: u32 = 16;
@@ -248,8 +293,8 @@ fn backdrop_downscale(sigma: f32) -> u32 {
 }
 
 /// Window-sized scratch for backdrop blurs: the copy of the frame, and two textures at half its
-/// size the blur passes ping-pong between. 1.5 × the surface's bytes; created on the first frame
-/// that blurs and dropped with the other intermediates on resize.
+/// size the blur passes ping-pong between. 1.5 × the bytes of the largest target that blurred;
+/// created on the first frame that blurs and dropped with the other intermediates on resize.
 struct BackdropTextures {
     copy: wgpu::Texture,
     copy_view: wgpu::TextureView,
@@ -516,6 +561,131 @@ struct OpaqueQuadPipelines {
     clamped: wgpu::RenderPipeline,
 }
 
+/// A render pipeline few scenes draw with, created on first use or by
+/// [`WgpuRenderer::warm_next_pipeline`] so the first frame does not wait for it.
+struct LazyPipeline {
+    pipeline: std::cell::OnceCell<wgpu::RenderPipeline>,
+    create: Box<dyn Fn() -> wgpu::RenderPipeline>,
+}
+
+impl LazyPipeline {
+    fn new(create: impl Fn() -> wgpu::RenderPipeline + 'static) -> Self {
+        Self { pipeline: Default::default(), create: Box::new(create) }
+    }
+
+    /// Creates the pipeline if it does not exist yet; true when this call did.
+    fn warm(&self) -> bool {
+        if self.pipeline.get().is_some() {
+            return false;
+        }
+        self.pipeline.get_or_init(|| (self.create)());
+        true
+    }
+}
+
+impl std::ops::Deref for LazyPipeline {
+    type Target = wgpu::RenderPipeline;
+
+    fn deref(&self) -> &wgpu::RenderPipeline {
+        self.pipeline.get_or_init(|| (self.create)())
+    }
+}
+
+/// What [`WgpuRenderer::create_pipelines`] needs to create a scene pipeline, kept for the
+/// [`LazyPipeline`]s.
+struct PipelineBuilder {
+    device: wgpu::Device,
+    pipeline_cache: Option<wgpu::PipelineCache>,
+    layouts: WgpuBindGroupLayouts,
+    scene_depth: bool,
+    coverage_epilogue: bool,
+    shaders: ShaderStages,
+}
+
+impl PipelineBuilder {
+    /// Every pipeline that draws in scene passes; the others have passes of their own.
+    fn depth_stencil(&self, name: &str) -> Option<wgpu::DepthStencilState> {
+        let scene = !matches!(name, "path_rasterization" | "backdrop_downsample" | "backdrop_blur" | "fs_frame");
+        (self.scene_depth && scene).then(|| wgpu::DepthStencilState {
+            format: SCENE_DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: Default::default(),
+            bias: Default::default(),
+        })
+    }
+
+    fn build(
+        &self,
+        name: &str,
+        vs_entry: &str,
+        fs_entry: &str,
+        data_layout: &wgpu::BindGroupLayout,
+        texture_layout: Option<&wgpu::BindGroupLayout>,
+        topology: wgpu::PrimitiveTopology,
+        color_targets: &[Option<wgpu::ColorTargetState>],
+        sample_count: u32,
+        module: &ShaderStages,
+    ) -> wgpu::RenderPipeline {
+        let mut bind_group_layouts = vec![Some(&self.layouts.globals), Some(data_layout)];
+        bind_group_layouts.extend(texture_layout.map(Some));
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("{name}_layout")),
+            bind_group_layouts: &bind_group_layouts,
+            immediate_size: 0,
+        });
+
+        let replace_targets: Vec<_>;
+        let color_targets = if self.coverage_epilogue {
+            replace_targets = color_targets
+                .iter()
+                .map(|target| {
+                    target.clone().map(|target| wgpu::ColorTargetState {
+                        blend: target.blend.or(Some(wgpu::BlendState::REPLACE)),
+                        ..target
+                    })
+                })
+                .collect();
+            &replace_targets[..]
+        } else {
+            color_targets
+        };
+        self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(name),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module.module(vs_entry),
+                entry_point: Some(vs_entry),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module.module(fs_entry),
+                entry_point: Some(fs_entry),
+                targets: color_targets,
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: self.depth_stencil(name),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: self.pipeline_cache.as_ref(),
+        })
+    }
+}
+
 struct WgpuPipelines {
     frame_clear: wgpu::RenderPipeline,
     frame_present: wgpu::RenderPipeline,
@@ -526,21 +696,51 @@ struct WgpuPipelines {
     quad_variant: Option<wgpu::RenderPipeline>,
     /// For [`RendererTuning::opaque_quads`].
     opaque_quads: Option<OpaqueQuadPipelines>,
-    shadows: wgpu::RenderPipeline,
-    shapes: wgpu::RenderPipeline,
-    path_rasterization: wgpu::RenderPipeline,
-    paths: wgpu::RenderPipeline,
-    underlines: wgpu::RenderPipeline,
+    shadows: LazyPipeline,
+    shapes: LazyPipeline,
+    path_rasterization: LazyPipeline,
+    paths: LazyPipeline,
+    underlines: LazyPipeline,
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
-    poly_sprites: wgpu::RenderPipeline,
+    poly_sprites: LazyPipeline,
     #[allow(dead_code)]
-    surfaces: wgpu::RenderPipeline,
+    surfaces: LazyPipeline,
     /// Pipeline for compositing a cached layer texture onto the frame.
-    layer_composite: wgpu::RenderPipeline,
-    backdrop_downsample: wgpu::RenderPipeline,
-    backdrop_blur: wgpu::RenderPipeline,
-    backdrop_composite: wgpu::RenderPipeline,
+    layer_composite: LazyPipeline,
+    backdrop_downsample: LazyPipeline,
+    backdrop_blur: LazyPipeline,
+    backdrop_composite: LazyPipeline,
+    effects: LazyPipeline,
+    /// Effect layers: scale what is drawn by one minus the coverage.
+    cutouts: LazyPipeline,
+}
+
+impl WgpuPipelines {
+    /// Creates the next pipeline that does not exist yet; false when all do.
+    fn warm_next(&self) -> bool {
+        [
+            &self.shadows,
+            &self.poly_sprites,
+            &self.backdrop_downsample,
+            &self.backdrop_blur,
+            &self.backdrop_composite,
+            &self.layer_composite,
+            &self.underlines,
+            &self.paths,
+            &self.path_rasterization,
+            &self.shapes,
+            &self.surfaces,
+            &self.effects,
+            &self.cutouts,
+        ]
+        .into_iter()
+        .any(LazyPipeline::warm)
+    }
+
+    fn warm_all(&self) {
+        while self.warm_next() {}
+    }
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -566,6 +766,7 @@ struct InstanceBindings {
     polychrome_sprites: InstanceBinding,
 }
 
+#[derive(Clone)]
 struct WgpuBindGroupLayouts {
     globals: wgpu::BindGroupLayout,
     instances: wgpu::BindGroupLayout,
@@ -576,6 +777,8 @@ struct WgpuBindGroupLayouts {
     layer_surfaces: wgpu::BindGroupLayout,
     /// Backdrop blur passes and composite: `BackdropParams` + source texture + sampler.
     backdrop: wgpu::BindGroupLayout,
+    /// Effects: `EffectParams`.
+    effect: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -616,9 +819,16 @@ struct WgpuResources {
     path_msaa_view: Option<wgpu::TextureView>,
     path_scratch_globals: Option<wgpu::BindGroup>,
     path_scratch_binding: Option<wgpu::BindGroup>,
+    /// The path intermediate set last replaced by one of another size. The desktop and its
+    /// windows share a renderer and alternate between large and small path atlases; keeping the
+    /// other size avoids reallocating textures on every switch.
+    path_spare: SparePathIntermediate,
     /// Cached offscreen textures for layered views, keyed by [`LayerId`] raw value.
     layer_textures: HashMap<u64, LayerTexture>,
     backdrop_textures: Option<BackdropTextures>,
+    /// Parameters and bindings of the effects drawn this frame, reused across frames by index.
+    effect_bindings: RefCell<Vec<(wgpu::Buffer, wgpu::BindGroup)>>,
+    next_effect: Cell<usize>,
     retained_frame: Option<RetainedFrame>,
     /// [`RendererTuning::depth_buffer`] attachments by size.
     scene_depth: HashMap<(u32, u32), wgpu::TextureView>,
@@ -651,7 +861,29 @@ impl WgpuResources {
         self.path_msaa_view = None;
         self.path_scratch_globals = None;
         self.path_scratch_binding = None;
+        self.path_spare = SparePathIntermediate::default();
     }
+
+    /// Exchanges the current path intermediate set with the spare one.
+    fn swap_path_spare(&mut self) {
+        let spare = &mut self.path_spare;
+        std::mem::swap(&mut self.path_intermediate_texture, &mut spare.texture);
+        std::mem::swap(&mut self.path_intermediate_view, &mut spare.view);
+        std::mem::swap(&mut self.path_msaa_texture, &mut spare.msaa_texture);
+        std::mem::swap(&mut self.path_msaa_view, &mut spare.msaa_view);
+        std::mem::swap(&mut self.path_scratch_globals, &mut spare.globals);
+        std::mem::swap(&mut self.path_scratch_binding, &mut spare.binding);
+    }
+}
+
+#[derive(Default)]
+struct SparePathIntermediate {
+    texture: Option<wgpu::Texture>,
+    view: Option<wgpu::TextureView>,
+    msaa_texture: Option<wgpu::Texture>,
+    msaa_view: Option<wgpu::TextureView>,
+    globals: Option<wgpu::BindGroup>,
+    binding: Option<wgpu::BindGroup>,
 }
 
 pub struct WgpuRenderer {
@@ -687,6 +919,8 @@ pub struct WgpuRenderer {
     retained_generation: u64,
     /// The surface can be copied from, so backdrop blur surfaces are drawn.
     backdrop_blur_supported: bool,
+    /// Effect surfaces are drawn (not on the WebGL instance path).
+    effects_supported: bool,
     frame_timings: Option<crate::frame_timings::FrameTimings>,
     instance_uploads: Option<crate::upload_ring::UploadRing>,
     instance_upload_encoder: Option<wgpu::CommandEncoder>,
@@ -749,7 +983,7 @@ impl WgpuRenderer {
                 tuning.depth_buffer,
                 tuning.coverage_epilogue,
             );
-            drop(pipelines);
+            pipelines.warm_all();
         }
         let validation = validation_scope.pop().await;
         let internal = internal_scope.pop().await;
@@ -1171,8 +1405,11 @@ impl WgpuRenderer {
             path_msaa_view: None,
             path_scratch_globals: None,
             path_scratch_binding: None,
+            path_spare: SparePathIntermediate::default(),
             layer_textures: HashMap::new(),
             backdrop_textures: None,
+            effect_bindings: RefCell::new(Vec::new()),
+            next_effect: Cell::new(0),
             retained_frame: None,
             scene_depth: HashMap::new(),
             offscreen_globals: HashMap::new(),
@@ -1209,6 +1446,7 @@ impl WgpuRenderer {
             needs_redraw: false,
             retained_generation: 0,
             backdrop_blur_supported,
+            effects_supported: !uses_webgl_instance_data,
             frame_timings,
             instance_uploads: None,
             instance_upload_encoder: None,
@@ -1419,6 +1657,20 @@ impl WgpuRenderer {
             ],
         });
 
+        let effect = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("effect_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<EffectParams>() as u64),
+                },
+                count: None,
+            }],
+        });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
@@ -1426,6 +1678,7 @@ impl WgpuRenderer {
             surfaces,
             layer_surfaces,
             backdrop,
+            effect,
         }
     }
 
@@ -1483,17 +1736,6 @@ impl WgpuRenderer {
         scene_depth: bool,
         coverage_epilogue: bool,
     ) -> WgpuPipelines {
-        // Every pipeline that draws in scene passes; the others have passes of their own.
-        let depth_stencil = |name: &str| {
-            let scene = !matches!(name, "path_rasterization" | "backdrop_downsample" | "backdrop_blur" | "fs_frame");
-            (scene_depth && scene).then(|| wgpu::DepthStencilState {
-                format: SCENE_DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: Default::default(),
-                bias: Default::default(),
-            })
-        };
         // Diagnostic guard: verify the device actually has
         // DUAL_SOURCE_BLENDING. We have a crash report (ZED-5G1) where a
         // feature mismatch caused a wgpu-hal abort, but we haven't
@@ -1523,13 +1765,21 @@ impl WgpuRenderer {
             STORAGE_BUFFER_SHADERS
         };
         let precompiled = PRECOMPILED_SHADERS.get().copied().unwrap_or((&[], &[]));
-        let shader_module = ShaderStages::new(
-            device,
-            "gpui_shaders",
-            shader_source,
-            if uses_webgl_instance_data { &[] } else { precompiled.0 },
-            shader_runtime_checks,
-        );
+        let builder = Rc::new(PipelineBuilder {
+            device: device.clone(),
+            pipeline_cache: pipeline_cache.cloned(),
+            layouts: layouts.clone(),
+            scene_depth,
+            coverage_epilogue,
+            shaders: ShaderStages::new(
+                device,
+                "gpui_shaders",
+                shader_source,
+                if uses_webgl_instance_data { &[] } else { precompiled.0 },
+                shader_runtime_checks,
+            ),
+        });
+        let shader_module = &builder.shaders;
 
         let frame_pipeline = |fragment: &str, layouts: &[Option<&wgpu::BindGroupLayout>]| {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1560,7 +1810,7 @@ impl WgpuRenderer {
                     topology: wgpu::PrimitiveTopology::TriangleStrip,
                     ..Default::default()
                 },
-                depth_stencil: depth_stencil(fragment),
+                depth_stencil: builder.depth_stencil(fragment),
                 multisample: Default::default(),
                 multiview_mask: None,
                 cache: pipeline_cache,
@@ -1585,99 +1835,78 @@ impl WgpuRenderer {
             blend: Some(blend_mode),
             write_mask: wgpu::ColorWrites::ALL,
         };
+        let premultiplied_target = wgpu::ColorTargetState {
+            format: surface_format,
+            blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+            write_mask: wgpu::ColorWrites::ALL,
+        };
+        let backdrop_pass_target = wgpu::ColorTargetState {
+            format: surface_format,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        };
 
         let create_pipeline = |name: &str,
                                vs_entry: &str,
                                fs_entry: &str,
-                               globals_layout: &wgpu::BindGroupLayout,
-                               data_layout: &wgpu::BindGroupLayout,
                                texture_layout: Option<&wgpu::BindGroupLayout>,
-                               topology: wgpu::PrimitiveTopology,
                                color_targets: &[Option<wgpu::ColorTargetState>],
-                               sample_count: u32,
                                module: &ShaderStages| {
-            let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
-            bind_group_layouts.extend(texture_layout.map(Some));
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(&format!("{name}_layout")),
-                bind_group_layouts: &bind_group_layouts,
-                immediate_size: 0,
-            });
-
-            let replace_targets: Vec<_>;
-            let color_targets = if coverage_epilogue {
-                replace_targets = color_targets
-                    .iter()
-                    .map(|target| {
-                        target.clone().map(|target| wgpu::ColorTargetState {
-                            blend: target.blend.or(Some(wgpu::BlendState::REPLACE)),
-                            ..target
-                        })
-                    })
-                    .collect();
-                &replace_targets[..]
-            } else {
-                color_targets
-            };
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(name),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &module.module(vs_entry),
-                    entry_point: Some(vs_entry),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &module.module(fs_entry),
-                    entry_point: Some(fs_entry),
-                    targets: color_targets,
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
+            builder.build(
+                name,
+                vs_entry,
+                fs_entry,
+                &layouts.instances,
+                texture_layout,
+                wgpu::PrimitiveTopology::TriangleStrip,
+                color_targets,
+                1,
+                module,
+            )
+        };
+        let lazy = |name: &'static str,
+                    vs_entry: &'static str,
+                    fs_entry: &'static str,
+                    data_layout: fn(&WgpuBindGroupLayouts) -> &wgpu::BindGroupLayout,
+                    textured: bool,
+                    topology: wgpu::PrimitiveTopology,
+                    color_target: wgpu::ColorTargetState,
+                    sample_count: u32| {
+            let builder = builder.clone();
+            LazyPipeline::new(move || {
+                let layouts = &builder.layouts;
+                builder.build(
+                    name,
+                    vs_entry,
+                    fs_entry,
+                    data_layout(layouts),
+                    textured.then_some(&layouts.texture),
                     topology,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: depth_stencil(name),
-                multisample: wgpu::MultisampleState {
-                    count: sample_count,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview_mask: None,
-                cache: pipeline_cache,
+                    &[Some(color_target.clone())],
+                    sample_count,
+                    &builder.shaders,
+                )
             })
         };
+        let strip = wgpu::PrimitiveTopology::TriangleStrip;
+        let list = wgpu::PrimitiveTopology::TriangleList;
 
         let quads = create_pipeline(
             "quads",
             "vs_quad",
             "fs_quad",
-            &layouts.globals,
-            &layouts.instances,
             None,
-            wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
-            1,
-            &shader_module,
+            shader_module,
         );
 
         let simple_quads = create_pipeline(
             "simple_quads",
             "vs_quad_simple",
             "fs_quad_simple",
-            &layouts.globals,
-            &layouts.instances,
             None,
-            wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
-            1,
-            &shader_module,
+            shader_module,
         );
 
         let quad_variant = quad_variant.map(|(vertex, fragment, blend)| {
@@ -1685,18 +1914,7 @@ impl WgpuRenderer {
                 blend: if blend { color_target.blend } else { None },
                 ..color_target.clone()
             };
-            create_pipeline(
-                fragment,
-                vertex,
-                fragment,
-                &layouts.globals,
-                &layouts.instances,
-                None,
-                wgpu::PrimitiveTopology::TriangleStrip,
-                &[Some(target)],
-                1,
-                &shader_module,
-            )
+            create_pipeline(fragment, vertex, fragment, None, &[Some(target)], shader_module)
         });
 
         let opaque_quads = opaque_quads.then(|| OpaqueQuadPipelines {
@@ -1704,115 +1922,30 @@ impl WgpuRenderer {
                 "opaque_quads",
                 "vs_quad_opaque",
                 "fs_quad_opaque",
-                &layouts.globals,
-                &layouts.instances,
                 None,
-                wgpu::PrimitiveTopology::TriangleStrip,
                 &[Some(wgpu::ColorTargetState {
                     blend: None,
                     ..color_target.clone()
                 })],
-                1,
-                &shader_module,
+                shader_module,
             ),
             clamped: create_pipeline(
                 "clamped_quads",
                 "vs_quad_clamped",
                 "fs_quad_simple",
-                &layouts.globals,
-                &layouts.instances,
                 None,
-                wgpu::PrimitiveTopology::TriangleStrip,
                 &[Some(color_target.clone())],
-                1,
-                &shader_module,
+                shader_module,
             ),
         });
-
-        let shadows = create_pipeline(
-            "shadows",
-            "vs_shadow",
-            "fs_shadow",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
-
-        let shapes = create_pipeline(
-            "shapes",
-            "vs_shape",
-            "fs_shape",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
-
-        let path_rasterization = create_pipeline(
-            "path_rasterization",
-            "vs_path_rasterization",
-            "fs_path_rasterization",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleList,
-            &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            path_sample_count,
-            &shader_module,
-        );
-
-        let paths = create_pipeline(
-            "paths",
-            "vs_path",
-            "fs_path",
-            &layouts.globals,
-            &layouts.instances,
-            Some(&layouts.texture),
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            1,
-            &shader_module,
-        );
-
-        let underlines = create_pipeline(
-            "underlines",
-            "vs_underline",
-            "fs_underline",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
 
         let mono_sprites = create_pipeline(
             "mono_sprites",
             "vs_mono_sprite",
             "fs_mono_sprite",
-            &layouts.globals,
-            &layouts.instances,
             Some(&layouts.texture),
-            wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
-            1,
-            &shader_module,
+            shader_module,
         );
 
         let subpixel_sprites = if let Some(subpixel_module) = &subpixel_shader_module {
@@ -1833,106 +1966,99 @@ impl WgpuRenderer {
                 "subpixel_sprites",
                 "vs_subpixel_sprite",
                 "fs_subpixel_sprite",
-                &layouts.globals,
-                &layouts.instances,
                 Some(&layouts.texture),
-                wgpu::PrimitiveTopology::TriangleStrip,
                 &[Some(wgpu::ColorTargetState {
                     format: surface_format,
                     blend: Some(subpixel_blend),
                     write_mask: wgpu::ColorWrites::COLOR,
                 })],
-                1,
                 subpixel_module,
             ))
         } else {
             None
         };
 
-        let poly_sprites = create_pipeline(
-            "poly_sprites",
-            "vs_poly_sprite",
-            "fs_poly_sprite",
-            &layouts.globals,
-            &layouts.instances,
-            Some(&layouts.texture),
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
+        let instances: fn(&WgpuBindGroupLayouts) -> &wgpu::BindGroupLayout = |layouts| &layouts.instances;
+        let backdrop: fn(&WgpuBindGroupLayouts) -> &wgpu::BindGroupLayout = |layouts| &layouts.backdrop;
+        let effect: fn(&WgpuBindGroupLayouts) -> &wgpu::BindGroupLayout = |layouts| &layouts.effect;
+        let shadows = lazy("shadows", "vs_shadow", "fs_shadow", instances, false, strip, color_target.clone(), 1);
+        let shapes = lazy("shapes", "vs_shape", "fs_shape", instances, false, strip, color_target.clone(), 1);
+        let path_rasterization = lazy(
+            "path_rasterization",
+            "vs_path_rasterization",
+            "fs_path_rasterization",
+            instances,
+            false,
+            list,
+            premultiplied_target.clone(),
+            path_sample_count,
         );
-
-        let surfaces = create_pipeline(
+        let paths = lazy("paths", "vs_path", "fs_path", instances, true, strip, premultiplied_target.clone(), 1);
+        let underlines =
+            lazy("underlines", "vs_underline", "fs_underline", instances, false, strip, color_target.clone(), 1);
+        let poly_sprites =
+            lazy("poly_sprites", "vs_poly_sprite", "fs_poly_sprite", instances, true, strip, color_target.clone(), 1);
+        let surfaces = lazy(
             "surfaces",
             "vs_surface",
             "fs_surface",
-            &layouts.globals,
-            &layouts.surfaces,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
+            |layouts| &layouts.surfaces,
+            false,
+            strip,
+            color_target.clone(),
             1,
-            &shader_module,
         );
-
-        let layer_composite = create_pipeline(
+        let layer_composite = lazy(
             "layer_composite",
             "vs_layer_composite",
             "fs_layer_composite",
-            &layouts.globals,
-            &layouts.layer_surfaces,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
+            |layouts| &layouts.layer_surfaces,
+            false,
+            strip,
+            premultiplied_target,
             1,
-            &shader_module,
         );
-
-        let backdrop_pass_target = [Some(wgpu::ColorTargetState {
-            format: surface_format,
-            blend: None,
-            write_mask: wgpu::ColorWrites::ALL,
-        })];
-        let backdrop_downsample = create_pipeline(
+        let backdrop_downsample = lazy(
             "backdrop_downsample",
             "vs_backdrop_pass",
             "fs_backdrop_downsample",
-            &layouts.globals,
-            &layouts.backdrop,
-            None,
-            wgpu::PrimitiveTopology::TriangleList,
-            &backdrop_pass_target,
+            backdrop,
+            false,
+            list,
+            backdrop_pass_target.clone(),
             1,
-            &shader_module,
         );
-        let backdrop_blur = create_pipeline(
+        let backdrop_blur = lazy(
             "backdrop_blur",
             "vs_backdrop_pass",
             "fs_backdrop_blur",
-            &layouts.globals,
-            &layouts.backdrop,
-            None,
-            wgpu::PrimitiveTopology::TriangleList,
-            &backdrop_pass_target,
+            backdrop,
+            false,
+            list,
+            backdrop_pass_target,
             1,
-            &shader_module,
         );
-        let backdrop_composite = create_pipeline(
+        let backdrop_composite = lazy(
             "backdrop_composite",
             "vs_backdrop_composite",
             "fs_backdrop_composite",
-            &layouts.globals,
-            &layouts.backdrop,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target)],
+            backdrop,
+            false,
+            strip,
+            color_target.clone(),
             1,
-            &shader_module,
         );
+        let erase = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Zero,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let cutout_target = wgpu::ColorTargetState {
+            blend: Some(wgpu::BlendState { color: erase, alpha: erase }),
+            ..color_target.clone()
+        };
+        let effects = lazy("effects", "vs_effect", "fs_effect", effect, false, strip, color_target, 1);
+        let cutouts = lazy("cutouts", "vs_effect", "fs_effect", effect, false, strip, cutout_target, 1);
 
         WgpuPipelines {
             frame_clear,
@@ -1954,6 +2080,8 @@ impl WgpuRenderer {
             backdrop_downsample,
             backdrop_blur,
             backdrop_composite,
+            effects,
+            cutouts,
         }
     }
 
@@ -2069,9 +2197,23 @@ impl WgpuRenderer {
             .path_intermediate_texture
             .as_ref()
             .map(|texture| [texture.width(), texture.height()]);
-        let [width, height] = path_intermediate_size(current, [width, height]);
+        let requested = [width, height];
+        let [width, height] = path_intermediate_size(current, requested);
         if current == Some([width, height]) && self.resources().path_scratch_binding.is_some() {
             return [width, height];
+        }
+
+        let resources = self.resources_mut();
+        resources.swap_path_spare();
+        let spare = resources
+            .path_intermediate_texture
+            .as_ref()
+            .map(|texture| [texture.width(), texture.height()]);
+        if let Some(spare) = spare.filter(|spare| {
+            resources.path_scratch_binding.is_some()
+                && path_intermediate_size(Some(*spare), requested) == *spare
+        }) {
+            return spare;
         }
 
         let format = self.surface_config.format;
@@ -2184,6 +2326,12 @@ impl WgpuRenderer {
 
     pub fn tuning(&self) -> RendererTuning {
         self.tuning
+    }
+
+    /// Creates one of the pipelines that are otherwise created on first draw, so a later frame
+    /// does not stall on it. Call while idle; false once all exist.
+    pub fn warm_next_pipeline(&self) -> bool {
+        self.resources.as_ref().is_some_and(|resources| resources.pipelines.warm_next())
     }
 
     /// Applies new trade-offs from the next frame on. Pipelines, path intermediates and the
@@ -2519,8 +2667,9 @@ impl WgpuRenderer {
     /// [`Self::draw_external_damage`]: damaged rectangles are redrawn (as `@area=` labelled
     /// passes when area passes are tuned on) and every other pixel is loaded unchanged, so a
     /// target that has never been drawn needs [`SceneDamage::Full`]. Backdrop blur surfaces
-    /// are not drawn into offscreen targets. Layers share the renderer's layer cache, which
-    /// each external or offscreen draw prunes to the layers its own scene references.
+    /// are drawn when `target` also has `COPY_SRC` usage, and repaint the whole target. Layers
+    /// share the renderer's layer cache, which each external or offscreen draw prunes to the
+    /// layers its own scene references.
     pub fn draw_offscreen_damage(
         &mut self,
         scene: &Scene,
@@ -2670,13 +2819,13 @@ impl WgpuRenderer {
         view: &wgpu::TextureView, viewport: Size<DevicePixels>, globals: Option<wgpu::BindGroup>,
         damage: SceneDamage) -> Result<wgpu::SubmissionIndex> {
         if let Some(textures) = &self.resources().backdrop_textures { textures.next_binding.set(0); }
+        self.resources().next_effect.set(0);
         for layer in self.resources().layer_textures.values() { layer.next_composite.set(0); }
-        // Backdrop textures are surface sized, so only surface-sized targets blur.
-        let blurs_backdrop = globals.is_none() && self.backdrop_blur_supported && scene.surfaces.iter()
-            .any(|surface| matches!(surface.source, PaintSurfaceSource::BackdropBlur(_)));
+        let blurs_backdrop = self.backdrop_blur_supported && scene.surfaces.iter()
+            .any(|surface| matches!(surface.source, PaintSurfaceSource::BackdropBlur(blur) if !blur.over_layer));
         anyhow::ensure!(!blurs_backdrop || target.usage().contains(wgpu::TextureUsages::COPY_SRC),
             "Backdrop blur requires a readable external target");
-        if blurs_backdrop { self.ensure_backdrop_textures(); }
+        if blurs_backdrop { self.ensure_backdrop_textures(target.width(), target.height()); }
         let mut instance_offset = 0;
         let mut encoder = self.resources().device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("gpui_external_frame"),
@@ -2804,6 +2953,7 @@ impl WgpuRenderer {
         surface_view: &wgpu::TextureView,
     ) -> Result<wgpu::SubmissionIndex> {
         if let Some(textures) = &self.resources().backdrop_textures { textures.next_binding.set(0); }
+        self.resources().next_effect.set(0);
         for layer in self.resources().layer_textures.values() { layer.next_composite.set(0); }
         let mut instance_offset = 0;
         self.ensure_retained_frame();
@@ -2823,9 +2973,9 @@ impl WgpuRenderer {
             && scene
                 .surfaces
                 .iter()
-                .any(|surface| matches!(surface.source, PaintSurfaceSource::BackdropBlur(_)));
+                .any(|surface| matches!(surface.source, PaintSurfaceSource::BackdropBlur(blur) if !blur.over_layer));
         if blurs_backdrop {
-            self.ensure_backdrop_textures();
+            self.ensure_backdrop_textures(self.surface_config.width, self.surface_config.height);
             damage = SceneDamage::Full;
         }
         let mut encoder = self
@@ -3164,7 +3314,7 @@ impl WgpuRenderer {
                                 self.draw_surfaces(std::slice::from_ref(surface), globals, &mut pass);
                                 continue;
                             };
-                            if !blurs_backdrop {
+                            if !blurs_backdrop || blur.over_layer {
                                 continue;
                             }
                             drop(pass);
@@ -3175,7 +3325,7 @@ impl WgpuRenderer {
                                 pass.set_pipeline(&self.resources().pipelines.backdrop_composite);
                                 pass.set_bind_group(0, globals, &[]);
                                 pass.set_bind_group(1, &binding, &[]);
-                                pass.draw(0..3, 0..1);
+                                pass.draw(0..4, 0..1);
                             }
                         }
                     }
@@ -3443,13 +3593,18 @@ impl WgpuRenderer {
         }
     }
 
-    fn ensure_backdrop_textures(&mut self) {
-        if self.resources().backdrop_textures.is_some() {
-            return;
+    /// Backdrop textures cover the largest target drawn so far, so the desktop and offscreen
+    /// window targets of one renderer share them.
+    fn ensure_backdrop_textures(&mut self, width: u32, height: u32) {
+        let (mut width, mut height) = (width.max(1), height.max(1));
+        if let Some(textures) = &self.resources().backdrop_textures {
+            if textures.copy.width() >= width && textures.copy.height() >= height {
+                return;
+            }
+            width = width.max(textures.copy.width());
+            height = height.max(textures.copy.height());
         }
         let format = self.surface_config.format;
-        let width = self.surface_config.width.max(1);
-        let height = self.surface_config.height.max(1);
         let blur_width = width.div_ceil(2);
         let blur_height = height.div_ceil(2);
         let resources = self.resources_mut();
@@ -3513,8 +3668,8 @@ impl WgpuRenderer {
 
         let sigma = blur.radius.0.max(0.);
         let downscale = backdrop_downscale(sigma);
-        let width = self.surface_config.width;
-        let height = self.surface_config.height;
+        let width = frame_texture.width();
+        let height = frame_texture.height();
         let margin = (sigma * 3.).ceil() + downscale as f32;
         let floor_to = |value: f32| (value.max(0.) as u32) / downscale * downscale;
         let ceil_to = |value: f32, limit: u32| {
@@ -3690,6 +3845,11 @@ impl WgpuRenderer {
         self.backdrop_blur_supported
     }
 
+    /// Whether this renderer draws effect surfaces.
+    pub fn supports_effects(&self) -> bool {
+        self.effects_supported
+    }
+
     fn write_instances(
         &mut self,
         scene: &Scene,
@@ -3834,6 +3994,10 @@ impl WgpuRenderer {
         pass: &mut wgpu::RenderPass<'_>,
     ) {
         for surface in surfaces {
+            if let PaintSurfaceSource::Effect(effect) = &surface.source {
+                self.draw_effect(surface, effect, globals, pass);
+                continue;
+            }
             let PaintSurfaceSource::Layer(layer_id) = &surface.source else {
                 continue;
             };
@@ -3853,6 +4017,45 @@ impl WgpuRenderer {
             pass.set_bind_group(1, bind_group, &[]);
             pass.draw(0..4, 0..1);
         }
+    }
+
+    /// Draws an effect with the next of this frame's effect bindings, creating it on first use.
+    fn draw_effect(
+        &self,
+        surface: &PaintSurface,
+        effect: &gpui::SurfaceEffect,
+        globals: &wgpu::BindGroup,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) {
+        if !self.effects_supported {
+            return;
+        }
+        let resources = self.resources();
+        let params = EffectParams::new(surface, effect);
+        let index = resources.next_effect.get();
+        resources.next_effect.set(index + 1);
+        let mut bindings = resources.effect_bindings.borrow_mut();
+        if bindings.len() <= index {
+            let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("effect_params"),
+                size: std::mem::size_of::<EffectParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let binding = resources.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("effect_params"),
+                layout: &resources.bind_group_layouts.effect,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+            });
+            bindings.push((buffer, binding));
+        }
+        let (buffer, binding) = &bindings[index];
+        resources.queue.write_buffer(buffer, 0, bytemuck::bytes_of(&params));
+        let pipeline = if effect.layer.is_some() { &resources.pipelines.cutouts } else { &resources.pipelines.effects };
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, globals, &[]);
+        pass.set_bind_group(1, binding, &[]);
+        pass.draw(0..4, 0..1);
     }
 
     /// Render each `SceneLayer` that needs rendering into its offscreen texture.

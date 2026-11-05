@@ -888,6 +888,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn supports_backdrop_blur(&self) -> bool {
         false
     }
+    /// Whether the renderer draws [`crate::PaintSurfaceSource::Effect`] surfaces.
+    fn supports_effects(&self) -> bool {
+        false
+    }
+    /// Whether the platform draws effects of [`crate::Window::paint_effect_layer`] under the
+    /// window.
+    fn supports_effect_layers(&self) -> bool {
+        false
+    }
 
     // macOS specific methods
     fn get_title(&self) -> String {

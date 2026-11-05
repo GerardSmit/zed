@@ -4958,6 +4958,11 @@ impl Window {
         let scale_factor = self.scale_factor();
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
+        let shown = bounds.intersect(&content_mask.bounds);
+        let over_layer = self.next_frame.scene.surfaces.iter().any(|surface| {
+            matches!(&surface.source, PaintSurfaceSource::Effect(effect) if effect.layer.is_some())
+                && surface.bounds.intersect(&surface.content_mask.bounds).intersect(&shown) == shown
+        });
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
@@ -4966,6 +4971,97 @@ impl Window {
                 radius: radius.scale(scale_factor),
                 corner_radii: corner_radii.scale(scale_factor),
                 opacity,
+                over_layer,
+            }),
+            stretch: false,
+        });
+    }
+
+    /// Whether this window's renderer draws effects ([`Self::paint_effect`]). Where it
+    /// cannot, the element paints a still fill instead.
+    pub fn supports_effects(&self) -> bool {
+        self.platform_window.supports_effects()
+    }
+
+    /// Fill `bounds`, clipped to the corners and the current content mask, with a built-in
+    /// animated shader at `time`. Request the next frame to animate it. A no-op on renderers
+    /// without [`Self::supports_effects`].
+    pub fn paint_effect(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        kind: crate::EffectKind,
+        time: f32,
+        color: crate::Rgba,
+        levels: &[f32; crate::EFFECT_LEVELS],
+    ) {
+        use crate::{PaintSurface, PaintSurfaceSource, SurfaceEffect};
+
+        self.invalidator.debug_assert_paint();
+
+        let opacity = self.element_opacity();
+        if opacity <= 0. || !self.supports_effects() {
+            return;
+        }
+        let scale_factor = self.scale_factor();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            source: PaintSurfaceSource::Effect(SurfaceEffect {
+                kind,
+                time,
+                color,
+                levels: levels.map(|level| level.clamp(0., 1.)),
+                corner_radii: corner_radii.scale(scale_factor),
+                opacity,
+                layer: None,
+            }),
+            stretch: false,
+        });
+    }
+
+    /// Whether [`Self::paint_effect_layer`] is drawn.
+    pub fn supports_effect_layers(&self) -> bool {
+        self.platform_window.supports_effect_layers()
+    }
+
+    /// Leave `bounds` to an effect the platform draws under the window over `base`, animating
+    /// it without a next frame: the window is cleared there, clipped to the corners and the
+    /// current content mask. A no-op without [`Self::supports_effect_layers`].
+    pub fn paint_effect_layer(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        kind: crate::EffectKind,
+        color: crate::Rgba,
+        base: crate::Rgba,
+    ) {
+        use crate::{PaintSurface, PaintSurfaceSource, SurfaceEffect};
+
+        self.invalidator.debug_assert_paint();
+
+        let opacity = self.element_opacity();
+        if opacity <= 0. || !self.supports_effect_layers() {
+            return;
+        }
+        let scale_factor = self.scale_factor();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            source: PaintSurfaceSource::Effect(SurfaceEffect {
+                kind,
+                time: 0.,
+                color,
+                levels: [0.; crate::EFFECT_LEVELS],
+                corner_radii: corner_radii.scale(scale_factor),
+                opacity,
+                layer: Some(base),
             }),
             stretch: false,
         });

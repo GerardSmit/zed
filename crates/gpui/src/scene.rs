@@ -1407,13 +1407,16 @@ pub enum PaintSurfaceSource {
     /// [`crate::Window::paint_backdrop_blur`]. Renderers that cannot read their own target back
     /// skip it.
     BackdropBlur(BackdropBlur),
+    /// A built-in animated fill, drawn by a shader. See [`crate::Window::paint_effect`].
+    /// Renderers without effects skip it.
+    Effect(SurfaceEffect),
     /// A platform pixel buffer (e.g. a decoded video frame). macOS only.
     #[cfg(target_os = "macos")]
     Image(core_video::pixel_buffer::CVPixelBuffer),
 }
 
 /// A live backdrop blur: the Gaussian standard deviation and the shape it is clipped to.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BackdropBlur {
     /// Standard deviation of the blur, in device pixels (CSS `blur()` semantics).
     pub radius: ScaledPixels,
@@ -1421,6 +1424,56 @@ pub struct BackdropBlur {
     pub corner_radii: Corners<ScaledPixels>,
     /// The element opacity the blur was painted at.
     pub opacity: f32,
+    /// Over an effect layer's cut-out ([`SurfaceEffect::layer`]): what lies under it is the
+    /// platform's layer, so the platform blurs the layer there and the renderer skips it.
+    pub over_layer: bool,
+}
+
+impl PaintSurfaceSource {
+    /// Drawn by the platform under the window, not by the renderer: an effect layer's
+    /// cut-out, and a blur over one.
+    pub fn platform_layer(&self) -> bool {
+        match self {
+            PaintSurfaceSource::Effect(effect) => effect.layer.is_some(),
+            PaintSurfaceSource::BackdropBlur(blur) => blur.over_layer,
+            _ => false,
+        }
+    }
+}
+
+/// The levels a [`SurfaceEffect`] carries, such as the bands of a sound's spectrum.
+pub const EFFECT_LEVELS: usize = 32;
+
+/// Which built-in shader a [`SurfaceEffect`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EffectKind {
+    /// A bar per level, rising from the bottom edge.
+    Bars,
+    /// Rings around the centre that swell with the levels.
+    Rings,
+    /// Slow bands of light that brighten with the levels.
+    Aurora,
+}
+
+/// An animated fill: the shader, the time and colour it draws with, and the levels it
+/// follows. The element that paints it sets the time; the renderer keeps no clock.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceEffect {
+    /// The shader.
+    pub kind: EffectKind,
+    /// Seconds since the effect started; wraps when the element wants it to.
+    pub time: f32,
+    /// The colour the shader draws in.
+    pub color: crate::Rgba,
+    /// Levels from 0 to 1, lowest pitch first.
+    pub levels: [f32; EFFECT_LEVELS],
+    /// Corner radii of the filled shape, in device pixels.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// The element opacity the effect was painted at.
+    pub opacity: f32,
+    /// Drawn by the platform as a layer under the window, over this colour: the renderer
+    /// clears what the window drew here instead. See [`crate::Window::paint_effect_layer`].
+    pub layer: Option<crate::Rgba>,
 }
 
 #[derive(Clone, Debug)]

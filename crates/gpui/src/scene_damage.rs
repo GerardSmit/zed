@@ -373,15 +373,22 @@ impl DamagePrimitive for PaintSurface {
         geometry_hash(Self::KIND, self.bounds, self.content_mask)
     }
 
-    // Only layer composites are comparable; changes inside a layer are added separately.
+    // Only layer composites and what the platform draws (cut-outs, blurs over them) are
+    // comparable; changes inside a layer are added separately.
     fn same_content(&self, other: &Self) -> bool {
         self.bounds == other.bounds
             && self.content_mask == other.content_mask
             && self.stretch == other.stretch
-            && matches!(
-                (&self.source, &other.source),
-                (PaintSurfaceSource::Layer(old), PaintSurfaceSource::Layer(new)) if old == new
-            )
+            && match (&self.source, &other.source) {
+                (PaintSurfaceSource::Layer(old), PaintSurfaceSource::Layer(new)) => old == new,
+                (PaintSurfaceSource::Effect(old), PaintSurfaceSource::Effect(new)) => {
+                    self.source.platform_layer() && old == new
+                }
+                (PaintSurfaceSource::BackdropBlur(old), PaintSurfaceSource::BackdropBlur(new)) => {
+                    self.source.platform_layer() && old == new
+                }
+                _ => false,
+            }
     }
 
     fn damage_footprint(&self) -> Bounds<ScaledPixels> {
@@ -737,13 +744,13 @@ impl Scene {
                 }
             }
         }
-        // Backdrop blur reads neighboring pixels from earlier draw order; live pixel buffers can
-        // mutate without changing identity. Neither is safe to infer from primitive equality.
+        // Backdrop blur reads neighboring pixels from earlier draw order; live pixel buffers and
+        // effects change without changing identity. None is safe to infer from primitive equality.
         if self
             .surfaces
             .iter()
             .chain(&previous.surfaces)
-            .any(|surface| !matches!(surface.source, PaintSurfaceSource::Layer(_)))
+            .any(|surface| !matches!(surface.source, PaintSurfaceSource::Layer(_)) && !surface.source.platform_layer())
         {
             self.damage = SceneDamage::Full;
             return;
@@ -1829,6 +1836,7 @@ mod tests {
                 radius: ScaledPixels(5.),
                 corner_radii: Corners::default(),
                 opacity: 1.,
+                over_layer: false,
             }),
             stretch: false,
         });
